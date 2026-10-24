@@ -1,7 +1,8 @@
 # ADR-0019: Upstream connections, monitoring and service authentication
 
-- Status: Accepted (planner, 2026-10-24, for SPEC-002). Items marked
-  "planner choice" are listed in `plans/SPEC-002.md`, "Proposed for Owner".
+- Status: Accepted (planner, 2026-10-24, for SPEC-002). Updated the same
+  day after the Owner's answers: SCRAM uses `github.com/xdg-go/scram` behind
+  a thin adapter, and the "planner choice" close reasons (P7) are accepted.
 - Related: SPEC-002 FR-18, FR-22, FR-24, FR-25, FR-28, FR-35, FR-37, FR-45,
   FR-46, FR-56; ADR-0002 (dependency pins), ADR-0015
 
@@ -39,23 +40,33 @@
 
 ### SCRAM-SHA-256 (FR-22)
 
-- corral implements the SCRAM-SHA-256 client itself
-  (`internal/infra/upstreamconn/scram`) with the standard library
-  (`crypto/pbkdf2`, `crypto/hmac`, `crypto/sha256`, `crypto/rand`). Username
-  escaping (`=2C`, `=3D`) follows RFC 5802, and the password is prepared
-  with SASLprep (RFC 4013) as the MongoDB authentication specification
-  requires.
-- SASLprep uses `github.com/xdg-go/stringprep` (pinned at v1.0.4, no
-  transitive dependencies; the same library the official Go driver uses).
-  This is a new production dependency, recorded here and in ADR-0002.
-  - Reason for not using a full SCRAM library: corral must tell a failed
-    **server signature** check apart from every other failure without
-    reading error text (FR-22, SPEC-001 FR-29). Owning the conversation
-    gives a typed `scram.ErrServerSignature`.
-- Conversation: `saslStart` (mechanism `SCRAM-SHA-256`, `options:
-  {skipEmptyExchange: true}`), `saslContinue` until `done`. The salted
-  password is cached per (salt, iteration count) in memory for the process
-  lifetime, to avoid one PBKDF2 per pool connection.
+Owner decision, 2026-10-24: use the maintained library, not an in-house
+client.
+
+- `internal/infra/upstreamconn/scram` is a thin adapter around
+  `github.com/xdg-go/scram` (`scram.SHA256.NewClient`, one
+  `ClientConversation` per authentication). The library does:
+  - SASLprep (RFC 4013) of the password, through its own dependency
+    `github.com/xdg-go/stringprep`;
+  - username escaping (RFC 5802);
+  - nonce generation;
+  - the PBKDF2 cache: one `Client` per process caches derived keys per
+    (salt, iteration count), so there is no PBKDF2 per pool connection.
+- **Typed server-signature failure without reading error text** (FR-22,
+  SPEC-001 FR-29):
+  - before passing the server-final message to `Step`, the adapter checks
+    its shape. A message starting with `e=` is a server-reported error,
+    and malformed content is a protocol error (`scram.ErrProtocol`).
+  - A well-formed `v=<base64>` message is passed to `Step`. If `Step`
+    returns an error, or the conversation ends with `Valid() == false`,
+    the adapter returns `scram.ErrServerSignature`.
+  - The library's error values are never logged or wrapped into records.
+    Only the adapter's constant sentinels leave the package.
+- The adapter rejects iteration counts below 4096 (`scram.ErrIterations`)
+  by checking the server-first message before stepping.
+- Conversation on the wire (in `upstreamconn`): `saslStart` (mechanism
+  `SCRAM-SHA-256`, `options: {skipEmptyExchange: true}`), then
+  `saslContinue` until `done`.
 - Secret handling: the username and password come only from
   `settings.Proxy` (typed, secret). They are never put in an error, a log
   attribute or a span, and are held as `[]byte`. Conversation payloads are
@@ -101,8 +112,9 @@
 
 ## Consequences
 
-- `go.mod` gains `github.com/xdg-go/stringprep v1.0.4` (production) and
-  makes `golang.org/x/sys` direct. ADR-0002's "no other third-party
-  dependency" rule is satisfied by this ADR.
-- The PBKDF2 cache holds derived key material in memory. It is never
+- `go.mod` gains `github.com/xdg-go/scram` (production, approved by the
+  Owner, P2). It brings `github.com/xdg-go/stringprep` and
+  `github.com/xdg-go/pbkdf2`, and `golang.org/x/sys` becomes direct.
+  Versions are recorded in ADR-0002.
+- The library's key cache holds derived key material in memory. It is never
   emitted and is dropped at process exit.

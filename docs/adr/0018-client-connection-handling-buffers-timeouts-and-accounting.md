@@ -1,8 +1,8 @@
 # ADR-0018: Client connection handling: buffer limits, I/O timeouts, liveness and accounting
 
-- Status: Accepted (planner, 2026-10-24, for SPEC-002). Items marked
-  "planner choice" are listed in `plans/SPEC-002.md`, "Proposed for Owner",
-  so the Owner can override them.
+- Status: Accepted (planner, 2026-10-24, for SPEC-002). The items marked
+  "planner choice" (P4, P8 in `plans/SPEC-002.md`) were accepted by the
+  Owner on 2026-10-24.
 - Related: SPEC-002 FR-2, FR-4, FR-12, FR-38, FR-41, FR-44, FR-48, FR-57,
   FR-58, NFR resource bounds, AC-2, AC-19, AC-21, AC-34, AC-35
 

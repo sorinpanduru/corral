@@ -57,9 +57,15 @@ version set, and its exporters pull in gRPC and the OTLP protobuf module.
   not already listed here is recorded in this ADR by the planner afterwards.
 
 - SPEC-002 additions (planner, 2026-10-24):
-  - production: `github.com/xdg-go/stringprep` v1.0.4, for SASLprep in
-    the SCRAM-SHA-256 client (ADR-0019). `golang.org/x/sys` becomes a
-    direct requirement at the already-pinned v0.49.0 (`TCP_USER_TIMEOUT`).
+  - production (approved by the Owner, 2026-10-24, P2):
+    `github.com/xdg-go/scram` (latest v1 release when added; v1.1.2 at
+    planning time, to be confirmed), used behind the ADR-0019 adapter. It
+    brings `github.com/xdg-go/stringprep` (v1.0.4) and
+    `github.com/xdg-go/pbkdf2` (v1.0.0) at the versions it selects, and
+    `golang.org/x/text` stays at the already-pinned v0.43.0.
+    `golang.org/x/sys` becomes a direct requirement at the already-pinned
+    v0.49.0 (`TCP_USER_TIMEOUT`). Exact versions are recorded here when T6
+    lands.
   - test-only: `go.mongodb.org/mongo-driver/v2` (latest v2 release when
     first added; the exact version is recorded here when it lands). It is
     allowed only in `_test.go` files, `internal/testkit/...`, `tests/...`

@@ -1,8 +1,9 @@
 # ADR-0022: Proxy test topology: twins, Docker fixtures, PHP-FPM and corraltest hooks
 
 - Status: Accepted (planner, 2026-10-24, for SPEC-002). Extends ADR-0014 and
-  ADR-0005. The items that need new network access (container registries,
-  PECL) are listed in `plans/SPEC-002.md`, "Proposed for Owner".
+  ADR-0005. The new network access (Docker on Linux with host networking,
+  Docker Hub images, PECL, all pinned) was granted by the Owner on
+  2026-10-24 (P1 in `plans/SPEC-002.md`).
 - Related: SPEC-002 FR-54, AC types (unit, twin, functional), AC-1, AC-12,
   AC-14, AC-16, AC-19 to AC-22, AC-26, AC-30, AC-35; ADR-0001, ADR-0005,
   ADR-0014

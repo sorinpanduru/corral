@@ -15,7 +15,7 @@
   - `docs/adr/0016-amendment-3-error-details-and-telemetry-artifacts.md`: `DetailedError`, classification precedence, the server-attribute rule for synthesized errors, enum and allowlist changes, catalog buckets.
   - `docs/adr/0017-domain-bson-and-wire-codec.md`: hand-written BSON, streaming validation, checksum stripping, header rewriting.
   - `docs/adr/0018-client-connection-handling-buffers-timeouts-and-accounting.md`: 64 KiB request buffer limit and reply chunk, I/O budget, liveness peek, TLS handshake bound, connection accounting and close reasons.
-  - `docs/adr/0019-upstream-connections-monitoring-and-authentication.md`: socket options, handshake metadata, own SCRAM with `xdg-go/stringprep`, monitoring authentication, error outcomes, upstream close reasons.
+  - `docs/adr/0019-upstream-connections-monitoring-and-authentication.md`: socket options, handshake metadata, SCRAM through `github.com/xdg-go/scram` behind a thin adapter, monitoring authentication, error outcomes, upstream close reasons.
   - `docs/adr/0020-file-content-settings-for-pem-paths.md`: PEM rule through the SPEC-003 reader (`registry.FileRule`).
   - `docs/adr/0021-startup-and-shutdown-with-the-wire-listener.md`: wire listener as the last startup step, the FR-47 drain inside shutdown, required-setting impact on existing tests.
   - `docs/adr/0022-proxy-test-topology-twins-fixtures-and-hooks.md`: test layers, twins, Docker fixtures, PHP-FPM, test-only driver dependency, corraltest hooks.
@@ -233,28 +233,34 @@
 - Docker: no.
 - Depends on: none. Wave 1.
 
-### T6: SCRAM-SHA-256 client
+### T6: SCRAM-SHA-256 adapter around `github.com/xdg-go/scram`
 
-- Goal: `internal/infra/upstreamconn/scram` per ADR-0019. Covers the RFC 5802 / RFC 7677 conversation, SASLprep of the password, username escaping, a typed server-signature failure and a salted-password cache.
+- Goal: `internal/infra/upstreamconn/scram`, a thin adapter around the maintained `github.com/xdg-go/scram` library (Owner decision, 2026-10-24; ADR-0019). No in-house SCRAM.
+  - The library does SASLprep (through its `xdg-go/stringprep` dependency), username escaping, nonces and the derived-key cache. The adapter holds one library `Client` per process and one `ClientConversation` per authentication.
+  - The adapter adds:
+    - shape checks on server messages: an iteration count below 4096 gives `ErrIterations`; an `e=` server-final or malformed content gives `ErrProtocol`;
+    - mapping of a failed `v=` verification (a `Step` error on a well-formed `v=` message, or `Valid() == false` at the end) to `ErrServerSignature`;
+    - constant sentinels as the only errors that leave the package. Library error values are never wrapped or logged.
 - FRs/ACs: FR-22 (failure classification), FR-24; AC-25 (unit: failed signature); AC-11 (support).
-- Implementer owns: `internal/infra/upstreamconn/scram/*.go` (non-test), `go.mod` / `go.sum` (`github.com/xdg-go/stringprep v1.0.4`).
+- Implementer owns: `internal/infra/upstreamconn/scram/*.go` (non-test), `go.mod` / `go.sum` (`github.com/xdg-go/scram` and what it selects; versions recorded in ADR-0002).
 - Test writer owns: `internal/infra/upstreamconn/scram/*_test.go`.
 - Interfaces defined:
-  - `scram.NewClient(username, password []byte, nonce func() ([]byte, error), cache *SaltCache) (*Client, error)`.
-  - `(*Client).First() []byte`; `(*Client).Step(server []byte) (reply []byte, done bool, err error)`.
-  - `scram.NewSaltCache() *SaltCache`.
-  - Sentinels `scram.ErrServerSignature`, `scram.ErrProtocol`, `scram.ErrSASLprep`, `scram.ErrIterations` (iteration count below 4096). Constant text only.
-- Test strategy (unit):
-  - The RFC 7677 vector (`user`/`pencil`, fixed nonce) produces the exact messages.
+  - `scram.NewClient(username, password []byte) (*Client, error)`. It wraps the library client, and a SASLprep failure gives `ErrSASLprep`.
+  - `(*Client).NewConversation() *Conversation`.
+  - `(*Conversation).First() ([]byte, error)`; `(*Conversation).Step(server []byte) (reply []byte, done bool, err error)`.
+  - Sentinels `scram.ErrServerSignature`, `scram.ErrProtocol`, `scram.ErrSASLprep`, `scram.ErrIterations`. Constant text only.
+- Test strategy (unit; a test-side SCRAM server built with the library's server API, `scram.SHA256.NewServer`, with synthetic credentials):
+  - A conversation against the library server succeeds.
   - A tampered `v=` gives `ErrServerSignature`.
-  - Malformed server-first and server-final messages give `ErrProtocol`, including a nonce that does not extend the client nonce.
-  - Iteration count 4095 is rejected.
-  - Usernames containing `,` and `=` are escaped.
-  - SASLprep cases (non-ASCII space mapping, prohibited output rejected).
-  - The cache avoids a second PBKDF2 for the same salt and iteration count.
-  - Marker username and password never appear in any error text (`fmt.Sprint(err)`).
+  - An `e=invalid-proof` server-final gives `ErrProtocol`, not `ErrServerSignature`.
+  - A malformed server-first or server-final message, and a nonce that does not extend the client nonce, give `ErrProtocol`.
+  - Iteration count 4095 gives `ErrIterations`.
+  - A username containing `,` or `=` authenticates.
+  - A non-ASCII-space password authenticates after SASLprep; a prohibited character gives `ErrSASLprep`.
+  - A second conversation with the same salt and iteration count reuses the derived keys. Assert through timing-independent means, for example by counting server-first messages per derived-key computation if the library exposes it; otherwise this is a review item.
+  - The marker username and password never appear in any error text (`fmt.Sprint(err)`).
 - Docker: no.
-- Depends on: none. Wave 1. **Security review recommended** (security@emag.ro) before merge to main, because this is a hand-written authentication implementation.
+- Depends on: none. Wave 1.
 
 ### T7: Test kit: raw wire client, process harness, minimal arguments, probe client
 
@@ -745,7 +751,7 @@
   - Pool gauges follow `StatsChanged`.
   - Debug-only per-exchange records follow SPEC-001 FR-32.
   - Errors go through `errclass.LogAttrs`. Metadata, command names and collections go through `sanitize`.
-  - `corral_request_errors_total` follows the default in "Proposed for Owner" P5. `corral_upstream_connect_errors_total` follows P6.
+  - `corral_request_errors_total` follows the Owner-accepted P5 default. `corral_upstream_connect_errors_total` follows P6 (see "Owner decisions").
 - FRs/ACs: FR-48, FR-49; AC-2 (metric part), AC-13 (metric part), AC-17 (metric and record part), AC-27 (events, rate limits, no status code on synthesized errors), SPEC-001 AC-23 Part B.
 - Implementer owns: `internal/infra/telemetry/proxyobs/*.go` (non-test).
 - Test writer owns: `internal/infra/telemetry/proxyobs/*_test.go`.
@@ -1306,27 +1312,26 @@ Everything in waves 1 to 3 except T13 can proceed while SPEC-003 is still being 
 
   `plans/SPEC-003.md` is not changed by this plan. If SPEC-003 T5 is still open when T13 starts, coordinate the call site with its implementer.
 - **ADR-0014 follow-up:** the production build now has real secret settings, so SPEC-003 AC-9 could move off the `CORRALTEST_REGISTRY=secret` option. This is optional and not scheduled.
-- **Security:** T6 (hand-written SCRAM) and the residual exposure routes in SPEC-002 Data and compliance are flagged for review by security@emag.ro (see P10).
+- **Security:** the residual exposure routes in SPEC-002 Data and compliance and the test-only `corraltest` probe server are flagged for review by security@emag.ro (P10). SCRAM is no longer in-house (T6 is an adapter around `github.com/xdg-go/scram`).
 - **Platform:** the liveness watcher (AC-21) and the functional suites (host networking) are Linux-only. CI must run `make test-twin` and `make test-functional` on Linux with Docker.
 
-## Proposed for Owner
+## Owner decisions (2026-10-24)
 
-Each item has the planner's default. The plan is built on the default, and an Owner decision only changes the named tasks.
+The Owner answered every item that was proposed. Nothing is open. The items are kept below with their outcome, because tasks refer to them by number.
 
-- **P1 (new access).**
-  - The functional suites need:
-    - Docker on a Linux CI runner with host networking;
-    - network access during tests to pull `mongo:7.0` and `mongo:8.0` and a PHP-FPM base image from Docker Hub;
-    - access to PECL to build `ext-mongodb`.
-  - Default: grant, with images pinned by digest and the PECL version pinned (ADR-0022).
-  - Alternative: pre-built images in an internal registry.
+- **P1 (new access): granted.**
+  - Docker on a Linux CI runner with host networking.
+  - Docker Hub images (`mongo:7.0`, `mongo:8.0`, a PHP-FPM base) and PECL (`ext-mongodb`), all pinned by digest or version (ADR-0022, recorded in ADR-0002).
   - Affects: T8, T26, T27, T28.
-- **P2 (dependencies, for information or veto).**
-  - New production dependency `github.com/xdg-go/stringprep` v1.0.4 (SASLprep for SCRAM).
-  - New test-only dependency `go.mongodb.org/mongo-driver/v2`.
+- **P2 (dependencies): approved, with one change.**
+  - SCRAM uses the maintained `github.com/xdg-go/scram` library instead of an in-house client. T6 is reworked into a thin adapter (ADR-0019). SASLprep comes from the library's own `xdg-go/stringprep` dependency.
+  - Production: `github.com/xdg-go/scram` (and what it selects).
+  - Test-only: `go.mongodb.org/mongo-driver/v2`.
   - `golang.org/x/sys` becomes direct.
   - Recorded in ADR-0002, ADR-0019 and ADR-0022.
   - Affects: T5, T6, T7.
+
+P3 to P9 and P11: **defaults accepted** as written.
 - **P3 (FR-7 ambiguity: kind-1 documents).**
   - FR-7 requires the kind-0 body to be valid BSON, and says nothing about the documents inside kind-1 sections beyond section bounds.
   - Default: validate each kind-1 document fully as BSON too (`malformed_message` on failure). This is what lets AC-19's "invalid tail" case work, since large inserts carry their documents in kind-1.
@@ -1350,14 +1355,29 @@ Each item has the planner's default. The plan is built on the default, and an Ow
   Affects: T15, T18, T19.
 - **P8 (client TLS handshake bound).** Default: the handshake is bounded by `proxy.client_io_timeout`, and a failure or timeout closes with `reason=tls_failure` (ADR-0018). Affects: T20.
 - **P9 (FR-16 literal reading).** Default: a second handshake carrying `client` on the same connection gets 186 even if the first handshake was answered with an error (for example code 6 before the upstream was reached). Affects: T14.
-- **P10 (security review).**
-  - The spec recommends review by security@emag.ro. Default: request it for:
-    - the hand-written SCRAM-SHA-256 client (T6) before merge to main;
-    - the residual cross-client exposure routes, which are handled by least privilege only;
-    - the `corraltest` probe server, which is test-build only and loopback only.
-  - Affects: merge gating only.
+- **P10 (security review): still recommended** for the items below. No in-house SCRAM remains to review.
+  - the residual cross-client exposure routes, which are handled by least privilege only;
+  - the `corraltest` probe server, which is test-build only and loopback only.
+
+  Affects: merge gating only.
 - **P11 (earlier ACs that say "default settings").**
   - SPEC-001 and SPEC-003 functional ACs that start corral "with default settings" can no longer be met literally, because `upstream.hosts` is required (SPEC-002 FR-55).
   - Default reading: "defaults plus the minimum required SPEC-002 settings" (`upstream.hosts` and `upstream.auth.mechanism=none`, on a free `proxy.listen` port; ADR-0021).
   - SPEC-003 AC-11 ("with no input, the record's `setting` is empty") is checked in process with a SPEC-001-only registry.
   - Affects: T21 migration, T26.
+
+## Pending: SPEC-002 Amendment 1 (spec gaps G-1 to G-20)
+
+A SPEC-002 Amendment 1 is being drafted to close spec gaps G-1 to G-20. This plan does **not** change any task for it yet. Its text is not available to the planner, so the gap details are unknown.
+
+Once it is approved, the planner will revise the affected tasks and the coverage table. Until then, these tasks may need rework, and the Orchestrator should expect it, especially for tasks already in progress:
+
+| Area | Tasks that may be affected |
+|---|---|
+| Framing and message model | T9 (wire model), T14 (decision and refusal table), and by extension T19 (exchange engine) and T23 (twin suite A) |
+| Handshake | T14 (handshake reply, handshake decisions), and by extension T19 and T23 |
+| Topology and monitoring | T10 (upstream state), T15 (connector and monitoring checks), and by extension T25 (twin suite C) and T27 |
+| Observer events and metrics | T18 (adapters), and possibly T12 (catalog) and T28 if events or metrics change |
+| Operator documentation | T22 |
+
+Suggested scheduling: start the wave 1 tasks and the unaffected wave 2 to 3 tasks (T1 to T8, TW1, TW2, T11, T13, T16) now. Hold T9, T10, T14 and T15 at the test-writing stage until the amendment's scope is known, or accept possible rework.
