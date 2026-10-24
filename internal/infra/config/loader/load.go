@@ -26,7 +26,8 @@ var (
 // Source says where an effective value came from.
 type Source int
 
-// Sources, in precedence order (flag > env > default).
+// Sources. Precedence is flag, then env, then default; nothing depends on the
+// numeric order of these constants.
 const (
 	SourceDefault Source = iota
 	SourceFlag
@@ -41,7 +42,8 @@ type Inputs struct {
 	ReadFile source.ReadFile
 }
 
-// Value is the effective value of one setting.
+// Value is the effective value of one setting. A failed setting keeps its
+// winning Source with Set=false; a missing required setting is SourceUnset.
 type Value struct {
 	Set     bool
 	V       any
@@ -171,10 +173,7 @@ func Load(r *registry.Registry, in Inputs) Result {
 		}
 		get := func(name string) (any, bool) { return res.Get(name) }
 		if rule.Check(get) != nil {
-			name := spelled[rule.Primary]
-			if name == "" {
-				name = rule.Primary
-			}
+			name := spelled[rule.Primary] // New guarantees the primary is registered
 			g3 = append(g3, record{name, config.NewError(name, ErrCrossRule)})
 		}
 	}
@@ -203,6 +202,10 @@ func skipRule(rule registry.CrossRule, res Result, missing, optional map[string]
 	}
 	return false
 }
+
+// Note on file reads (FR-15, FR-17): each file reference is read once. A flag
+// reference and an env reference to the same path are two references and are
+// each read; do not merge or cache them across sources.
 
 // evalEnv evaluates the environment source of s. Records go through fail.
 func evalEnv(s registry.Setting, in Inputs, fail func(string, error)) srcState {
