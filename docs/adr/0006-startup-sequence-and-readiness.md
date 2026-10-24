@@ -8,6 +8,11 @@
   ADR-0013 sequence (mode selection, configuration load including `OTEL_*`
   validation, failure and success output paths). Steps 5 to 9, readiness
   and shutdown are unchanged.
+- Amended by ADR-0021 (SPEC-002; SPEC-001 Amendment 3, item 10): binding
+  the MongoDB wire listener is now the last startup step, after
+  `tracing.Start`. The upstream monitor and pool start before it, without
+  waiting. Shutdown runs the SPEC-002 FR-47 drain before the admin and
+  tracing shutdown.
 - Related: SPEC-001 FR-7 (lifecycle), FR-18, FR-27, FR-28, FR-34, FR-35,
   AC-3, AC-21, AC-30, AC-31
 

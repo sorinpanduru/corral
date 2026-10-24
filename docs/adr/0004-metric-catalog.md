@@ -3,7 +3,10 @@
 - Status: Accepted (planner, 2026-10-24). The error-label names were decided
   by Orchestrator under Owner's standing instruction, 2026-10-24, Owner may
   override (former question Q4, decision D4 in `plans/SPEC-001.md`).
-- Related: SPEC-001 FR-10, FR-11, FR-13, FR-29, FR-31, FR-37, AC-8, AC-10
+  Updated 2026-10-24 for SPEC-001 Amendment 3 (label-name allowlist and
+  the outcome/cause rule; see ADR-0016).
+- Related: SPEC-001 FR-10, FR-11, FR-13, FR-29, FR-31, FR-37, AC-8, AC-10,
+  AC-41
 
 ## Context
 
@@ -57,9 +60,26 @@ label names and allowed label values, and a constructor that cannot create a
   - `/metrics` (T17) keeps `promhttp` OpenMetrics exemplars off, so
     exemplars are never served.
 
+- Update for SPEC-001 Amendment 3 (planner, 2026-10-24; ADR-0016):
+  - `metrics.AllowedLabelNames()` is exactly the nine FR-11 names:
+    `command`, `error_class`, `error_detail`, `outcome`, `reason`, `side`,
+    `state`, `opcode`, `kind`. The forbidden-name list stays as a second
+    line of defence and none of the new names trips it.
+  - New lint rule (FR-11 outcome and cause labels): no value of an
+    `outcome`, `reason`, `state`, `side`, `opcode` or `kind` label may equal
+    any FR-29 class or detail value (`errclass.Classes()`,
+    `errclass.Details()`). Other values still match `^[a-z0-9_]+$`.
+  - The `error_class` enum now includes `rejected`, and the `error_detail`
+    enum includes the 14 Amendment 3 details, through `errclass`.
+  - `command` label values are checked against the 27-name allowlist plus
+    `other`.
+  - SPEC-002 adds its metrics to `catalog.json` without amending SPEC-001
+    (FR-31 as reworded by Amendment 3). Histogram buckets are listed in
+    ADR-0016.
+
 ## Consequences
 
-- Feature specs add metrics by editing `catalog.json` (and amending their
-  spec). AC-10 (Part B) can compute the series cap from the file alone.
+- Feature specs add metrics by editing `catalog.json`. They amend SPEC-001
+  only when they need a new label name (FR-31, Amendment 3). AC-10 (Part B) can compute the series cap from the file alone.
 - promlint (AC-8) runs over gathered `corral_` families from the live
   registry, not over the JSON.

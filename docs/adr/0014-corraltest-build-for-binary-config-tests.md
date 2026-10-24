@@ -2,7 +2,9 @@
 
 - Status: Accepted (Owner, 2026-10-24; P1 in `plans/SPEC-003.md` approved).
   Updated the same day for SPEC-003 Amendment 1 (AC-19 check-config hold
-  point).
+  point). Extended by ADR-0022 (SPEC-002): more hold points, pool order,
+  panic injection and a loopback probe server, all in the `corraltest`
+  build only.
 - Related: SPEC-003 AC-6, AC-9, AC-10, AC-19; ADR-0001, ADR-0005; SPEC-001
   T21 (`importcheck.ForbiddenDeps`)
 

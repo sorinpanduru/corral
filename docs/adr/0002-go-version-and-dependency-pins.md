@@ -56,6 +56,18 @@ version set, and its exporters pull in gRPC and the OTLP protobuf module.
   2026-10-24), despite ADR-0001 giving `go.mod` to implementers. Any module
   not already listed here is recorded in this ADR by the planner afterwards.
 
+- SPEC-002 additions (planner, 2026-10-24):
+  - production: `github.com/xdg-go/stringprep` v1.0.4, for SASLprep in
+    the SCRAM-SHA-256 client (ADR-0019). `golang.org/x/sys` becomes a
+    direct requirement at the already-pinned v0.49.0 (`TCP_USER_TIMEOUT`).
+  - test-only: `go.mongodb.org/mongo-driver/v2` (latest v2 release when
+    first added; the exact version is recorded here when it lands). It is
+    allowed only in `_test.go` files, `internal/testkit/...`, `tests/...`
+    and `twins/...` (ADR-0022). The production import lint enforces this.
+  - The Docker image digests (`mongo:7.0`, `mongo:8.0`, the PHP-FPM base)
+    and the PECL `mongodb` extension version used by the functional
+    fixtures are recorded here when the fixtures land (ADR-0022).
+
 ## Consequences
 
 - `go mod tidy` must leave the OTel set at v1.47.0. CI or review checks
