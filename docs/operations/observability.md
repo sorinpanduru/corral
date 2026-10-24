@@ -4,9 +4,11 @@ This guide covers corral's logging, metrics, tracing and admin listener. It
 describes what the code in `internal/infra/` does today. The configuration
 mechanism below is temporary (see "Settings").
 
-Note: at the time of writing `cmd/corral` is a stub and the startup wiring
-(`internal/app/runtime`, ADR-0006) is not merged. The behaviour below is that of
-the merged packages.
+> **Temporary status note (remove when T18 merges):** `cmd/corral` is a stub;
+> the tracing bootstrap and shutdown (T15, T16) and the runtime wiring (T18) are
+> not merged yet. Sections on startup, exit codes, stderr, tracing bootstrap,
+> log correlation and shutdown describe the specified behaviour (SPEC-001,
+> ADR-0006, ADR-0007).
 
 ## Security and operational warnings
 
@@ -23,6 +25,10 @@ the merged packages.
   synchronously to stdout. If stdout blocks (a stalled log pipeline, a full
   pipe), logging calls block, and this can stall proxied operations. This risk
   is accepted for v1. Make sure whatever consumes stdout keeps reading.
+- **OTLP credentials:** use an `https://` endpoint when sending authentication
+  headers. Do not set `OTEL_EXPORTER_OTLP_*INSECURE=true` outside a trusted
+  network. Supply headers, the CA and the client certificate/key through a
+  secrets mechanism, not in manifests or scripts.
 - corral writes no log output to stderr; third-party output is routed through
   the same stdout logger (see "Logging").
 
@@ -52,6 +58,9 @@ example:
 corral -log.level=debug --admin.listen=0.0.0.0:9187
 ```
 
+Binding `0.0.0.0` as above exposes the unauthenticated admin listener (see
+security warnings).
+
 This syntax is temporary and may change when the configuration spec lands.
 
 - A known flag without a value, or given twice, is an error naming that setting.
@@ -80,8 +89,8 @@ This syntax is temporary and may change when the configuration spec lands.
 ## Admin endpoints
 
 Only `GET` (and `HEAD`) on these exact paths; any other path returns 404 with
-body `not found`, and other methods on these paths are refused by the router
-(405). Bodies are fixed strings: nothing from the request (path,
+body `not found`, and other methods on these paths get `405` with
+`Allow: GET, HEAD`. Bodies are fixed strings: nothing from the request (path,
 query, headers) is echoed. Text responses use
 `Content-Type: text/plain; charset=utf-8`.
 
@@ -104,8 +113,8 @@ Each body ends with a newline (`ok\n`, `starting\n`, ...).
 `/metrics` serves the Prometheus text format only. OpenMetrics is not offered
 and no exemplars are emitted. Any query string is ignored. If gathering fails,
 the response is `500` with the fixed body `error`; the error text is not
-exposed. At most 4 scrapes are served concurrently; each has a 10 second
-timeout.
+exposed. At most 4 scrapes are served concurrently; beyond that, or past the 10
+second timeout, the response is `503` with a fixed body.
 
 Server limits: read-header timeout 5 s, read timeout 10 s, write timeout 30 s,
 idle timeout 60 s, maximum request headers 16 KiB. `OPTIONS *` is not
@@ -147,8 +156,9 @@ in the binary (`internal/infra/telemetry/metrics/catalog.json`).
   seconds; the next emitted record carries `suppressed_count`. Levels:
   `otel` informational logs are emitted at debug and `otel` errors at warn;
   `grpc` info, warning and error map to debug, warn and error; admin HTTP
-  server errors are emitted at warn; standard `log` and `slog.Default()`
-  records follow the configured level. A gRPC fatal log writes an error record
+  server errors are emitted at warn; standard `log` records are emitted
+  at info and `slog.Default()` records keep the caller's level; both are
+  filtered by `log.level`. A gRPC fatal log writes an error record
   (not rate limited) and exits the process with status 1.
 
 ### What corral never emits (FR-24)
@@ -165,12 +175,18 @@ At any level, in logs, metrics, spans, resource attributes or HTTP bodies:
   version (OS, platform and environment fields are never emitted);
 - verbatim MongoDB server error messages;
 - raw wire-protocol bytes;
-- connection strings and URLs that contain userinfo, including OTLP endpoint
+- MongoDB connection strings, with or without credentials, and URLs that
+  contain userinfo, including OTLP endpoint
   URLs; the values of `OTEL_EXPORTER_OTLP_HEADERS` and
   `OTEL_EXPORTER_OTLP_TRACES_HEADERS`;
 - TLS private key material and the contents of certificate and key files;
 - recovered panic values;
 - free text from third-party log sources.
+
+What may appear in logs and spans (FR-25 allowlist): client IP and port,
+upstream host and port, database and collection names, connection, request,
+session (UUID only) and cursor IDs, client `appName`, driver name and version,
+and `host.name` as a resource attribute on spans.
 
 Errors are reported through a classification (the `error.type` and
 `corral.error.detail` keys) rather than their text. The client `appName` (truncated to 128 bytes) and
@@ -206,7 +222,7 @@ and is never an error.
 | `OTEL_EXPORTER_OTLP_HEADERS`, `..._TRACES_HEADERS` | Comma-separated `key=value`; keys are non-empty HTTP tokens; values valid percent-encoding | none |
 | `OTEL_EXPORTER_OTLP_TIMEOUT`, `..._TRACES_TIMEOUT` | Non-negative integer, milliseconds | SDK default |
 | `OTEL_EXPORTER_OTLP_COMPRESSION`, `..._TRACES_COMPRESSION` | `gzip` or `none` (exact, lowercase) | SDK default |
-| `OTEL_EXPORTER_OTLP_INSECURE`, `..._TRACES_INSECURE` | `true` or `false` (case-insensitive) | SDK default |
+| `OTEL_EXPORTER_OTLP_INSECURE`, `..._TRACES_INSECURE` | `true` or `false` (case-insensitive; see security warnings) | SDK default |
 | `OTEL_EXPORTER_OTLP_CERTIFICATE`, `..._TRACES_CERTIFICATE` | Path to a readable PEM file with at least one parsable certificate | none |
 | `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE` and `..._CLIENT_KEY` (and `_TRACES_` forms) | Both must be set under the same prefix and form a valid key pair. Key formats PKCS#8, PKCS#1, SEC1; encrypted keys are rejected. | none |
 | `OTEL_TRACES_SAMPLER` | `always_on`, `always_off`, `traceidratio`, `parentbased_always_on`, `parentbased_always_off`, `parentbased_traceidratio` (case-insensitive) | unset (parent-based ratio) |
@@ -220,16 +236,16 @@ directories, FIFOs or devices); symlinks are followed. Paths and file contents
 are never logged. The exporters read the standard `OTEL_EXPORTER_OTLP_*`
 variables themselves from the process environment, so for the TLS and header
 variables use your secrets mechanism rather than writing values into manifests
-or scripts. Examples with placeholders only:
+or scripts. Header values are percent-encoded (a space is `%20`). Examples with placeholders only:
 
 ```
 OTEL_TRACES_EXPORTER=otlp
 OTEL_EXPORTER_OTLP_PROTOCOL=grpc
 OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://<YOUR_COLLECTOR_HOST>:4317
-OTEL_EXPORTER_OTLP_HEADERS=authorization=<YOUR_API_KEY>
-OTEL_EXPORTER_OTLP_CERTIFICATE=<PATH_TO_CA_PEM>
-OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE=<PATH_TO_CLIENT_CERT_PEM>
-OTEL_EXPORTER_OTLP_CLIENT_KEY=<PATH_TO_CLIENT_KEY_PEM>
+OTEL_EXPORTER_OTLP_HEADERS=authorization=Bearer%20<YOUR_API_KEY>
+OTEL_EXPORTER_OTLP_CERTIFICATE=<YOUR_CA_PEM_PATH>
+OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE=<YOUR_CLIENT_CERT_PEM_PATH>
+OTEL_EXPORTER_OTLP_CLIENT_KEY=<YOUR_CLIENT_KEY_PEM_PATH>
 ```
 
 Headers sent over a plain `http://` endpoint (or with `..._INSECURE=true`) are

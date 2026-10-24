@@ -18,7 +18,7 @@ Requires Go (see `go.mod`).
 
 - `make build` builds `bin/corral`.
 - `make test` runs `go vet` and the unit and integration tests.
-- `make test-functional` runs the binary-level tests (builds first).
+- `make test-functional` runs the binary-level tests (builds first); available once the functional suite lands (T18).
 
 ## Documentation
 
