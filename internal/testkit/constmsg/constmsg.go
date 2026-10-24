@@ -12,7 +12,22 @@
 // logger (for example an interface with an Info(msg string) method) are not
 // tracked, and neither are messages passed to the *log.Logger returned by
 // slog.NewLogLogger (its Printf and friends). The latter is to be revisited
-// at T8, where the bridges that use it are built.
+// at T8 (see below).
+//
+// slog.NewLogLogger: its Printf and friends cannot be tracked, so every
+// reference to slog.NewLogLogger is reported unless the package path ends in
+// internal/infra/telemetry/logbridge, and an allow annotation never exempts
+// it. Outcome (T8): accepted inside logbridge, because the bridges there
+// replace the message with a constant whatever is printed.
+//
+// Allow annotation: a call in a _test.go file that intentionally passes a
+// non-constant message (for example a test simulating a third-party caller of
+// slog.Default) can be exempted with the exact keyword "//constmsg:allow" followed by whitespace and
+// a non-empty reason. A comment on a line of its own covers only the next line;
+// a trailing comment covers only its own line. "//constmsg:allowed", a bare
+// keyword and a keyword without a reason do not count. In files that do not
+// end in _test.go the annotation is ignored and the finding stays. A finding is reported
+// at the line of the call expression, which is where the annotation must apply.
 package constmsg
 
 import (
@@ -113,8 +128,15 @@ func Check(dir string, patterns ...string) ([]Finding, error) {
 				}
 				return true
 			})
+			allowed := map[int]bool{}
+			if strings.HasSuffix(p.Fset.Position(file.Pos()).Filename, "_test.go") {
+				allowed = allowedLines(p.Fset, file)
+			}
 			report := func(pos token.Pos, name, msg string) {
 				ps := p.Fset.Position(pos)
+				if allowed[ps.Line] {
+					return
+				}
 				key := fmt.Sprintf("%s:%d", ps.Filename, ps.Line)
 				if seen[key] {
 					return
@@ -125,6 +147,21 @@ func Check(dir string, patterns ...string) ([]Finding, error) {
 			ast.Inspect(file, func(n ast.Node) bool {
 				id, ok := n.(*ast.Ident)
 				if !ok {
+					return true
+				}
+				if fn, ok := info.Uses[id].(*types.Func); ok && fn.Pkg() != nil &&
+					fn.Pkg().Path() == "log/slog" && fn.Name() == "NewLogLogger" && !inLogbridge(p.PkgPath) {
+					pos := id.Pos()
+					if call, isCall := callOf[id]; isCall {
+						pos = call.Pos()
+					}
+					ps := p.Fset.Position(pos)
+					key := fmt.Sprintf("%s:%d", ps.Filename, ps.Line)
+					if !seen[key] {
+						seen[key] = true
+						out = append(out, Finding{File: ps.Filename, Line: ps.Line, Column: ps.Column, Package: p.PkgPath, Func: fn.Name(),
+							Message: "slog.NewLogLogger is only allowed in the logbridge package"})
+					}
 					return true
 				}
 				fn, idx, ok := slogFunc(info, id)
@@ -204,4 +241,55 @@ func slogFunc(info *types.Info, id *ast.Ident) (*types.Func, int, bool) {
 		return fn, 2, true
 	}
 	return fn, idx, true
+}
+
+const allowKeyword = "//constmsg:allow"
+
+// allowedLines returns the lines exempted by //constmsg:allow annotations in
+// file: the next line for a comment on its own line, the same line for a
+// trailing comment.
+func allowedLines(fset *token.FileSet, file *ast.File) map[int]bool {
+	var comments []*ast.Comment
+	for _, g := range file.Comments {
+		for _, c := range g.List {
+			rest, ok := strings.CutPrefix(c.Text, allowKeyword)
+			if !ok || rest == "" || (rest[0] != ' ' && rest[0] != '\t') || strings.TrimSpace(rest) == "" {
+				continue
+			}
+			comments = append(comments, c)
+		}
+	}
+	out := map[int]bool{}
+	if len(comments) == 0 {
+		return out
+	}
+	// Lines on which code starts or ends: a comment on such a line is trailing.
+	code := map[int]bool{}
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch n.(type) {
+		case nil, *ast.Comment, *ast.CommentGroup:
+			return false
+		}
+		code[fset.Position(n.Pos()).Line] = true
+		code[fset.Position(n.End()).Line] = true
+		return true
+	})
+	for _, c := range comments {
+		line := fset.Position(c.Slash).Line
+		if code[line] {
+			out[line] = true
+		} else {
+			out[line+1] = true
+		}
+	}
+	return out
+}
+
+// inLogbridge reports whether pkgPath is the logbridge package, the only place
+// slog.NewLogLogger is accepted.
+func inLogbridge(pkgPath string) bool {
+	const suffix = "internal/infra/telemetry/logbridge"
+	pkgPath, _, _ = strings.Cut(pkgPath, " ") // test variants: "path [path.test]"
+	pkgPath = strings.TrimSuffix(pkgPath, "_test")
+	return pkgPath == suffix || strings.HasSuffix(pkgPath, "/"+suffix)
 }

@@ -127,9 +127,12 @@ func TestBuildTaggedFilesAreChecked(t *testing.T) {
 // the bad ones, and "./..." finds them as well.
 func TestPatternsSelectPackages(t *testing.T) {
 	dir := fixture(t)
-	all, _ := wantLocs(t, filepath.Join(dir, "bad"))
-	want := len(all)
-	for _, patterns := range [][]string{{"./..."}, {"./good", "./bad"}} {
+	want := 0
+	for _, d := range []string{"bad", "allow", "newlog"} {
+		all, _ := wantLocs(t, filepath.Join(dir, d))
+		want += len(all)
+	}
+	for _, patterns := range [][]string{{"./..."}, {"./good", "./bad", "./allow", "./newlog", "./internal/infra/telemetry/logbridge"}} {
 		fs, err := constmsg.Check(dir, patterns...)
 		if err != nil {
 			t.Fatalf("Check(%v): %v", patterns, err)
@@ -183,5 +186,72 @@ func TestLoadIsHermetic(t *testing.T) {
 	if _, err := os.Stat(sentinel); err == nil {
 		b, _ := os.ReadFile(sentinel)
 		t.Errorf("an external tool (gopackagesdriver or C compiler) was executed %d time(s)", strings.Count(string(b), "ran"))
+	}
+}
+
+// AC-5 (static check), Orchestrator decision for T8: the annotation is honoured
+// only in _test.go files (allow_test.go); a correctly annotated non-constant
+// call in the non-test file annotated.go is still reported. A call carrying
+// "//constmsg:allow <reason>" on its own line or on the line before it is not
+// reported (a); an annotation with no reason, or a different keyword, is still
+// reported (b); an annotation covers only its own line (c).
+func TestAllowAnnotation(t *testing.T) {
+	dir := fixture(t)
+	fs, err := constmsg.Check(dir, "./allow")
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	want, _ := wantLocs(t, filepath.Join(dir, "allow"))
+	if len(want) != 6 {
+		t.Fatalf("fixture has %d want markers, want 6 (5 in allow_test.go, 1 in annotated.go)", len(want))
+	}
+	got := map[loc]bool{}
+	for _, f := range fs {
+		got[loc{filepath.Base(f.File), f.Line}] = true
+	}
+	for _, l := range want {
+		if !got[l] {
+			t.Errorf("missing finding at %s:%d (annotation must not cover it)", l.file, l.line)
+		}
+		delete(got, l)
+	}
+	for l := range got {
+		t.Errorf("annotated line reported: %s:%d", l.file, l.line)
+	}
+}
+
+// AC-5, FR-28 (T8 review): slog.NewLogLogger outside the logbridge package
+// path is reported (even with an allow annotation, which is not honoured
+// here); inside internal/infra/telemetry/logbridge it is not.
+func TestNewLogLoggerOnlyAllowedInLogbridge(t *testing.T) {
+	dir := fixture(t)
+	fs, err := constmsg.Check(dir, "./newlog")
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	want, _ := wantLocs(t, filepath.Join(dir, "newlog"))
+	if len(want) != 2 {
+		t.Fatalf("fixture has %d want markers, want 2", len(want))
+	}
+	got := map[loc]bool{}
+	for _, f := range fs {
+		got[loc{filepath.Base(f.File), f.Line}] = true
+	}
+	for _, l := range want {
+		if !got[l] {
+			t.Errorf("missing finding at %s:%d", l.file, l.line)
+		}
+		delete(got, l)
+	}
+	for l := range got {
+		t.Errorf("unexpected finding at %s:%d", l.file, l.line)
+	}
+
+	fs, err = constmsg.Check(dir, "./internal/infra/telemetry/logbridge")
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if len(fs) != 0 {
+		t.Errorf("NewLogLogger reported inside the logbridge path: %+v", fs)
 	}
 }
