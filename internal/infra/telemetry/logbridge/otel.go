@@ -50,8 +50,13 @@ func NewOTelLogSink(f *logging.Factory, now func() time.Time) logr.LogSink {
 	return &otelLogSink{lg: logger(f, logging.OTel), info: newLimiter(now), errl: newLimiter(now)}
 }
 
-func (s *otelLogSink) Init(logr.RuntimeInfo)          {}
-func (s *otelLogSink) Enabled(int) bool               { return true }
+func (s *otelLogSink) Init(logr.RuntimeInfo) {}
+
+// Enabled follows the factory handler at debug, the level Info maps to.
+func (s *otelLogSink) Enabled(int) bool {
+	return s.lg.Enabled(context.Background(), slog.LevelDebug)
+}
+
 func (s *otelLogSink) WithValues(...any) logr.LogSink { return s }
 func (s *otelLogSink) WithName(string) logr.LogSink   { return s }
 

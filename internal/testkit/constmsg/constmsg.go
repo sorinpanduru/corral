@@ -12,14 +12,21 @@
 // logger (for example an interface with an Info(msg string) method) are not
 // tracked, and neither are messages passed to the *log.Logger returned by
 // slog.NewLogLogger (its Printf and friends). The latter is to be revisited
-// at T8, where the bridges that use it are built.
+// at T8 (see below).
 //
-// Allow annotation: a call that intentionally passes a non-constant message
-// (for example a test simulating a third-party caller of slog.Default) can be
-// exempted with the exact keyword "//constmsg:allow" followed by whitespace and
+// slog.NewLogLogger: its Printf and friends cannot be tracked, so every
+// reference to slog.NewLogLogger is reported unless the package path ends in
+// internal/infra/telemetry/logbridge, and an allow annotation never exempts
+// it. Outcome (T8): accepted inside logbridge, because the bridges there
+// replace the message with a constant whatever is printed.
+//
+// Allow annotation: a call in a _test.go file that intentionally passes a
+// non-constant message (for example a test simulating a third-party caller of
+// slog.Default) can be exempted with the exact keyword "//constmsg:allow" followed by whitespace and
 // a non-empty reason. A comment on a line of its own covers only the next line;
 // a trailing comment covers only its own line. "//constmsg:allowed", a bare
-// keyword and a keyword without a reason do not count. A finding is reported
+// keyword and a keyword without a reason do not count. In files that do not
+// end in _test.go the annotation is ignored and the finding stays. A finding is reported
 // at the line of the call expression, which is where the annotation must apply.
 package constmsg
 
@@ -121,7 +128,10 @@ func Check(dir string, patterns ...string) ([]Finding, error) {
 				}
 				return true
 			})
-			allowed := allowedLines(p.Fset, file)
+			allowed := map[int]bool{}
+			if strings.HasSuffix(p.Fset.Position(file.Pos()).Filename, "_test.go") {
+				allowed = allowedLines(p.Fset, file)
+			}
 			report := func(pos token.Pos, name, msg string) {
 				ps := p.Fset.Position(pos)
 				if allowed[ps.Line] {
@@ -137,6 +147,21 @@ func Check(dir string, patterns ...string) ([]Finding, error) {
 			ast.Inspect(file, func(n ast.Node) bool {
 				id, ok := n.(*ast.Ident)
 				if !ok {
+					return true
+				}
+				if fn, ok := info.Uses[id].(*types.Func); ok && fn.Pkg() != nil &&
+					fn.Pkg().Path() == "log/slog" && fn.Name() == "NewLogLogger" && !inLogbridge(p.PkgPath) {
+					pos := id.Pos()
+					if call, isCall := callOf[id]; isCall {
+						pos = call.Pos()
+					}
+					ps := p.Fset.Position(pos)
+					key := fmt.Sprintf("%s:%d", ps.Filename, ps.Line)
+					if !seen[key] {
+						seen[key] = true
+						out = append(out, Finding{File: ps.Filename, Line: ps.Line, Column: ps.Column, Package: p.PkgPath, Func: fn.Name(),
+							Message: "slog.NewLogLogger is only allowed in the logbridge package"})
+					}
 					return true
 				}
 				fn, idx, ok := slogFunc(info, id)
@@ -258,4 +283,13 @@ func allowedLines(fset *token.FileSet, file *ast.File) map[int]bool {
 		}
 	}
 	return out
+}
+
+// inLogbridge reports whether pkgPath is the logbridge package, the only place
+// slog.NewLogLogger is accepted.
+func inLogbridge(pkgPath string) bool {
+	const suffix = "internal/infra/telemetry/logbridge"
+	pkgPath, _, _ = strings.Cut(pkgPath, " ") // test variants: "path [path.test]"
+	pkgPath = strings.TrimSuffix(pkgPath, "_test")
+	return pkgPath == suffix || strings.HasSuffix(pkgPath, "/"+suffix)
 }

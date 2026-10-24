@@ -36,8 +36,8 @@ func (l *levelLimiters) of(lvl slog.Level) *ratelimit.Limiter {
 }
 
 // bridgeHandler is a slog.Handler that discards the record's message and
-// attributes and emits one fixed message, limited per level. fixedMsg picks
-// the constant; it is set only to package constants.
+// attributes and emits one fixed message, limited per level. The emit closures exist so
+// that each LogAttrs call site passes a constant message the lint can see.
 type bridgeHandler struct {
 	lg    *slog.Logger
 	level slog.Leveler
