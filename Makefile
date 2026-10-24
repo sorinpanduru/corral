@@ -7,7 +7,7 @@ VERSION ?= devel
 # Accept only characters that are safe in a linker flag and in a one-line
 # version string.
 export VERSION
-ifeq ($(shell printf '%s' "$$VERSION" | grep -Ec '^[A-Za-z0-9._+-]+$$'),0)
+ifneq ($(shell case "$$VERSION" in (''|*[!A-Za-z0-9._+-]*) echo bad;; esac),)
 $(error VERSION must match ^[A-Za-z0-9._+-]+$$)
 endif
 
