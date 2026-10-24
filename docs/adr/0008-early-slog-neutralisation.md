@@ -14,14 +14,16 @@ stdlib default handler writes it to stderr.
 
 Package `internal/infra/telemetry/earlyslog` (stdlib imports only) sets, in its
 init, a slog default handler that keeps only a per-level counter and drops
-message and attributes. Go initialises packages in dependency order, ties
-broken by import path; `github.com/sorinpanduru/...` sorts before
-`go.opentelemetry.io/...` and earlyslog has no non-stdlib dependencies.
-earlyslog does not run first overall: standard-library packages, and packages
-that import only `log` (not `log/slog`), may initialise earlier. The property
-is narrower: earlyslog initialises before every linked third-party package that
-uses `log/slog` or `log` at init, apart from the reviewed allowlist. The
-init-order guard (tests/functional/initorder_test.go) enforces this property.
+message and attributes. Go initialises packages in dependency order; import
+path sort order is not relied on. earlyslog has no non-stdlib dependencies, but
+the real init trace places it at about position 109, after many otel and grpc
+packages, and it does not run first overall: standard-library packages, and
+packages that import only `log` (not `log/slog`), may initialise earlier. What
+is relied on is a trace-based guard
+(tests/functional/initorder_test.go, T24.2). It checks that earlyslog
+initialises before every linked third-party package that depends on `log/slog`
+(transitively), and that any other package depending on `log` is on a reviewed
+allowlist. It fails on any un-reviewed dependent regardless of import path.
 cmd/corral blank-imports earlyslog and logbridge imports it, so it is always
 linked. `logbridge.Install` calls `earlyslog.Handoff`, which returns the counts and makes
 later records of handlers captured during init forward to the bridge handler.
@@ -38,9 +40,19 @@ Raw values are never retained or output.
 
 Correctness relies on init ordering; this is pinned by the T22 functional
 test (the binary must have empty stderr) and by the init-order guard, which
-checks the property stated above against the linked dependency set. A future dependency whose import
-path sorts before `github.com/sorinpanduru` and logs at init would not be
-covered. Rejected: removing auto/sdk (unavoidable transitive dependency).
+checks the property stated above against the linked dependency set. Rejected:
+removing auto/sdk (unavoidable transitive dependency).
+
+Remaining risks the guard does not cover:
+
+- (a) The allowlist review being wrong: an allowlisted `log` user that does
+  write at init would reach stderr unneutralised.
+- (b) Output written directly to `os.Stderr` without going through `log` or
+  `slog`.
+- (c) Loggers built over `os.Stderr` at init (for example grpclog's
+  `log.New(os.Stderr, ...)`) bypass earlyslog entirely until `logbridge.Install`
+  swaps the grpclog logger. This is guarded by
+  TestT24_GRPCLogNeverReachesStderr (T24.3).
 
 Residual risk: a package that imports only `log` (not `log/slog`) can be
 initialised before `log/slog` and therefore before earlyslog, regardless of
