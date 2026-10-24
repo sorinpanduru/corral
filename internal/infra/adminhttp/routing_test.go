@@ -136,7 +136,8 @@ func TestQueryStringIgnored(t *testing.T) {
 	r.srv.MarkStarted()
 	m := marker(t)
 	wantCode, wantHdr, wantBody := r.get(t, "/healthz")
-	for _, q := range []string{"?x=1", "?", "?" + m, "?a=b&a=c&ready=true", "?reason=ok"} {
+	for _, q := range []string{"?x=1", "?", "?" + m, "?a=b&a=c&ready=true", "?reason=ok",
+		"?name[]=go_goroutines", "?name%5B%5D=go_goroutines"} {
 		code, hdr, body := r.get(t, "/healthz"+q)
 		if code != wantCode || body != wantBody || hdr.Get("Content-Type") != wantHdr.Get("Content-Type") {
 			t.Errorf("/healthz%s differs: %d %q", q, code, body)
@@ -148,6 +149,11 @@ func TestQueryStringIgnored(t *testing.T) {
 		mc, _, mb := r.get(t, "/metrics"+q)
 		if mc != 200 || strings.Contains(mb, m) {
 			t.Errorf("/metrics%s = %d (echo=%v)", q, mc, strings.Contains(mb, m))
+		}
+		// (D) the query has no effect: no family filtering (name[]=...).
+		if !strings.Contains(mb, "\ncorral_tracing_spans_dropped_total") && !strings.HasPrefix(mb, "corral_tracing_spans_dropped_total") ||
+			!strings.Contains(mb, "\nprocess_") || !strings.Contains(mb, "\ngo_") {
+			t.Errorf("/metrics%s lost families: query must not filter", q)
 		}
 	}
 	// 404 for an unknown path stays 404 with a query.

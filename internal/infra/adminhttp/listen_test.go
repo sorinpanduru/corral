@@ -1,10 +1,13 @@
 package adminhttp_test
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"syscall"
@@ -33,11 +36,7 @@ func TestListenConfiguredAddress(t *testing.T) {
 
 // AC-11 (FR-16): 0.0.0.0:<port> binds all IPv4 interfaces.
 func TestListenAllIPv4(t *testing.T) {
-	srv := adminhttp.New(adminhttp.Options{Addr: "0.0.0.0:0", Gatherer: newRegistry(t), ErrorLog: newLogs(t).l})
-	if err := srv.Listen(); err != nil {
-		t.Fatal(err)
-	}
-	defer srv.Shutdown(t.Context())
+	srv := listenOnly(t, adminhttp.Options{Addr: "0.0.0.0:0", Gatherer: newRegistry(t), ErrorLog: newLogs(t).l})
 	ta := srv.Addr().(*net.TCPAddr)
 	// Go may report the IPv4 wildcard as 0.0.0.0 or as the dual-stack [::].
 	if !ta.IP.IsUnspecified() {
@@ -66,7 +65,7 @@ func TestListenDefaultAddress(t *testing.T) {
 	if err := srv.Listen(); err != nil {
 		t.Skipf("default address not bindable here: %v", err)
 	}
-	defer srv.Shutdown(t.Context())
+	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) }) // release 9187
 	if got := srv.Addr().String(); got != "127.0.0.1:9187" {
 		t.Fatalf("Addr() = %q, want 127.0.0.1:9187", got)
 	}
@@ -238,5 +237,135 @@ func TestReadHeaderTimeoutSet(t *testing.T) {
 			}
 			break // EOF or reset: the server closed the connection
 		}
+	}
+}
+
+// Shutdown after Listen without Serve releases the port; a second Listen on the
+// same Server is an error (no panic, no second socket).
+func TestShutdownWithoutServeReleasesPort(t *testing.T) {
+	srv := listenOnly(t, adminhttp.Options{Addr: loopback, Gatherer: newRegistry(t), ErrorLog: newLogs(t).l})
+	addr := srv.Addr().String()
+	if err := srv.Listen(); err == nil {
+		t.Fatal("second Listen on the same Server succeeded")
+	}
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Logf("Shutdown without Serve returned %v", err)
+	}
+	again, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("port not released by Shutdown: %v", err)
+	}
+	again.Close()
+	srv2 := listenOnly(t, adminhttp.Options{Addr: addr, Gatherer: newRegistry(t), ErrorLog: newLogs(t).l})
+	_ = srv2
+}
+
+// Serve before Listen fails with a non-config error and does not block.
+func TestServeBeforeListen(t *testing.T) {
+	srv := adminhttp.New(adminhttp.Options{Addr: loopback, Gatherer: newRegistry(t), ErrorLog: newLogs(t).l})
+	res := make(chan error, 1)
+	go func() { res <- srv.Serve() }()
+	select {
+	case err := <-res:
+		if err == nil {
+			t.Fatal("Serve before Listen returned nil")
+		}
+		var ce *config.Error
+		if errors.As(err, &ce) {
+			t.Fatalf("Serve before Listen returned a config error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		_ = srv.Shutdown(context.Background())
+		t.Fatal("Serve before Listen blocked")
+	}
+}
+
+// Server limits (plan T17, round 1): documented defaults are exported constants.
+func TestLimitConstants(t *testing.T) {
+	if time.Duration(adminhttp.IdleTimeout) != 60*time.Second {
+		t.Errorf("IdleTimeout = %v", adminhttp.IdleTimeout)
+	}
+	if time.Duration(adminhttp.ReadTimeout) != 10*time.Second {
+		t.Errorf("ReadTimeout = %v", adminhttp.ReadTimeout)
+	}
+	if time.Duration(adminhttp.WriteTimeout) != 30*time.Second {
+		t.Errorf("WriteTimeout = %v", adminhttp.WriteTimeout)
+	}
+	if int(adminhttp.MaxHeaderBytes) != 16<<10 {
+		t.Errorf("MaxHeaderBytes = %v", adminhttp.MaxHeaderBytes)
+	}
+}
+
+// An idle keep-alive connection is closed by the server (Options.IdleTimeout
+// overrides the 60 s default for tests).
+func TestIdleKeepAliveClosed(t *testing.T) {
+	r := startOpts(t, adminhttp.Options{IdleTimeout: 300 * time.Millisecond})
+	c := rawConn(t, r)
+	if _, err := c.Write([]byte("GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("first response: %v %v", resp, err)
+	}
+	resp.Body.Close()
+	if !waitClosed(c, 5*time.Second) {
+		t.Fatal("idle keep-alive connection not closed (IdleTimeout not applied)")
+	}
+}
+
+// A request announcing a body that never arrives is cut off within ReadTimeout
+// (Options.ReadTimeout overrides the 10 s default for tests).
+func TestReadTimeoutOnStalledBody(t *testing.T) {
+	r := startOpts(t, adminhttp.Options{ReadTimeout: 500 * time.Millisecond})
+	c := rawConn(t, r)
+	if _, err := c.Write([]byte("GET /healthz HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if !waitClosed(c, 5*time.Second) {
+		t.Fatal("connection with a stalled body not closed (ReadTimeout not applied)")
+	}
+}
+
+// Headers over the limit get 431; ordinary large headers still work. Go adds
+// 4 KiB slack to MaxHeaderBytes, so the oversize case uses 32 KiB.
+func TestHeaderSizeLimit(t *testing.T) {
+	r := startOpts(t, adminhttp.Options{})
+	status := func(n int) int {
+		c := rawConn(t, r)
+		req := "GET /healthz HTTP/1.1\r\nHost: x\r\nX-Big: " + strings.Repeat("a", n) + "\r\n\r\n"
+		_, _ = c.Write([]byte(req)) // the server may reset while we are still writing
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+		if err != nil {
+			t.Fatalf("%d-byte header: no response: %v", n, err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if got := status(4 << 10); got != 200 {
+		t.Errorf("4 KiB header = %d, want 200", got)
+	}
+	if got := status(32 << 10); got != http.StatusRequestHeaderFieldsTooLarge {
+		t.Errorf("32 KiB header = %d, want 431", got)
+	}
+}
+
+// OPTIONS * is not answered by net/http's built-in handler: 404.
+func TestOptionsStarIs404(t *testing.T) {
+	r := startOpts(t, adminhttp.Options{})
+	c := rawConn(t, r)
+	if _, err := c.Write([]byte("OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("OPTIONS * = %d, want 404", resp.StatusCode)
 	}
 }

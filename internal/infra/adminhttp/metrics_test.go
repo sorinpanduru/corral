@@ -1,6 +1,9 @@
 package adminhttp_test
 
 import (
+	"context"
+	"errors"
+	"github.com/sorinpanduru/corral/internal/infra/adminhttp"
 	"net/http"
 	"regexp"
 	"strings"
@@ -60,7 +63,7 @@ func TestMetricsPrivateRegistryOnly(t *testing.T) {
 	}
 }
 
-// FR-9: OpenMetrics negotiation is allowed but exemplars must stay off.
+// FR-9: exemplars must stay off whatever the client asks for.
 func TestMetricsNoExemplars(t *testing.T) {
 	m := strings.ToLower(marker(t))
 	reg := newRegistry(t)
@@ -92,9 +95,8 @@ func TestMetricsNoExemplars(t *testing.T) {
 		if code != 200 {
 			t.Fatalf("Accept %q: /metrics = %d", accept, code)
 		}
-		ct := hdr.Get("Content-Type")
-		if !strings.HasPrefix(ct, "text/plain") && !strings.HasPrefix(ct, "application/openmetrics-text") {
-			t.Errorf("Accept %q: Content-Type = %q", accept, ct)
+		if ct := hdr.Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+			t.Errorf("Accept %q: Content-Type = %q, want text/plain", accept, ct)
 		}
 		if strings.Contains(body, ex) {
 			t.Errorf("Accept %q: exemplar present in /metrics", accept)
@@ -106,4 +108,71 @@ func TestMetricsNoExemplars(t *testing.T) {
 			t.Errorf("Accept %q: counter itself missing", accept)
 		}
 	}
+}
+
+// (D) Only the Prometheus text format is served: protobuf and OpenMetrics
+// Accept headers still get text/plain; version=0.0.4.
+func TestMetricsOnlyTextFormat(t *testing.T) {
+	r := start(t, nil, nil)
+	for _, accept := range []string{
+		"application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=delimited",
+		"application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=text",
+		openMetricsAccept, "application/openmetrics-text", "*/*", "",
+	} {
+		code, hdr, body := r.do(t, http.MethodGet, "/metrics", map[string]string{"Accept": accept})
+		ct := hdr.Get("Content-Type")
+		if code != 200 || !strings.HasPrefix(ct, "text/plain") || !strings.Contains(ct, "version=0.0.4") {
+			t.Errorf("Accept %q: %d %q, want 200 text/plain; version=0.0.4", accept, code, ct)
+		}
+		if !strings.HasPrefix(body, "# HELP ") && !strings.Contains(body, "\n# HELP ") {
+			t.Errorf("Accept %q: body is not text exposition", accept)
+		}
+		if strings.Contains(body, "# EOF") {
+			t.Errorf("Accept %q: OpenMetrics terminator in body", accept)
+		}
+	}
+}
+
+// A Gatherer error never reaches the response: 500 with a fixed body, with an
+// ErrorLog and with a nil one (no panic).
+func TestMetricsGathererError(t *testing.T) {
+	m := marker(t)
+	g := failGatherer{err: errors.New(m + "\x1b[31m gather failed")}
+	check := func(t *testing.T, r *running) {
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			code, hdr, body := r.do(t, method, "/metrics", nil)
+			want := "error\n"
+			if method == http.MethodHead {
+				want = ""
+			}
+			if code != 500 || body != want || hdr.Get("Content-Type") != textPlainUTF {
+				t.Errorf("%s /metrics = %d %q %q, want 500 %q", method, code, body, hdr.Get("Content-Type"), want)
+			}
+			if strings.Contains(body+strings.Join(flat(hdr), "|"), m) {
+				t.Errorf("%s: gatherer error text leaked", method)
+			}
+		}
+		// the server survives
+		if code, _, _ := r.get(t, "/healthz"); code != 200 {
+			t.Errorf("healthz after gather error = %d", code)
+		}
+	}
+	t.Run("with ErrorLog", func(t *testing.T) {
+		r := startOpts(t, adminhttp.Options{Gatherer: g})
+		check(t, r)
+		if strings.Contains(r.logs.buf.String(), m) {
+			t.Error("gatherer error text leaked into logs")
+		}
+	})
+	t.Run("nil ErrorLog", func(t *testing.T) {
+		srv := adminhttp.New(adminhttp.Options{Addr: loopback, Gatherer: g})
+		if err := srv.Listen(); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- srv.Serve() }()
+		check(t, &running{srv: srv, base: "http://" + srv.Addr().String()})
+		_ = srv.Shutdown(context.Background())
+		<-done
+	})
 }

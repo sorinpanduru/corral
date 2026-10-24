@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/sorinpanduru/corral/internal/domain/health"
 	"github.com/sorinpanduru/corral/internal/infra/adminhttp"
@@ -39,6 +41,11 @@ import (
 //	(*Server).MarkStarted(), MarkStopping()
 //	(*Server).Handler() http.Handler
 //	(*Server).Shutdown(ctx) error
+//
+// Round 1 additions: Options.IdleTimeout and Options.ReadTimeout
+// (time.Duration, zero = default, for tests); exported constants IdleTimeout
+// (60s), ReadTimeout (10s), WriteTimeout (30s), MaxHeaderBytes (16<<10). Hint:
+// "OPTIONS *" needs http.Server.DisableGeneralOptionsHandler = true.
 //
 // Beyond that these tests assume: an empty Options.Addr means the FR-16
 // default 127.0.0.1:9187, a nil Readiness means "no check registered", and a
@@ -151,11 +158,25 @@ type running struct {
 // It does not call MarkStarted.
 func start(tb testing.TB, ready health.Readiness, reg prometheus.Gatherer) *running {
 	tb.Helper()
+	return startOpts(tb, adminhttp.Options{Readiness: ready, Gatherer: reg})
+}
+
+// startOpts is start with caller-supplied Options. Addr defaults to loopback
+// port 0, Gatherer to a fresh private registry and ErrorLog to the logbridge
+// logger wired through logcheck, unless set.
+func startOpts(tb testing.TB, o adminhttp.Options) *running {
+	tb.Helper()
 	lg := newLogs(tb)
-	if reg == nil {
-		reg = newRegistry(tb)
+	if o.Gatherer == nil {
+		o.Gatherer = newRegistry(tb)
 	}
-	srv := adminhttp.New(adminhttp.Options{Addr: loopback, Gatherer: reg, Readiness: ready, ErrorLog: lg.l})
+	if o.Addr == "" {
+		o.Addr = loopback
+	}
+	if o.ErrorLog == nil {
+		o.ErrorLog = lg.l
+	}
+	srv := adminhttp.New(o)
 	if err := srv.Listen(); err != nil {
 		tb.Fatalf("Listen: %v", err)
 	}
@@ -173,6 +194,51 @@ func start(tb testing.TB, ready health.Readiness, reg prometheus.Gatherer) *runn
 	})
 	return &running{srv: srv, base: "http://" + srv.Addr().String(), logs: lg}
 }
+
+// listenOnly listens (no Serve) and always releases the port in Cleanup.
+func listenOnly(tb testing.TB, o adminhttp.Options) *adminhttp.Server {
+	tb.Helper()
+	srv := adminhttp.New(o)
+	if err := srv.Listen(); err != nil {
+		tb.Fatalf("Listen: %v", err)
+	}
+	tb.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+	return srv
+}
+
+// rawConn dials the server for byte-level HTTP tests.
+func rawConn(tb testing.TB, r *running) net.Conn {
+	tb.Helper()
+	c, err := net.Dial("tcp", r.srv.Addr().String())
+	if err != nil {
+		tb.Fatal(err)
+	}
+	tb.Cleanup(func() { c.Close() })
+	return c
+}
+
+// waitClosed reports whether the server closes c within d (reading and
+// discarding anything it sends first).
+func waitClosed(c net.Conn, d time.Duration) bool {
+	_ = c.SetReadDeadline(time.Now().Add(d))
+	buf := make([]byte, 512)
+	for {
+		if _, err := c.Read(buf); err != nil {
+			var ne net.Error
+			return !(errors.As(err, &ne) && ne.Timeout())
+		}
+	}
+}
+
+// failGatherer is a prometheus.Gatherer whose error carries a marker and a
+// control character.
+type failGatherer struct{ err error }
+
+func (f failGatherer) Gather() ([]*dto.MetricFamily, error) { return nil, f.err }
 
 // do sends one request and returns status, headers and the body.
 func (r *running) do(tb testing.TB, method, path string, hdr map[string]string) (int, http.Header, string) {
