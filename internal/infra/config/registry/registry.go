@@ -11,7 +11,9 @@ package registry
 import (
 	"errors"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sorinpanduru/corral/internal/infra/config/types"
 )
@@ -179,7 +181,10 @@ func New(groups ...Group) (*Registry, error) {
 	var decls []Decl
 	groupOf := map[string]int{} // declaration name -> index in decls (first)
 	nsOwner := map[string]string{}
-	for _, g := range groups {
+	for i, g := range groups {
+		if g.Spec == "" {
+			p.add("group without spec", "group #"+strconv.Itoa(i+1))
+		}
 		for _, ns := range g.Namespaces {
 			if !isNameSegment(ns) {
 				p.add("invalid namespace", ns)
@@ -207,9 +212,14 @@ func New(groups ...Group) (*Registry, error) {
 			p.add("derived name collision", o)
 		}
 	}
+	ruleIDs := map[string]bool{}
 	for _, g := range groups {
 		for _, r := range g.Rules {
 			checkRule(p, r, groupOf)
+			if r.ID != "" && ruleIDs[r.ID] {
+				p.add("duplicate rule id", r.ID)
+			}
+			ruleIDs[r.ID] = true
 		}
 	}
 	if len(p) > 0 {
@@ -258,6 +268,9 @@ func checkDecl(p problems, g Group, d Decl) {
 			}
 		}
 	case PresenceRequired, PresenceOptional:
+		if d.Default != "" {
+			p.add("default text without default presence", d.Name)
+		}
 	default:
 		p.add("invalid presence", d.Name)
 	}
@@ -294,6 +307,7 @@ func build(groups []Group, decls []Decl) *Registry {
 		byName: map[string]int{}, byFlag: map[string]ref{}, byEnv: map[string]ref{},
 	}
 	for _, d := range decls {
+		d.Type.EnumValues = append([]string(nil), d.Type.EnumValues...)
 		s := Setting{Decl: d, Flag: d.Name, Env: EnvName(d.Name)}
 		if d.Secret {
 			s.FileFlag, s.FileEnv = d.Name+"_file", s.Env+"_FILE"
@@ -314,13 +328,44 @@ func build(groups []Group, decls []Decl) *Registry {
 		}
 	}
 	for _, g := range groups {
-		r.rules = append(r.rules, g.Rules...)
+		for _, c := range g.Rules {
+			c.Involves = append([]string(nil), c.Involves...)
+			r.rules = append(r.rules, c)
+		}
 	}
 	return r
 }
 
 // Settings returns every setting sorted by name, as a copy.
-func (r *Registry) Settings() []Setting { return append([]Setting(nil), r.settings...) }
+func (r *Registry) Settings() []Setting {
+	out := make([]Setting, len(r.settings))
+	for i, s := range r.settings {
+		out[i] = cloneSetting(s)
+	}
+	return out
+}
+
+// cloneSetting copies the slices a caller could mutate. DefaultValue lists are
+// cloned too.
+func cloneSetting(s Setting) Setting {
+	s.Type.EnumValues = append([]string(nil), s.Type.EnumValues...)
+	if s.Type.EnumValues != nil && len(s.Type.EnumValues) == 0 {
+		s.Type.EnumValues = nil
+	}
+	switch v := s.DefaultValue.(type) {
+	case []string:
+		s.DefaultValue = append([]string{}, v...)
+	case []int64:
+		s.DefaultValue = append([]int64{}, v...)
+	case []bool:
+		s.DefaultValue = append([]bool{}, v...)
+	case []float64:
+		s.DefaultValue = append([]float64{}, v...)
+	case []time.Duration:
+		s.DefaultValue = append([]time.Duration{}, v...)
+	}
+	return s
+}
 
 // Lookup finds a setting by logical name.
 func (r *Registry) Lookup(name string) (Setting, bool) {
@@ -328,7 +373,7 @@ func (r *Registry) Lookup(name string) (Setting, bool) {
 	if !ok {
 		return Setting{}, false
 	}
-	return r.settings[i], true
+	return cloneSetting(r.settings[i]), true
 }
 
 // ByFlag finds a setting by flag name (without dashes). fileRef reports that
@@ -338,7 +383,7 @@ func (r *Registry) ByFlag(flag string) (s Setting, fileRef bool, ok bool) {
 	if !ok {
 		return Setting{}, false, false
 	}
-	return r.settings[e.idx], e.fileRef, true
+	return cloneSetting(r.settings[e.idx]), e.fileRef, true
 }
 
 // ByEnv finds a setting by environment variable name; fileRef reports the
@@ -348,8 +393,15 @@ func (r *Registry) ByEnv(env string) (s Setting, fileRef bool, ok bool) {
 	if !ok {
 		return Setting{}, false, false
 	}
-	return r.settings[e.idx], e.fileRef, true
+	return cloneSetting(r.settings[e.idx]), e.fileRef, true
 }
 
 // CrossRules returns the cross rules in declaration order, as a copy.
-func (r *Registry) CrossRules() []CrossRule { return append([]CrossRule(nil), r.rules...) }
+func (r *Registry) CrossRules() []CrossRule {
+	out := make([]CrossRule, len(r.rules))
+	for i, c := range r.rules {
+		c.Involves = append([]string(nil), c.Involves...)
+		out[i] = c
+	}
+	return out
+}

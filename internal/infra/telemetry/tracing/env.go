@@ -285,7 +285,7 @@ func (r *resolver) resolve(in ResolveInputs) EnvConfig {
 		}
 	}
 	usesRatio := cfg.Sampler == SamplerUnset || cfg.Sampler == SamplerTraceIDRatio || cfg.Sampler == SamplerParentBasedTraceIDRatio
-	if v, ok := r.get(varSamplerArg); ok && usesRatio {
+	if v, ok := r.get(varSamplerArg); ok && usesRatio && !r.failed[varSampler] {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f > 1 {
 			r.fail(varSamplerArg, errBadSamplerArg)

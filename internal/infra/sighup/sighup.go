@@ -80,9 +80,13 @@ func (w *Watcher) run(ch <-chan os.Signal) {
 	}
 }
 
-// SetLogger installs a fresh Reporter (new rate-limit state) on l. The latest
+// SetLogger (nil clears the logger) installs a fresh Reporter (new rate-limit state) on l. The latest
 // logger wins.
 func (w *Watcher) SetLogger(l *slog.Logger) {
+	if l == nil { // nil means "no logger": signals are dropped again
+		w.reporter.Store(nil)
+		return
+	}
 	w.reporter.Store(NewReporter(l, w.now))
 }
 
