@@ -15,6 +15,7 @@ import (
 	"github.com/sorinpanduru/corral/internal/infra/config"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/errclass"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logging"
+	"github.com/sorinpanduru/corral/internal/testkit/logcheck"
 )
 
 // Compliance (FR-24, FR-27, GDPR data minimisation): every value in this file
@@ -29,6 +30,18 @@ func newMarker(tb testing.TB) string {
 		tb.Fatalf("rand: %v", err)
 	}
 	return "MARKER" + hex.EncodeToString(b)
+}
+
+// cfgLogger builds a component=config logger through the factory, behind the
+// logcheck handler (AC-5). LogError adds no component itself (D): the logger
+// passed in must already carry it.
+func cfgLogger(tb testing.TB, buf *bytes.Buffer) *slog.Logger {
+	tb.Helper()
+	l, err := logging.NewFactory(logcheck.New(tb, logcheck.Tee(buf, logging.FormatJSON))).Logger(logging.Config)
+	if err != nil {
+		tb.Fatalf("factory: %v", err)
+	}
+	return l
 }
 
 // settingOf extracts the setting a config error names, via the duck-typed
@@ -57,8 +70,8 @@ func requireRejected(tb testing.TB, err error, setting, marker string) {
 	if !isConfigError(err) {
 		tb.Fatalf("error %T is not a config.Error", err)
 	}
-	if got := settingOf(tb, err); !strings.Contains(got, setting) {
-		tb.Errorf("ConfigSetting() = %q, want it to name %q", got, setting)
+	if got := settingOf(tb, err); got != setting {
+		tb.Errorf("ConfigSetting() = %q, want %q", got, setting)
 	}
 	if !strings.Contains(err.Error(), setting) {
 		tb.Errorf("Error() = %q, want it to contain the setting name %q", err.Error(), setting)
@@ -75,7 +88,7 @@ func requireRejected(tb testing.TB, err error, setting, marker string) {
 	}
 	// The whole log record must also stay marker-free.
 	var buf bytes.Buffer
-	config.LogError(slog.New(logging.NewHandler(&buf, logging.FormatJSON, slog.LevelDebug)), err)
+	config.LogError(cfgLogger(tb, &buf), err)
 	assertNoMarker(tb, "log record", marker, buf.String())
 }
 
@@ -198,7 +211,7 @@ func TestParse_LogFormatAccepted(t *testing.T) {
 // AC-21 / FR-16 / B3: admin.listen accepted values, including explicit
 // all-interface hosts and port 0.
 func TestParse_AdminListenAccepted(t *testing.T) {
-	for _, in := range []string{"127.0.0.1:9187", "127.0.0.1:0", "0.0.0.0:9187", "0.0.0.0:65535", "[::]:9187", "[::1]:8080", "localhost:8080"} {
+	for _, in := range []string{"127.0.0.1:9187", "127.0.0.1:0", "0.0.0.0:9187", "0.0.0.0:65535", "[::]:9187", "[::1]:8080", "localhost:8080", "db-proxy.example.internal:9187"} {
 		t.Run(in, func(t *testing.T) {
 			s, err := config.Parse(map[string]string{config.SettingAdminListen: in})
 			if err != nil {
@@ -268,6 +281,18 @@ func TestParse_RejectsInvalid(t *testing.T) {
 		{"admin.listen negative port", config.SettingAdminListen, func(m string) string { return m + ".invalid:-1" }},
 		{"admin.listen text port", config.SettingAdminListen, func(m string) string { return "127.0.0.1:" + m }},
 		{"admin.listen empty", config.SettingAdminListen, lit("")},
+		{"admin.listen blank host", config.SettingAdminListen, lit(" :9187")},
+		{"admin.listen spaces in host", config.SettingAdminListen, lit(" a b :1")},
+		{"admin.listen newline in host", config.SettingAdminListen, lit("x\n:1")},
+		{"admin.listen numeric 0", config.SettingAdminListen, lit("0:9187")},
+		{"admin.listen numeric hex", config.SettingAdminListen, lit("0x0:9187")},
+		{"admin.listen numeric short ip", config.SettingAdminListen, lit("127.1:9187")},
+		{"admin.listen underscore host", config.SettingAdminListen, lit("a_b:9187")},
+		{"admin.listen label too long", config.SettingAdminListen, lit(strings.Repeat("a", 64) + ".example:9187")},
+		{"admin.listen host too long", config.SettingAdminListen, lit(strings.Repeat(strings.Repeat("a", 60)+".", 5) + "example:9187")},
+		{"admin.listen empty label", config.SettingAdminListen, lit("a..b:9187")},
+		{"admin.listen leading hyphen", config.SettingAdminListen, lit("-a.example:9187")},
+		{"admin.listen marker with control", config.SettingAdminListen, func(m string) string { return m + "\x01:9187" }},
 		{"admin.listen bare marker", config.SettingAdminListen, func(m string) string { return m }},
 		{"admin.listen bare ipv6 no port", config.SettingAdminListen, lit("[::]")},
 		{"tracing.enabled text", config.SettingTracingEnabled, func(m string) string { return m }},
@@ -312,7 +337,43 @@ func TestParse_NoEchoForEverySetting(t *testing.T) {
 func TestParse_UnknownSetting(t *testing.T) {
 	m := newMarker(t)
 	_, err := config.Parse(map[string]string{"log.levl": m})
-	requireRejected(t, err, "log.levl", m)
+	requireRejected(t, err, config.SettingUnknown, m)
+	assertNoMarker(t, "Error()", "log.levl", err.Error()) // unknown names are never echoed (D)
+	// A marker used as the key itself must not leak either.
+	_, err = config.Parse(map[string]string{m: "x"})
+	requireRejected(t, err, config.SettingUnknown, m)
+}
+
+// B3 / D: a 253-byte DNS name with 63-byte labels is accepted.
+func TestParse_AdminListenMaxDNSName(t *testing.T) {
+	host := strings.Join([]string{strings.Repeat("a", 63), strings.Repeat("b", 63), strings.Repeat("c", 63), strings.Repeat("d", 61)}, ".")
+	if len(host) != 253 {
+		t.Fatalf("test bug: len = %d", len(host))
+	}
+	if _, err := config.Parse(map[string]string{config.SettingAdminListen: host + ":9187"}); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+}
+
+// D: case variants of bool and format are accepted.
+func TestParse_CaseInsensitiveBoolAndFormat(t *testing.T) {
+	s, err := config.Parse(map[string]string{config.SettingTracingEnabled: "TRUE", config.SettingLogFormat: "JSON"})
+	if err != nil || !s.TracingEnabled || s.LogFormat != logging.FormatJSON {
+		t.Fatalf("got %+v, %v", s, err)
+	}
+	s, err = config.Parse(map[string]string{config.SettingTracingEnabled: "False"})
+	if err != nil || s.TracingEnabled {
+		t.Fatalf("got %+v, %v", s, err)
+	}
+}
+
+// FR-27 / D: LogError(nil) writes nothing.
+func TestLogError_Nil(t *testing.T) {
+	var buf bytes.Buffer
+	config.LogError(cfgLogger(t, &buf), nil)
+	if buf.Len() != 0 {
+		t.Fatalf("LogError(nil) wrote %q", buf.String())
+	}
 }
 
 // FR-27: a valid setting alongside an invalid one does not mask the error.
@@ -448,7 +509,7 @@ func TestLogError_Record(t *testing.T) {
 				t.Fatal("expected rejection")
 			}
 			var buf bytes.Buffer
-			config.LogError(slog.New(logging.NewHandler(&buf, logging.FormatJSON, slog.LevelDebug)), err)
+			config.LogError(cfgLogger(t, &buf), err)
 			rec := decodeRecord(t, &buf)
 			if rec["component"] != "config" {
 				t.Errorf("component = %v, want config", rec["component"])
@@ -466,8 +527,8 @@ func TestLogError_Record(t *testing.T) {
 				t.Errorf("level = %v, want ERROR", rec["level"])
 			}
 			msg, _ := rec["msg"].(string)
-			if msg == "" {
-				t.Error("msg is empty")
+			if msg != "invalid configuration" {
+				t.Errorf("msg = %q, want %q", msg, "invalid configuration")
 			}
 			assertNoMarker(t, "record", m, buf.String())
 			for k := range rec {
@@ -485,7 +546,7 @@ func TestLogError_ConstantMessage(t *testing.T) {
 	for _, s := range []string{config.SettingLogLevel, config.SettingAdminListen} {
 		_, err := config.Parse(map[string]string{s: ":"})
 		var buf bytes.Buffer
-		config.LogError(slog.New(logging.NewHandler(&buf, logging.FormatJSON, slog.LevelDebug)), err)
+		config.LogError(cfgLogger(t, &buf), err)
 		msgs[decodeRecord(t, &buf)["msg"].(string)] = true
 	}
 	if len(msgs) != 1 {
@@ -499,7 +560,7 @@ func TestLogError_BindFailureDetail(t *testing.T) {
 	m := newMarker(t)
 	err := config.NewError("admin.listen", fmt.Errorf("listen "+m+": %w", syscall.EADDRINUSE))
 	var buf bytes.Buffer
-	config.LogError(slog.New(logging.NewHandler(&buf, logging.FormatJSON, slog.LevelDebug)), err)
+	config.LogError(cfgLogger(t, &buf), err)
 	rec := decodeRecord(t, &buf)
 	if rec["setting"] != "admin.listen" || rec["error"] != "config" || rec["corral.error.detail"] != "EADDRINUSE" {
 		t.Fatalf("record = %v", rec)
@@ -511,7 +572,7 @@ func TestLogError_BindFailureDetail(t *testing.T) {
 func TestLogError_WrappedConfigError(t *testing.T) {
 	err := fmt.Errorf("startup: %w", config.NewError(config.SettingLogFormat, errors.New("x")))
 	var buf bytes.Buffer
-	config.LogError(slog.New(logging.NewHandler(&buf, logging.FormatJSON, slog.LevelDebug)), err)
+	config.LogError(cfgLogger(t, &buf), err)
 	rec := decodeRecord(t, &buf)
 	if rec["setting"] != config.SettingLogFormat {
 		t.Fatalf("setting = %v", rec["setting"])
@@ -528,6 +589,10 @@ func TestLogError_BootstrapLogger(t *testing.T) {
 	rec := decodeRecord(t, &buf)
 	if rec["component"] != "config" || rec["setting"] != config.SettingAdminListen {
 		t.Fatalf("record = %v", rec)
+	}
+	// LogError adds no component of its own: exactly one key in the raw line (D).
+	if n := strings.Count(buf.String(), `"component":`); n != 1 {
+		t.Fatalf("component key appears %d times, want 1: %q", n, buf.String())
 	}
 	assertNoMarker(t, "record", m, buf.String())
 }
@@ -612,22 +677,75 @@ func TestFromArgs_ValueContainingEquals(t *testing.T) {
 	}
 }
 
-// D1 / FR-27: unknown flag is a config error naming the flag, never the value.
+// D1 / FR-27 / D: an unknown flag is a config error with setting "unknown";
+// neither the flag name nor the value is ever echoed.
 func TestFromArgs_UnknownFlag(t *testing.T) {
 	for name, mk := range map[string]func(m string) string{
-		"with value":    func(m string) string { return "-no.such.flag=" + m },
-		"typo":          func(m string) string { return "-log.levl=" + m },
-		"without value": func(string) string { return "-no.such.flag" },
+		"with value":        func(m string) string { return "-no.such.flag=" + m },
+		"typo":              func(m string) string { return "-log.levl=" + m },
+		"without value":     func(string) string { return "-no.such.flag" },
+		"secret-like name":  func(m string) string { return "-" + m },
+		"secret-like value": func(m string) string { return "-" + m + "=v" },
+		"double dash name":  func(m string) string { return "--" + m + "=v" },
+		"newline in name":   func(m string) string { return "-bad\nname" + m + "=v" },
+		"control in name":   func(m string) string { return "-bad\x01\x1b[31mname" + m + "=v" },
+		"oversized name":    func(m string) string { return "-" + strings.Repeat("a", 1<<20) + m + "=v" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			m := newMarker(t)
-			_, err := config.FromArgs([]string{mk(m)})
-			flag := "no.such.flag"
-			if name == "typo" {
-				flag = "log.levl"
+			arg := mk(m)
+			_, err := config.FromArgs([]string{arg})
+			requireRejected(t, err, config.SettingUnknown, m)
+			for _, frag := range []string{"no.such.flag", "log.levl"} {
+				if strings.Contains(arg, frag) {
+					assertNoMarker(t, "Error()", frag, err.Error())
+				}
 			}
-			requireRejected(t, err, flag, m)
+			if len(err.Error()) > 1024 {
+				t.Errorf("Error() length %d is unbounded", len(err.Error()))
+			}
 		})
+	}
+}
+
+// D: malformed flags and positional arguments. "--" is not an end-of-flags
+// marker; it is a malformed flag.
+func TestFromArgs_MalformedAndPositional(t *testing.T) {
+	cases := []struct {
+		name    string
+		mk      func(m string) []string
+		setting string
+	}{
+		{"single dash", func(string) []string { return []string{"-"} }, config.SettingUnknown},
+		{"double dash", func(string) []string { return []string{"--"} }, config.SettingUnknown},
+		{"double dash then flags", func(string) []string { return []string{"--", "-log.level=debug"} }, config.SettingUnknown},
+		{"empty name with value", func(m string) []string { return []string{"-=" + m} }, config.SettingUnknown},
+		{"double dash empty name", func(m string) []string { return []string{"--=" + m} }, config.SettingUnknown},
+		{"empty arg", func(string) []string { return []string{""} }, config.SettingArgument},
+		{"positional", func(m string) []string { return []string{m} }, config.SettingArgument},
+		{"positional after flag", func(m string) []string { return []string{"-log.level=debug", m} }, config.SettingArgument},
+		{"positional with newline", func(m string) []string { return []string{"a\n" + m} }, config.SettingArgument},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := newMarker(t)
+			_, err := config.FromArgs(c.mk(m))
+			requireRejected(t, err, c.setting, m)
+		})
+	}
+	if config.SettingUnknown != "unknown" || config.SettingArgument != "argument" {
+		t.Fatalf("constants = %q, %q", config.SettingUnknown, config.SettingArgument)
+	}
+}
+
+// D1: a double-dash form of a known flag is accepted (Go flag style).
+func TestFromArgs_DoubleDashKnownFlag(t *testing.T) {
+	raw, err := config.FromArgs([]string{"--log.level=debug"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw[config.SettingLogLevel] != "debug" || len(raw) != 1 {
+		t.Fatalf("raw = %v", raw)
 	}
 }
 
@@ -652,7 +770,7 @@ func TestFromArgs_RepeatedFlag(t *testing.T) {
 	requireRejected(t, err, "log.level", m1)
 	assertNoMarker(t, "Error()", m2, err.Error())
 	var buf bytes.Buffer
-	config.LogError(slog.New(logging.NewHandler(&buf, logging.FormatJSON, slog.LevelDebug)), err)
+	config.LogError(cfgLogger(t, &buf), err)
 	assertNoMarker(t, "log record", m2, buf.String())
 }
 
