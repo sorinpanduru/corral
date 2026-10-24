@@ -44,7 +44,10 @@ func genSyntheticCA(t *testing.T) (certPath, keyPath string) {
 	if err != nil {
 		t.Fatalf("key: %v", err)
 	}
-	dir := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "t23pathmark-Kd4Ws9")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	certPath, keyPath = filepath.Join(dir, "ca.crt"), filepath.Join(dir, "client.k")
 	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
 		t.Fatal(err)
@@ -55,19 +58,14 @@ func genSyntheticCA(t *testing.T) (certPath, keyPath string) {
 	return certPath, keyPath
 }
 
-// T23 (FR-20, FR-27, FR-28, AC-15): TLS material (CA, client cert+key) combined
-// with a plain http:// OTLP endpoint is a valid configuration under standard
-// SDK semantics (http:// means plaintext). corral must start, become ready,
-// log no config or startup-failure record, keep stderr empty and exit 0 on
-// SIGTERM. Both protocols, general and _TRACES_ variants.
-//
-// SDK reference: otlptracehttp v1.47.0 client.go Start returns
-// errInsecureEndpointWithTLS when Insecure (set by an http:// scheme,
-// otlpconfig/options.go WithEndpointURL) meets a TLS config built from the
-// CERTIFICATE / CLIENT_CERTIFICATE variables. otlptracegrpc v1.47.0
-// otlpconfig/options.go prioritises GRPCCredentials over Insecure, so grpc
-// starts (and would use TLS, not plaintext, toward the http:// endpoint);
-// for grpc this test therefore pins startup behaviour only.
+// T23 (FR-20, FR-27, FR-28, FR-41, AC-40): TLS material (CA, client cert+key)
+// combined with a plain http:// OTLP endpoint is not a config error: the
+// effective transport is plaintext for BOTH protocols (Amendment 2). corral
+// must start, become ready, emit exactly one FR-41 WARN, log no other config
+// or startup-failure record, keep stderr empty and exit 0 on SIGTERM. Both
+// protocols, general and _TRACES_ variants. Plaintext delivery itself is
+// asserted in internal/app/runtime (a span must be emitted, which needs the
+// in-process runtime; the corral binary emits no spans without MongoDB).
 func TestT23_TLSMaterialWithHTTPEndpoint(t *testing.T) {
 	ca, key := genSyntheticCA(t)
 	col := otlpcollector.Start(t)
@@ -123,19 +121,20 @@ func TestT23_TLSMaterialWithHTTPEndpoint(t *testing.T) {
 	}
 }
 
-// assertTLSIgnoredWarn asserts the number of WARN records with component=config
-// (Owner decision for T23, SPEC-001 Amendment 2 pending: exactly one fixed
-// WARN when TLS settings are ignored for an http:// endpoint) and that no
-// record or stderr contains a certificate path or PEM content. The exact
-// message text is pinned by Amendment 2 and is deliberately not asserted yet.
+// t23Msg is the FR-41 message (SPEC-001 Amendment 2).
+const t23Msg = "OTLP TLS settings ignored because the traces endpoint uses http://"
+
+// assertTLSIgnoredWarn asserts the number of FR-41 records (level WARN,
+// component=config) and that each carries exactly the FR-41 message, and that
+// no record or stderr contains a certificate path or PEM content.
 func assertTLSIgnoredWarn(t *testing.T, p *proc, want int, secrets ...string) {
 	t.Helper()
 	n := 0
 	for _, r := range p.records() {
 		if str(r, "component") == "config" && str(r, "level") == "WARN" {
 			n++
-			if str(r, "msg") == "" {
-				t.Errorf("WARN config record has empty msg")
+			if str(r, "msg") != t23Msg {
+				t.Errorf("WARN msg = %q, want %q", str(r, "msg"), t23Msg)
 			}
 		}
 	}
@@ -147,6 +146,9 @@ func assertTLSIgnoredWarn(t *testing.T, p *proc, want int, secrets ...string) {
 		if strings.Contains(all, sct) || strings.Contains(all, filepath.Dir(sct)) {
 			t.Errorf("output contains a TLS file path (FR-24)")
 		}
+	}
+	if strings.Contains(all, "t23pathmark-Kd4Ws9") || strings.Contains(all, "-----BEGIN") {
+		t.Errorf("output contains the path marker or PEM content (FR-24)")
 	}
 	if strings.Contains(all, "BEGIN CERTIFICATE") || strings.Contains(all, "PRIVATE KEY") {
 		t.Errorf("output contains PEM content (FR-24)")
