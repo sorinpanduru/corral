@@ -11,6 +11,7 @@ import (
 
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/metrics"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/tracing"
+	"github.com/sorinpanduru/corral/internal/testkit/otlpcollector"
 )
 
 // startOTLP resolves the given variables (corral validation, FR-27) and then
@@ -19,6 +20,13 @@ import (
 // SDK semantics"). The exporter-options construction has no narrower seam, so
 // this is the lowest level that reaches it.
 func startOTLP(t *testing.T, vars map[string]string) error {
+	t.Helper()
+	return startOTLPSpan(t, vars, nil)
+}
+
+// startOTLPSpan is startOTLP plus, when onSpan is non-nil, one span emitted
+// and flushed before shutdown, then onSpan is called.
+func startOTLPSpan(t *testing.T, vars map[string]string, onSpan func()) error {
 	t.Helper()
 	for _, k := range os.Environ() {
 		if name, _, _ := strings.Cut(k, "="); strings.HasPrefix(name, "OTEL_") {
@@ -47,6 +55,12 @@ func startOTLP(t *testing.T, vars map[string]string) error {
 	tr, err := tracing.Start(ctx, tracing.Options{
 		Settings: envOn(1.0), Env: lookup, Config: cfg, Enabled: on, Metrics: mf,
 	})
+	if err == nil && onSpan != nil {
+		_, sp := tr.TracerProvider().Tracer("t23").Start(ctx, "t23-span")
+		sp.End()
+		_ = tr.ForceFlush(ctx)
+		onSpan()
+	}
 	if err == nil {
 		sctx, scancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer scancel()
@@ -113,6 +127,44 @@ func TestStart_OTLPTLSMaterialControls(t *testing.T) {
 				}
 				if err := startOTLP(t, v); err != nil {
 					t.Fatalf("Start error = %v, want nil", err)
+				}
+			})
+		}
+	}
+}
+
+// FR-20, Owner decision T23 (SPEC-001 Amendment 2 pending): an http:// traces
+// endpoint is plaintext for both protocols and TLS material is withheld from
+// the exporter. The testkit collector serves plaintext only, so a span that
+// arrives proves no TLS was applied. No seam exposes the exporter options, so
+// delivery is the observable; the implementer may add one (for example a pure
+// function returning the exporter option set for an EnvConfig plus the
+// effective endpoint) to also unit-test the withholding directly.
+func TestStart_HTTPEndpointWithTLSMaterialDeliversPlaintext(t *testing.T) {
+	certs := envGenCerts(t)
+	for _, proto := range []string{"http/protobuf", "grpc"} {
+		for name, tls := range map[string]map[string]string{
+			"ca":     {"OTEL_EXPORTER_OTLP_CERTIFICATE": certs.Cert},
+			"traces": {"OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE": certs.Cert},
+			"client": {"OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE": certs.Cert, "OTEL_EXPORTER_OTLP_CLIENT_KEY": certs.Key},
+			"tr+cl":  {"OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE": certs.Cert, "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY": certs.Key},
+		} {
+			t.Run(proto+"/"+name, func(t *testing.T) {
+				col := otlpcollector.Start(t)
+				ep := "http://" + col.HTTPEndpoint()
+				if proto == "grpc" {
+					ep = "http://" + col.GRPCEndpoint()
+				}
+				vars := map[string]string{"OTEL_EXPORTER_OTLP_PROTOCOL": proto, "OTEL_EXPORTER_OTLP_ENDPOINT": ep}
+				for k, v := range tls {
+					vars[k] = v
+				}
+				err := startOTLPSpan(t, vars, func() {})
+				if err != nil {
+					t.Fatalf("Start error = %v, want nil", err)
+				}
+				if len(col.Spans()) == 0 {
+					t.Errorf("plaintext collector received no span (TLS material applied to an http:// endpoint)")
 				}
 			})
 		}
