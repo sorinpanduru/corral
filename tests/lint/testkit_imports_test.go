@@ -204,8 +204,17 @@ func TestT21_SelfTest_GoListEnvIsHermetic(t *testing.T) {
 	}
 
 	lines := readRecord(t, record)
-	if len(lines) < 6 {
-		t.Fatalf("expected 3 go invocations recorded, got lines: %q", lines)
+	var nEnv, nDrv int
+	for _, l := range lines {
+		switch {
+		case strings.HasPrefix(l, "GOENV="):
+			nEnv++
+		case strings.HasPrefix(l, "GOPACKAGESDRIVER="):
+			nDrv++
+		}
+	}
+	if nEnv != 3 || nDrv != 3 {
+		t.Fatalf("want exactly 3 go invocations (3 GOENV, 3 GOPACKAGESDRIVER records), got %d and %d: %q", nEnv, nDrv, lines)
 	}
 	for i, l := range lines {
 		switch {
@@ -246,5 +255,122 @@ func TestT21_SelfTest_HostileGoEnvFileIgnored(t *testing.T) {
 	}
 	if len(vs) != 2 {
 		t.Fatalf("violations = %s, want 2", render(vs))
+	}
+}
+
+// Failure behaviour: an empty forbidden list means nothing is checked, which
+// is an error rather than a silent pass.
+func TestT21_ForbiddenEmptyForbiddenListIsError(t *testing.T) {
+	for _, f := range [][]string{nil, {}} {
+		if vs, err := importcheck.Forbidden(tkFixtureDir(t), "./...", nil, f); err == nil {
+			t.Errorf("Forbidden(forbidden=%v): expected error, got %v", f, vs)
+		}
+	}
+}
+
+const (
+	bcKit     = "bcfixture/internal/testkit"
+	bcKitPkg  = "bcfixture/internal/testkit/kit"
+	bcTesting = "testing"
+)
+
+func closureFixtureDir(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate test file")
+	}
+	return filepath.Join(filepath.Dir(file), "testdata", "closurefixture")
+}
+
+var closurePlatforms = []struct{ goos, goarch string }{
+	{"linux", "amd64"}, {"darwin", "arm64"}, {"windows", "amd64"},
+}
+
+// T21 binary closure: the shipped binaries' full dependency closure, for each
+// supported platform, contains no test infrastructure, x/tools or testing.
+func TestT21_BinaryClosureHasNoForbiddenPackages(t *testing.T) {
+	forbidden := []string{testkitPrefix, xToolsPrefix, "testing"}
+	for _, p := range closurePlatforms {
+		t.Run(p.goos+"_"+p.goarch, func(t *testing.T) {
+			got, err := importcheck.ForbiddenDeps(repoRoot(t), "./cmd/...", p.goos, p.goarch, forbidden)
+			if err != nil {
+				t.Fatalf("ForbiddenDeps returned error: %v", err)
+			}
+			if len(got) != 0 {
+				t.Fatalf("forbidden packages in %s/%s binary closure: %v", p.goos, p.goarch, got)
+			}
+		})
+	}
+}
+
+// Self-test: a GOOS-specific file pulls the testkit stand-in in only on
+// windows; the check must see it there and not on linux.
+func TestT21_SelfTest_ClosureGOOSSpecificImport(t *testing.T) {
+	forbidden := []string{bcKit, bcTesting}
+	got, err := importcheck.ForbiddenDeps(closureFixtureDir(t), "./cmd/winonly", "windows", "amd64", forbidden)
+	if err != nil {
+		t.Fatalf("windows: %v", err)
+	}
+	if want := []string{bcKitPkg}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("windows closure = %v, want %v", got, want)
+	}
+	got, err = importcheck.ForbiddenDeps(closureFixtureDir(t), "./cmd/winonly", "linux", "amd64", forbidden)
+	if err != nil {
+		t.Fatalf("linux: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("linux closure = %v, want none", got)
+	}
+}
+
+// Self-test: transitive import of testing via a third in-fixture package is
+// reported; a clean command is not; results are sorted and deduplicated
+// across multiple matched commands.
+func TestT21_SelfTest_ClosureTransitiveTesting(t *testing.T) {
+	forbidden := []string{bcKit, bcTesting}
+	got, err := importcheck.ForbiddenDeps(closureFixtureDir(t), "./cmd/viatesting", "linux", "amd64", forbidden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"testing"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("closure = %v, want %v", got, want)
+	}
+	got, err = importcheck.ForbiddenDeps(closureFixtureDir(t), "./cmd/clean", "linux", "amd64", forbidden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("clean closure = %v, want none", got)
+	}
+	got, err = importcheck.ForbiddenDeps(closureFixtureDir(t), "./cmd/...", "windows", "amd64", forbidden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{bcKitPkg, "testing"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("./cmd/... windows closure = %v, want %v (sorted, deduped)", got, want)
+	}
+}
+
+// Failure behaviour: leading-dash pattern, no matched packages and an empty
+// forbidden list are errors.
+func TestT21_ForbiddenDepsErrors(t *testing.T) {
+	dir := closureFixtureDir(t)
+	for _, pat := range []string{"-json", "-toolexec=/bin/true", "--help"} {
+		if _, err := importcheck.ForbiddenDeps(dir, pat, "linux", "amd64", []string{bcTesting}); err == nil {
+			t.Errorf("pattern %q: expected error", pat)
+		}
+	}
+	if got, err := importcheck.ForbiddenDeps(dir, "./nomatch/...", "linux", "amd64", []string{bcTesting}); err == nil {
+		t.Errorf("no match: expected error, got %v", got)
+	}
+	for _, f := range [][]string{nil, {}} {
+		if got, err := importcheck.ForbiddenDeps(dir, "./cmd/...", "linux", "amd64", f); err == nil {
+			t.Errorf("forbidden=%v: expected error, got %v", f, got)
+		}
+	}
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	if _, err := importcheck.ForbiddenDeps(missing, "./...", "linux", "amd64", []string{bcTesting}); err == nil {
+		t.Error("missing dir: expected error")
 	}
 }
