@@ -5,6 +5,7 @@ import (
 	"log"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logbridge"
 )
@@ -197,4 +198,42 @@ func TestStdAndSlogDefaultBridgesAreIndependent(t *testing.T) {
 		t.Fatalf("records = %d, want 2 (slog.Default burst must not suppress std log)", e2.count())
 	}
 	expect(t, e2.last(), slog.LevelInfo, "thirdparty", 0)
+}
+
+// AC-26 (FR-28, FR-33): slog.Default() warn burst, 10 in 30 s give 1 record,
+// then suppressed_count 9.
+func TestSlogDefaultWarnBurstLimit(t *testing.T) {
+	e := newEnv(t, slog.LevelInfo)
+	lg := slog.New(logbridge.NewSlogDefaultHandler(e.f, e.lv, e.clk.Now))
+	for i := 0; i < 10; i++ {
+		lg.Warn("x")
+		e.clk.Advance(time.Second)
+	}
+	expect(t, e.only(), slog.LevelWarn, "thirdparty", 0)
+	e.clk.Advance(win)
+	lg.Warn("x")
+	if e.count() != 2 {
+		t.Fatalf("records = %d, want 2", e.count())
+	}
+	expect(t, e.last(), slog.LevelWarn, "thirdparty", 9)
+}
+
+// AC-26 (D7): combined case within one 30 s window: slog.Default warn,
+// slog.Default error and a std log message all emit (separate limiters per
+// level and per source).
+func TestCombinedThirdPartySourcesAllEmit(t *testing.T) {
+	e := newEnv(t, slog.LevelInfo)
+	def := slog.New(logbridge.NewSlogDefaultHandler(e.f, e.lv, e.clk.Now))
+	std := log.New(logbridge.NewStdLogWriter(e.f, e.lv, e.clk.Now), "", 0)
+	def.Warn("x")
+	def.Error("x")
+	std.Print("x")
+	rs := e.records()
+	if len(rs) != 3 {
+		t.Fatalf("records = %d, want 3", len(rs))
+	}
+	want := []slog.Level{slog.LevelWarn, slog.LevelError, slog.LevelInfo}
+	for i, r := range rs {
+		expect(t, r, want[i], "thirdparty", 0)
+	}
 }

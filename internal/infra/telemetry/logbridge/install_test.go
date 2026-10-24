@@ -1,10 +1,15 @@
 package logbridge_test
 
 import (
+	"context"
 	"errors"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"io"
 	"log"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -18,12 +23,15 @@ import (
 func restoreGlobals(t *testing.T) {
 	t.Helper()
 	oldDef, oldW, oldF, oldP := slog.Default(), log.Writer(), log.Flags(), log.Prefix()
+	oldH := otel.GetErrorHandler()
 	t.Cleanup(func() {
 		slog.SetDefault(oldDef)
 		log.SetOutput(oldW)
 		log.SetFlags(oldF)
 		log.SetPrefix(oldP)
-		otel.SetErrorHandler(otel.ErrorHandlerFunc(func(error) {}))
+		otel.SetErrorHandler(oldH)
+		// otel.SetLogger and grpclog have no getters, so the previous values
+		// cannot be captured: reset them to discarding sinks.
 		otel.SetLogger(logr.Discard())
 		grpclog.SetLoggerV2(grpclog.NewLoggerV2(io.Discard, io.Discard, io.Discard))
 	})
@@ -39,9 +47,6 @@ func TestInstallRoutesAllSources(t *testing.T) {
 
 	otel.Handle(errors.New(m))
 	expect(t, e.last(), slog.LevelWarn, "otel", 0)
-
-	// NOTE: the otel logger (otel.SetLogger) has no public getter in otel
-	// v1.47.0, so its Install wiring is covered only via NewOTelLogSink.
 
 	grpclog.Warning(m)
 	expect(t, e.last(), slog.LevelWarn, "grpc", 0)
@@ -79,8 +84,8 @@ func TestInstallKeepsStdLogAndSlogDefaultDistinct(t *testing.T) {
 		slog.Info("y")
 	}
 	log.Print("x")
-	// window elapsed: slog.Default emits again (suppressed 0 first? 0 events were
-	// dropped for it), the std log bridge reports its 4 suppressed.
+	// Window elapsed. slog.Default dropped nothing in the first window, so its
+	// next record reports 0; the std log bridge dropped 4, so it reports 4.
 	rs := e.records()
 	if len(rs) != 4 {
 		t.Fatalf("records = %d, want 4", len(rs))
@@ -102,5 +107,29 @@ func TestInstallHonoursLevel(t *testing.T) {
 	slog.Debug("x")
 	if e.count() != 0 {
 		t.Fatalf("records = %d at info level, want 0", e.count())
+	}
+}
+
+// FR-28 (T8 review): Install wires the otel logger. The SDK logs "TracerProvider
+// created" with its configuration through the otel global logger; that must
+// arrive as exactly one component=otel debug record with the fixed message and
+// none of the configuration text (a marker seeded in the resource).
+func TestInstallRoutesOTelLogger(t *testing.T) {
+	restoreGlobals(t)
+	e := newEnv(t, slog.LevelDebug)
+	m := marker(t)
+	logbridge.Install(e.f, e.lv, e.clk.Now)
+
+	tp := sdktrace.NewTracerProvider(sdktrace.WithResource(resource.NewSchemaless(attribute.String("synthetic.key", m))))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+	r := e.only()
+	expect(t, r, slog.LevelDebug, "otel", 0)
+	if r.Msg != logbridge.MsgOTelLogDebug {
+		t.Errorf("message = %q, want %q", r.Msg, logbridge.MsgOTelLogDebug)
+	}
+	e.noMarker(m)
+	if strings.Contains(e.buf.String(), "config") {
+		t.Errorf("configuration text in output: %s", e.buf.String())
 	}
 }

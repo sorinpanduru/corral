@@ -2,7 +2,6 @@ package logbridge_test
 
 import (
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/url"
 	"testing"
@@ -185,5 +184,22 @@ func TestOTelErrorHandlerAndLoggerIndependent(t *testing.T) {
 	for _, r := range e.records() {
 		expect(t, r, slog.LevelWarn, "otel", 0)
 	}
-	_ = fmt.Sprint
+}
+
+// FR-28 (T8 review): the logr sink reports V(n).Enabled() according to the
+// configured level: false at info (its records are debug), true at debug.
+func TestOTelLogSinkEnabledFollowsLevel(t *testing.T) {
+	e := newEnv(t, slog.LevelInfo)
+	lg := logr.New(logbridge.NewOTelLogSink(e.f, e.clk.Now))
+	for _, v := range []int{0, 1, 4} {
+		if lg.V(v).Enabled() {
+			t.Errorf("V(%d).Enabled() true at info level", v)
+		}
+	}
+	e.lv.Set(slog.LevelDebug)
+	for _, v := range []int{0, 1, 4} {
+		if !lg.V(v).Enabled() {
+			t.Errorf("V(%d).Enabled() false at debug level", v)
+		}
+	}
 }
