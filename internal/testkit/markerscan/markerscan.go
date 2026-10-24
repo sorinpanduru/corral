@@ -15,10 +15,13 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"testing"
 
 	"github.com/sorinpanduru/corral/internal/testkit/otlpcollector"
 )
@@ -56,14 +59,49 @@ func (s Source) String() string {
 	return fmt.Sprintf("source(%d)", int(s))
 }
 
-// MaxSourceBytes bounds the data retained per source. Data beyond it is
+// DefaultMaxSourceBytes bounds the data retained per source. Data beyond it is
 // discarded and reported by Truncated, so a huge input cannot exhaust memory.
-const MaxSourceBytes = 64 << 20
+const DefaultMaxSourceBytes = 64 << 20
+
+var maxSourceBytes atomic.Int64
+
+func init() { maxSourceBytes.Store(DefaultMaxSourceBytes) }
+
+func maxBytes() int { return int(maxSourceBytes.Load()) }
+
+// SetMaxSourceBytesForTest lowers (or raises) the per-source cap, which also
+// bounds captured streams and the rendered collector text. It returns a func
+// that restores the previous value. The cap is process-wide.
+func SetMaxSourceBytesForTest(n int) (restore func()) {
+	old := maxSourceBytes.Swap(int64(n))
+	return func() { maxSourceBytes.Store(old) }
+}
+
+// Marker constraints (AC-33): long enough to avoid accidental matches and
+// restricted to a safe alphabet so every encoding is well defined.
+const (
+	minMarkerLen = 16
+	partialLen   = 12
+)
+
+func validMarker(m string) error {
+	if len(m) < minMarkerLen {
+		return fmt.Errorf("markerscan: marker shorter than %d bytes", minMarkerLen)
+	}
+	for i := 0; i < len(m); i++ {
+		c := m[i]
+		if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return fmt.Errorf("markerscan: marker byte %d outside [A-Za-z0-9_-]", i)
+		}
+	}
+	return nil
+}
 
 // Pattern is one searchable encoding of a marker.
 type Pattern struct {
-	Name  string // e.g. "raw", "hex-lower", "base64-std/1"
+	Name  string // raw, raw-partial, raw-casefold, hex-lower, hex-upper, base64-std/N, base64-url/N
 	Bytes []byte
+	Fold  bool // match ASCII case-insensitively (Bytes is lower case)
 }
 
 // Finding reports that a marker was found in a source.
@@ -77,17 +115,22 @@ func (f Finding) String() string {
 	return fmt.Sprintf("marker %q found in %s as %s", f.Marker, f.Source, f.Encoding)
 }
 
-// Patterns returns every search pattern for marker: raw, hex lower, hex upper
-// and base64 (standard, URL-safe) at prefix lengths 0, 1 and 2. The count
-// depends only on the marker length. A pattern may be empty for a marker too
+// Patterns returns every search pattern for marker: raw, every 12-byte window
+// (raw-partial), case-folded raw, hex lower, hex upper and base64 (standard,
+// URL-safe) at prefix lengths 0, 1 and 2. The count depends only on the marker
+// length. A pattern may be empty for a marker too
 // short to leave stable base64 characters; the scanner skips empty patterns.
 func Patterns(marker string) []Pattern {
 	raw := []byte(marker)
 	hx := hex.EncodeToString(raw)
 	ps := []Pattern{
-		{"raw", raw},
-		{"hex-lower", []byte(strings.ToLower(hx))},
-		{"hex-upper", []byte(strings.ToUpper(hx))},
+		{Name: "raw", Bytes: raw},
+		{Name: "raw-casefold", Bytes: asciiLower(raw), Fold: true},
+		{Name: "hex-lower", Bytes: []byte(strings.ToLower(hx))},
+		{Name: "hex-upper", Bytes: []byte(strings.ToUpper(hx))},
+	}
+	for i := 0; i+partialLen <= len(raw); i++ {
+		ps = append(ps, Pattern{Name: "raw-partial", Bytes: raw[i : i+partialLen]})
 	}
 	encs := []struct {
 		name string
@@ -98,7 +141,7 @@ func Patterns(marker string) []Pattern {
 	}
 	for _, e := range encs {
 		for k := 0; k <= 2; k++ {
-			ps = append(ps, Pattern{fmt.Sprintf("%s/%d", e.name, k), b64Stable(e.enc, raw, k)})
+			ps = append(ps, Pattern{Name: fmt.Sprintf("%s/%d", e.name, k), Bytes: b64Stable(e.enc, raw, k)})
 		}
 	}
 	return ps
@@ -123,6 +166,17 @@ func b64Stable(enc *base64.Encoding, marker []byte, k int) []byte {
 	return []byte(s[lead : len(s)-trail])
 }
 
+func asciiLower(b []byte) []byte {
+	out := make([]byte, len(b))
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		out[i] = c
+	}
+	return out
+}
+
 type markerEntry struct {
 	marker   string
 	sources  map[Source]bool // nil means all
@@ -144,10 +198,10 @@ func New() *Scanner {
 }
 
 // AddMarker registers a marker. With no sources it is scanned in all of them.
-// Empty markers are ignored.
-func (s *Scanner) AddMarker(m string, sources ...Source) {
-	if m == "" {
-		return
+// A marker must be at least 16 bytes and use only [A-Za-z0-9_-].
+func (s *Scanner) AddMarker(m string, sources ...Source) error {
+	if err := validMarker(m); err != nil {
+		return err
 	}
 	e := markerEntry{marker: m, patterns: Patterns(m)}
 	if len(sources) > 0 {
@@ -159,15 +213,20 @@ func (s *Scanner) AddMarker(m string, sources ...Source) {
 	s.mu.Lock()
 	s.markers = append(s.markers, e)
 	s.mu.Unlock()
+	return nil
 }
 
 // Add appends data from a source. Successive calls for one source form a
 // stream (a marker split across calls is still found). Order relative to
-// AddMarker does not matter.
+// AddMarker does not matter. Data beyond the per-source cap is dropped and
+// reported by Truncated.
 func (s *Scanner) Add(src Source, data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	room := MaxSourceBytes - len(s.data[src])
+	room := maxBytes() - len(s.data[src])
+	if room < 0 {
+		room = 0
+	}
 	if len(data) > room {
 		data = data[:room]
 		s.truncated[src] = true
@@ -186,53 +245,91 @@ func (s *Scanner) AddCollector(c *otlpcollector.Collector) {
 	s.mu.Unlock()
 }
 
-// Truncated lists sources whose data exceeded MaxSourceBytes; their scan is
-// incomplete.
-func (s *Scanner) Truncated() []Source {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var out []Source
-	for _, src := range AllSources() {
-		if s.truncated[src] {
-			out = append(out, src)
-		}
-	}
-	return out
+// view is a consistent snapshot of the scannable data.
+type view struct {
+	markers   []markerEntry
+	data      map[Source][]byte
+	truncated map[Source]bool
 }
 
-// Findings scans everything added so far, in deterministic order.
-func (s *Scanner) Findings() []Finding {
+func (s *Scanner) snapshot() view {
 	s.mu.Lock()
-	markers := append([]markerEntry(nil), s.markers...)
-	collectors := append([]*otlpcollector.Collector(nil), s.collectors...)
-	data := make(map[Source][]byte, len(s.data)+1)
-	for k, v := range s.data {
-		data[k] = v[:len(v):len(v)] // append-only buffer: this view stays valid
+	v := view{
+		markers:   append([]markerEntry(nil), s.markers...),
+		data:      make(map[Source][]byte, len(s.data)+1),
+		truncated: make(map[Source]bool, len(s.truncated)+1),
 	}
+	for k, d := range s.data {
+		v.data[k] = d[:len(d):len(d)] // append-only buffer: this view stays valid
+	}
+	for k, t := range s.truncated {
+		v.truncated[k] = t
+	}
+	collectors := append([]*otlpcollector.Collector(nil), s.collectors...)
 	s.mu.Unlock()
 
 	if len(collectors) > 0 {
+		base := v.data[SourceSpans]
 		var b bytes.Buffer
-		b.Write(data[SourceSpans])
+		b.Write(base)
+		room := maxBytes() - len(base)
 		for _, c := range collectors {
+			if room <= 0 {
+				v.truncated[SourceSpans] = true
+				break
+			}
+			text, trunc := renderCollector(c, room)
 			b.WriteByte('\n')
-			b.WriteString(RenderCollector(c))
+			b.WriteString(text)
+			room -= len(text) + 1
+			if trunc {
+				v.truncated[SourceSpans] = true
+			}
 		}
-		data[SourceSpans] = b.Bytes()
+		v.data[SourceSpans] = b.Bytes()
 	}
+	return v
+}
 
+// Truncated reports whether src exceeded the per-source cap, so that its scan
+// is incomplete.
+func (s *Scanner) Truncated(src Source) bool { return s.snapshot().truncated[src] }
+
+// AssertClean fails tb if there is any finding or any truncated source.
+func (s *Scanner) AssertClean(tb testing.TB) {
+	tb.Helper()
+	v := s.snapshot()
+	for _, f := range v.findings() {
+		tb.Errorf("markerscan: %s", f)
+	}
+	for _, src := range AllSources() {
+		if v.truncated[src] {
+			tb.Errorf("markerscan: %s data exceeded the %d byte cap; scan incomplete", src, maxBytes())
+		}
+	}
+}
+
+// Findings scans everything added so far, in deterministic order.
+func (s *Scanner) Findings() []Finding { return s.snapshot().findings() }
+
+func (v view) findings() []Finding {
 	var out []Finding
-	for _, m := range markers {
+	for _, m := range v.markers {
 		for _, src := range AllSources() {
 			if m.sources != nil && !m.sources[src] {
 				continue
 			}
-			d := data[src]
+			d := v.data[src]
 			if len(d) == 0 {
 				continue
 			}
+			seen := map[string]bool{}
 			for _, p := range m.patterns {
-				if len(p.Bytes) > 0 && bytes.Contains(d, p.Bytes) {
+				if len(p.Bytes) == 0 || seen[p.Name] {
+					continue
+				}
+				if contains(d, p) {
+					seen[p.Name] = true
 					out = append(out, Finding{Marker: m.marker, Source: src, Encoding: p.Name})
 				}
 			}
@@ -247,23 +344,73 @@ func (s *Scanner) Findings() []Finding {
 	return out
 }
 
-// jsonUnescape undoes encoding/json's HTML escaping, which the collector's
-// compact JSON rendering of arrays and kvlists applies.
-var jsonUnescape = strings.NewReplacer(`<`, "<", `>`, ">", `&`, "&")
+const foldChunk = 1 << 20
 
-// RenderCollector renders the scannable text of a collector's payload: span
-// names, attribute keys and values, event names and attributes, status
-// messages and resource attributes, one item per line. Request headers are
-// excluded. Bytes attributes are already padded standard base64 and
-// arrays/kvlists sorted compact JSON (T13 rendering).
+func contains(d []byte, p Pattern) bool {
+	if !p.Fold {
+		return bytes.Contains(d, p.Bytes)
+	}
+	// ASCII case-insensitive search in bounded chunks (no full-size copy).
+	buf := make([]byte, 0, foldChunk+len(p.Bytes))
+	for off := 0; off < len(d); off += foldChunk {
+		end := off + foldChunk + len(p.Bytes) - 1
+		if end > len(d) {
+			end = len(d)
+		}
+		buf = buf[:0]
+		for _, c := range d[off:end] {
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			buf = append(buf, c)
+		}
+		if bytes.Contains(buf, p.Bytes) {
+			return true
+		}
+	}
+	return false
+}
+
+// RenderCollector renders the scannable text of a collector's payload, bounded
+// by the per-source cap. See renderCollector.
 func RenderCollector(c *otlpcollector.Collector) string {
+	t, _ := renderCollector(c, maxBytes())
+	return t
+}
+
+// renderCollector renders span names, attribute keys and values, event names
+// and attributes, status messages and resource attributes, one item per line,
+// stopping at limit bytes (truncated reports that). Request headers are
+// excluded. Bytes attributes are already padded standard base64 (T13
+// rendering) and are found by the base64 patterns. Values that parse as JSON
+// arrays or objects (the T13 rendering of arrays and kvlists) additionally
+// contribute their decoded leaves (object keys and string values), so JSON
+// escaping cannot hide a marker.
+func renderCollector(c *otlpcollector.Collector, limit int) (text string, truncated bool) {
 	var b strings.Builder
-	line := func(v string) {
+	full := false
+	emit := func(v string) {
+		if full {
+			return
+		}
+		if b.Len()+len(v)+1 > limit {
+			room := limit - b.Len()
+			if room > 0 {
+				b.WriteString(v[:min(room, len(v))])
+			}
+			full, truncated = true, true
+			return
+		}
 		b.WriteString(v)
 		b.WriteByte('\n')
-		if u := jsonUnescape.Replace(v); u != v {
-			b.WriteString(u)
-			b.WriteByte('\n')
+	}
+	line := func(v string) {
+		emit(v)
+		if len(v) > 0 && (v[0] == '[' || v[0] == '{') && !full {
+			var x any
+			if json.Unmarshal([]byte(v), &x) == nil {
+				walkLeaves(x, emit)
+			}
 		}
 	}
 	attrs := func(m map[string]string) {
@@ -289,5 +436,26 @@ func RenderCollector(c *otlpcollector.Collector) string {
 		}
 		line(sp.StatusMessage)
 	}
-	return b.String()
+	return b.String(), truncated
+}
+
+func walkLeaves(x any, emit func(string)) {
+	switch v := x.(type) {
+	case string:
+		emit(v)
+	case []any:
+		for _, e := range v {
+			walkLeaves(e, emit)
+		}
+	case map[string]any:
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			emit(k)
+			walkLeaves(v[k], emit)
+		}
+	}
 }

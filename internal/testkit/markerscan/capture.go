@@ -3,7 +3,6 @@ package markerscan
 import (
 	"bytes"
 	"context"
-	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -13,10 +12,8 @@ import (
 	"time"
 )
 
-// maxCapture bounds each captured stream; excess output is drained and
-// discarded and the test is failed, since the scan would be incomplete.
-const maxCapture = MaxSourceBytes
-
+// boundedBuffer keeps the head of a stream up to the cap and discards the
+// rest. Write always reports len(p) so writers keep draining and never block.
 type boundedBuffer struct {
 	mu        sync.Mutex
 	buf       bytes.Buffer
@@ -26,14 +23,17 @@ type boundedBuffer struct {
 func (b *boundedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	room := maxCapture - b.buf.Len()
+	n := len(p)
+	room := maxBytes() - b.buf.Len()
+	if room < 0 {
+		room = 0
+	}
 	if len(p) > room {
 		b.truncated = true
 		p = p[:room]
-		b.buf.Write(p)
-		return len(p), nil // report full length so writers keep draining
 	}
-	return b.buf.Write(p)
+	b.buf.Write(p)
+	return n, nil
 }
 
 func (b *boundedBuffer) snapshot() ([]byte, bool) {
@@ -42,10 +42,17 @@ func (b *boundedBuffer) snapshot() ([]byte, bool) {
 	return append([]byte(nil), b.buf.Bytes()...), b.truncated
 }
 
-// CaptureStdio replaces os.Stdout and os.Stderr with pipes drained in the
-// background. The returned stop restores them and returns what was written.
-// stop is idempotent and is also registered with tb.Cleanup. Loggers that
-// captured the original *os.File before the call are not redirected.
+// CaptureStdio redirects the process stdout and stderr into memory. On unix
+// it works at the file-descriptor level: fds 1 and 2 are saved, the pipe write
+// ends are dup2'd over them, and os.Stdout/os.Stderr point at the pipes, so
+// loggers that grabbed os.Stderr earlier and raw fd writes are captured too.
+// On other platforms only os.Stdout/os.Stderr are swapped.
+//
+// It is NOT parallel-safe: it swaps process-wide state, so tests using it
+// must not call t.Parallel(). The stop func restores everything, is
+// idempotent, and is also registered with tb.Cleanup. Each stream keeps at
+// most the per-source cap; if exceeded, stop reports it through tb, and the
+// writers are never blocked because the pipes are always drained.
 func CaptureStdio(tb testing.TB) (stop func() (stdout, stderr []byte)) {
 	tb.Helper()
 	origOut, origErr := os.Stdout, os.Stderr
@@ -59,6 +66,14 @@ func CaptureStdio(tb testing.TB) (stop func() (stdout, stderr []byte)) {
 		outW.Close()
 		tb.Fatalf("markerscan: pipe: %v", err)
 	}
+	restoreFDs, err := redirectFDs(outW, errW)
+	if err != nil {
+		outR.Close()
+		outW.Close()
+		errR.Close()
+		errW.Close()
+		tb.Fatalf("markerscan: redirect fds: %v", err)
+	}
 	var outB, errB boundedBuffer
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -71,6 +86,7 @@ func CaptureStdio(tb testing.TB) (stop func() (stdout, stderr []byte)) {
 	stop = func() ([]byte, []byte) {
 		once.Do(func() {
 			os.Stdout, os.Stderr = origOut, origErr
+			restoreFDs()
 			outW.Close()
 			errW.Close()
 			wg.Wait()
@@ -80,7 +96,7 @@ func CaptureStdio(tb testing.TB) (stop func() (stdout, stderr []byte)) {
 			so, t1 = outB.snapshot()
 			se, t2 = errB.snapshot()
 			if t1 || t2 {
-				tb.Errorf("markerscan: captured output exceeded %d bytes and was truncated", maxCapture)
+				tb.Errorf("markerscan: captured stdio exceeded the %d byte cap and was truncated", maxBytes())
 			}
 		})
 		return so, se
@@ -90,24 +106,27 @@ func CaptureStdio(tb testing.TB) (stop func() (stdout, stderr []byte)) {
 }
 
 // RunCapture runs cmd (a child process) and returns its stdout and stderr,
-// each bounded. cmd.Stdout and cmd.Stderr must be unset.
-func RunCapture(cmd *exec.Cmd) (stdout, stderr []byte, err error) {
+// each limited to the per-source cap (excess is drained and discarded, and
+// truncated is true). cmd.Stdout and cmd.Stderr must be unset. A start
+// failure fails tb; a non-zero exit does not.
+func RunCapture(tb testing.TB, cmd *exec.Cmd) (stdout, stderr []byte, truncated bool) {
+	tb.Helper()
 	if cmd.Stdout != nil || cmd.Stderr != nil {
-		return nil, nil, errors.New("markerscan: cmd.Stdout/Stderr must be nil")
+		tb.Fatalf("markerscan: cmd.Stdout/Stderr must be nil")
 	}
 	var o, e boundedBuffer
 	cmd.Stdout, cmd.Stderr = &o, &e
-	err = cmd.Run()
+	if err := cmd.Start(); err != nil {
+		tb.Fatalf("markerscan: start child: %v", err)
+	}
+	_ = cmd.Wait() // exit status is the caller's concern
 	so, t1 := o.snapshot()
 	se, t2 := e.snapshot()
-	if (t1 || t2) && err == nil {
-		err = errors.New("markerscan: child output truncated")
-	}
-	return so, se, err
+	return so, se, t1 || t2
 }
 
-// FetchBody GETs url (for /metrics or /readyz) and returns the body, bounded,
-// regardless of the status code.
+// FetchBody GETs url (for /metrics or /readyz) and returns the body, bounded
+// by the per-source cap, regardless of the status code. Over-cap bodies fail tb.
 func FetchBody(tb testing.TB, url string) []byte {
 	tb.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -121,13 +140,14 @@ func FetchBody(tb testing.TB, url string) []byte {
 		tb.Fatalf("markerscan: fetch: %v", err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxCapture+1))
+	limit := maxBytes()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
 	if err != nil {
 		tb.Fatalf("markerscan: read body: %v", err)
 	}
-	if len(body) > maxCapture {
-		tb.Errorf("markerscan: body exceeded %d bytes", maxCapture)
-		body = body[:maxCapture]
+	if len(body) > limit {
+		tb.Errorf("markerscan: body exceeded the %d byte cap", limit)
+		body = body[:limit]
 	}
 	return body
 }
