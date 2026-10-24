@@ -16,6 +16,8 @@
 - `docs/adr/0005-telemetry-test-infrastructure.md`: in-process fake OTLP collector, marker scanner, fake clock, no Docker, runtime-generated certificates.
 - `docs/adr/0006-startup-sequence-and-readiness.md`: startup order, startup-complete, readiness gating and `/readyz` responses (Accepted, D6).
 - `docs/adr/0007-tracing-bootstrap-and-span-processor.md`: tracing package split, disabled/none behaviour (log correlation on with `none`, D9), custom bounded-queue processor.
+- `docs/adr/0008-early-slog-neutralisation.md`: `earlyslog` neutralises `slog.Default()` and std `log` during package init; `logbridge.Install` hands off and replays counts (T22).
+- `docs/adr/0009-otlp-tls-withheld-for-http-endpoint.md`: for an `http://` traces endpoint the exporters get explicit plaintext options; one FR-41 warn record (T23).
 
 ## Dependency pins (ADR-0002)
 
@@ -62,6 +64,7 @@ Test writers may add `go.mod`/`go.sum` requirements when a self-test needs them;
 | `internal/infra/telemetry/sanitize` | T6 |
 | `internal/infra/telemetry/metrics` (+ `catalog.json`) | T7 |
 | `internal/infra/telemetry/ratelimit`, `internal/infra/telemetry/logbridge` | T8 |
+| `internal/infra/telemetry/earlyslog` | T22 |
 | `internal/infra/telemetry/tracing` | T10, T11, T15, T16 |
 | `internal/infra/telemetry/tracing/spanqueue` | T12 |
 | `internal/infra/adminhttp` | T17 |
@@ -469,6 +472,117 @@ Added after the T2–T6/T13 reviews (decided by Orchestrator under Owner's stand
 - Docker: no.
 - Depends on: T4 (needs `golang.org/x/tools` present so the rule is meaningful; `constmsg` is the expected only importer). Independent of T5–T20; can run in any wave after T4.
 
+### T22: Early slog neutralisation (done)
+
+Verification fix after T19/T18 functional runs (decided by Orchestrator under Owner's standing instruction, 2026-10-24). Status: **done** (branch `factory/SPEC-001/T22-thirdparty-stderr`).
+
+- Goal: no third-party `slog`/`log` output reaches stderr during package init, before `logbridge.Install` runs (ADR-0008). Trigger: `go.opentelemetry.io/auto/sdk` calls `slog.Warn` at init for invalid `OTEL_*_LIMIT` values and echoes the raw value.
+  - `earlyslog` (stdlib imports only) installs at init a counting-only default slog handler and counts std `log` writes; nothing is retained but per-level counts.
+  - `cmd/corral` blank-imports `earlyslog`; `logbridge` imports it. `logbridge.Install` calls `earlyslog.Handoff` and replays the counts through the `thirdparty` bridges (fixed message, per-source/per-level limiter, `suppressed_count`).
+  - Functional guard on init order (`tests/functional/initorder_test.go`) with a reviewed allowlist of `log`-only importers that init before `earlyslog`.
+- FRs/ACs: FR-24, FR-28 (Amendment 1 `thirdparty`); AC-3 (empty stderr), AC-26.
+- Implementer owned: `internal/infra/telemetry/earlyslog/*.go` (non-test), `internal/infra/telemetry/logbridge/install.go`, `cmd/corral/main.go`.
+- Test writer owned: `internal/infra/telemetry/earlyslog/*_test.go`, `internal/infra/telemetry/logbridge/replay_early_test.go`, `tests/functional/thirdparty_stderr_test.go`, `tests/functional/initorder_test.go`.
+- Interfaces defined: `earlyslog.Counts{Debug, Info, Warn, Error, StdLog uint64}`; `earlyslog.Handoff(h slog.Handler) Counts`; `earlyslog.Drain() Counts`.
+- Docker: no.
+- Depends on: T8, T18.
+
+### T23: FR-41 plaintext for `http://` OTLP endpoints (done)
+
+Implements spec Amendment 2 (FR-41, AC-40). Status: **done** (branch `factory/SPEC-001/T23-otlp-ca-http`, 00af1e0).
+
+- Goal: with an `http://` effective traces endpoint, both protocols export in plaintext, TLS material is not used, and exactly one FR-41 warn record names the set TLS variables (ADR-0009).
+  - `tracing.TLSIgnoredSettings` returns the sorted names of the set TLS variables when the effective traces endpoint (`_TRACES_` over general, scheme case-insensitive) is `http://`.
+  - `newOTLP` passes explicit plaintext options whenever the effective endpoint is `http://` (http: nil TLS config plus insecure; grpc: insecure transport credentials plus insecure), overriding env-derived TLS, including `OTEL_EXPORTER_OTLP_INSECURE=false`.
+  - The runtime emits the warn record (`component=config`, constant message, `setting` = names only) before the lifecycle records. FR-27 validation in `Resolve` runs first and is unchanged.
+- FRs/ACs: FR-7 (`setting` names only), FR-20, FR-24, FR-27, FR-41; AC-40.
+- Implementer owned: `internal/infra/telemetry/tracing/plaintext.go`, `internal/infra/telemetry/tracing/start*.go`, `internal/app/runtime/runtime.go`.
+- Test writer owned: `internal/infra/telemetry/tracing/plaintext*_test.go`, `tests/functional/otlp_tls_http_test.go`.
+- Interfaces defined: `tracing.TLSIgnoredSettings(cfg EnvConfig, env LookupEnv) []string`.
+- Docker: no.
+- Depends on: T10, T15, T18, T22.
+
+### T24: Hardening follow-ups
+
+Scoped only to behaviour the approved spec already requires (Amendments 1 and 2 included) and to test and documentation quality. No new behaviour. Sub-items are independent and can be delivered as separate implementer/test-writer rounds; each one is done when its acceptance holds and `make build`, `make test` and `make test-functional` pass.
+
+#### T24.1: ADR-0008 wording (docs)
+
+- Goal: correct ADR-0008's claim that `earlyslog` "runs first". What is true and what the guard enforces: `earlyslog` initialises before every linked third-party package that uses `log/slog` (and, except for the reviewed allowlist, `log`) at init. Standard-library packages and `log`-only packages may init earlier; the Residual risk paragraph stays and is aligned with the T24.2 guard.
+- FRs/ACs: FR-28 (documentation of the mechanism); no AC.
+- Owner: planner (ADR text). No code.
+- Files: `docs/adr/0008-early-slog-neutralisation.md`.
+- Interfaces: none.
+- Acceptance: the ADR no longer says `earlyslog` runs first. It states the property in terms of third-party packages that use `slog`/`log` at init, names the T24.2 guard as the enforcement, and keeps the residual-risk statement.
+- Depends on: none (can run first in T24).
+
+#### T24.2: Init-order guard on transitive dependents
+
+- Goal: `tests/functional/initorder_test.go` currently selects only direct importers of `log/slog` and `log` (`Imports`). A package that reaches `slog`/`log` through an intermediate package is not checked. Strengthen it:
+  - Select every non-standard package in `go list -deps ./cmd/corral` whose transitive closure (`Deps`, from `-json=ImportPath,Standard,Deps`) contains `log/slog` or `log`.
+  - Determine the real init order from the built binary with `GODEBUG=inittrace=1` (order of `init <importpath>` lines on stderr). Packages that do no init work do not appear and cannot log at init, so they need no check. Do not re-derive the order from the Go spec's sort rule as the only source.
+  - Fail if any selected package inits before `github.com/sorinpanduru/corral/internal/infra/telemetry/earlyslog` and is not on the reviewed allowlist.
+  - Stale-allowlist check: each allowlist entry must still (a) be a transitive dependent of `log` or `log/slog` and (b) actually init before `earlyslog` in the trace. If either is false, the test fails and asks for the entry to be removed.
+  - The test uses the hermetic `go list` environment (`GOENV=off`, `GOPACKAGESDRIVER=off`, as in T21). It runs against the binary that `TestMain` builds, with no tracing configured.
+- FRs/ACs: FR-28; AC-3 (empty stderr), supports ADR-0008.
+- Test writer owns: `tests/functional/initorder_test.go`.
+- Implementer owns: nothing, unless the strengthened guard finds an unallowlisted package. That finding goes to the Orchestrator, because extending the allowlist or changing `earlyslog` needs a review decision.
+- Interfaces: none new (test-local helpers only).
+- Acceptance: the guard selects transitive dependents. A self-check in the test shows that at least one known indirect dependent of `log/slog` (one with no direct `log/slog` import) is in the selected set. Every allowlist entry is shown both as a dependent and as initialising before `earlyslog`. The suite passes on the current tree.
+- Depends on: T22.
+
+#### T24.3: grpclog output never reaches stderr (FR-28)
+
+- Goal: `google.golang.org/grpc/grpclog` initialises before `earlyslog` and, at init, builds its default `LoggerV2` with its own `log.New(os.Stderr, ...)` loggers. Its severity and verbosity come from `GRPC_GO_LOG_SEVERITY_LEVEL` and `GRPC_GO_LOG_VERBOSITY_LEVEL`. Prove that no grpc log output reaches stderr before or after `logbridge.Install`.
+  - Functional cases (built binary, separate stdout/stderr capture), each with `GRPC_GO_LOG_SEVERITY_LEVEL` in {`info`, `warning`, `error`} and `GRPC_GO_LOG_VERBOSITY_LEVEL` in {unset, `99`}:
+    - tracing on, `OTEL_EXPORTER_OTLP_PROTOCOL=grpc`, unreachable collector (`otlpcollector.UnreachableEndpoint`), `log.level=debug`;
+    - tracing on, grpc, collector in reject mode;
+    - tracing off (only init-time behaviour is exercised).
+  - Each case asserts empty stderr, every stdout line is JSON, and any grpc record has `component=grpc` and a fixed message.
+  - Each case also plants a marker (for example in the endpoint path or userinfo, as in AC-38) and runs a `markerscan` pass over stdout and stderr.
+  - Fix only if a test shows a leak. Any fix stays within T8/T22-owned files (`internal/infra/telemetry/logbridge/*.go`, `internal/infra/telemetry/earlyslog/*.go`) and is routed through the Orchestrator.
+- FRs/ACs: FR-24, FR-28; AC-3 (empty stderr), AC-26, AC-29.
+- Test writer owns: `tests/functional/grpclog_stderr_test.go`.
+- Implementer owns (only on a failing test): `internal/infra/telemetry/logbridge/*.go`, `internal/infra/telemetry/earlyslog/*.go` (non-test).
+- Interfaces: none new.
+- Acceptance: all cases pass with empty stderr and no marker findings. If a case fails, the fix lands and the same cases pass.
+- Depends on: T8, T13, T14, T18, T22.
+
+#### T24.4: otel logger sink never emits key/value arguments (FR-28, FR-24, FR-29)
+
+- Goal: the OTel SDK's envconfig calls `global.Error(err, "read tls client cert", "file", <path>)` (and similar for the CA certificate and client key) if a cert file becomes unreadable after `Resolve` validated it. Verify that the `logr` sink installed by `logbridge` (`otelLogSink`) never emits the key/value arguments or the message, and that the error carries only the FR-29 class and detail (the `*os.PathError` text contains the path).
+  - Unit: call the sink's `Info`/`Error` (and `WithValues`/`WithName` chains) with a marker-bearing message, marker-bearing kv values, and an `*os.PathError` whose path contains the marker. Assert the record has `component=otel`, the fixed per-level message, the error class and detail only, and no marker in any attribute (logcheck tee and `markerscan`).
+  - Integration: valid synthetic PEM files (generated at runtime) under marker paths, `OTEL_EXPORTER_OTLP_CERTIFICATE` / `_CLIENT_CERTIFICATE` / `_CLIENT_KEY` set, an `https://` endpoint so FR-41 does not apply. `Resolve` succeeds; the files are then made unreadable (removed or `chmod 000`) before `tracing.Start`. Check both protocols. Assert no marker in stdout or stderr, and no stderr output. Whether the exporter then fails or exports is not asserted. Skip the `chmod` variant when running as root.
+- FRs/ACs: FR-7 (`setting` names only), FR-24, FR-28 (no key/value arguments forwarded), FR-29.
+- Test writer owns: `internal/infra/telemetry/logbridge/otel_kv_test.go`, `tests/integration/tracing/envconfig_unreadable_test.go`.
+- Implementer owns (only on a failing test): `internal/infra/telemetry/logbridge/otel.go`.
+- Interfaces: none new.
+- Acceptance: both tests pass with no marker findings and empty stderr.
+- Depends on: T8, T14, T15.
+
+#### T24.5: otlpcollector records span links and instrumentation scope
+
+- Goal: test-quality. The fake collector currently drops span links and the instrumentation scope, so tests cannot assert on them. FR-24 says forbidden data must not be emitted "in any signal", and OTLP span payloads carry links and scope. The collector should therefore record them so that FR-24/FR-23 tests can make assertions on the full payload.
+  - Record, per span: its links (each link's trace ID and span ID as lowercase hex, plus its attributes) and its instrumentation scope (name, version, attributes). Use the existing T13 rendering for attribute values: bytes as padded standard base64, arrays and kvlists as compact JSON with sorted keys.
+  - This applies to both OTLP/HTTP and OTLP/gRPC.
+  - `markerscan`'s `spans` source is **not** changed in T24. AC-33 lists the scanned span fields (names, attributes, events, status descriptions, resource attributes). Scanning links and scope as well is a superset; whether to do it is listed under "Proposed for Owner" (P5).
+- FRs/ACs: test infrastructure for FR-23 and FR-24. No FR or AC names link or scope attributes (see the spec-support note in P5).
+- Implementer owns: `internal/testkit/otlpcollector/*.go` (non-test).
+- Test writer owns: `internal/testkit/otlpcollector/*_test.go` (self-test using the real OTel exporters: one span with a link carrying attributes and a tracer with scope name, version and attributes, over both protocols).
+- Interfaces defined (additive; existing fields unchanged):
+  - `otlpcollector.RecordedLink{TraceID, SpanID string; Attributes map[string]string}`;
+  - `otlpcollector.RecordedScope{Name, Version string; Attributes map[string]string}`;
+  - new fields `RecordedSpan.Links []RecordedLink` and `RecordedSpan.Scope RecordedScope`.
+- Acceptance: the self-test asserts the link and scope values over both protocols. Existing T13/T14/T15/T19/T23 suites pass unchanged.
+- Depends on: T13.
+
+#### T24.6: gRPC `codes.Unavailable` classification: dropped from T24
+
+- FR-29 defines only the class enum (`timeout`, `network`, `protocol`, `server`, `config`, `internal`). It does not say which errors belong to which class; in particular it does not say that connection failures are `network`.
+- The mapping in use is D3, a plan decision, not spec text. D3 covers errno and DNS/TLS/EOF failures (as `network`) and OTLP collector rejections (gRPC non-transport status as `protocol`/`other`). It does not cover a gRPC status that reports a transport failure.
+- Today `tracing.ClassifyExportError` passes `Unavailable`/`DeadlineExceeded`/`Canceled` status errors through unchanged. Because a gRPC status error does not unwrap to the underlying `net`/errno error, they classify as `internal`/`other`.
+- Changing this needs an Owner decision: see P4. Not planned.
+
 ---
 
 ## Ordering and parallelism
@@ -483,13 +597,15 @@ Added after the T2–T6/T13 reviews (decided by Orchestrator under Owner's stand
 - Wave 8: T16, T20.
 - Wave 9: T18.
 - Wave 10: T19.
+- Wave 11: T22, then T23 (both done; verification fixes after Wave 10).
+- Wave 12: T24. T24.1 first (docs only), then T24.2 to T24.5 in parallel. T24.6 is not planned (P4).
 
 ## Coverage table (Part A)
 
 | AC | Task(s) |
 |---|---|
 | AC-1 | T2, T21 (hermetic env, production import lint) |
-| AC-3 | T3 (unit), T15 (integration), T18 (functional) |
+| AC-3 | T3 (unit), T15 (integration), T18 (functional), T22 (init-time stderr), T24.2/T24.3 (guards) |
 | AC-4 | T3 |
 | AC-5 | T3 (factory rejects unknown components), T4 (test handler, constant-message check; applied by all later suites) |
 | AC-6 | T3 (correlation wrapper unit), T15 (integration) |
@@ -504,7 +620,7 @@ Added after the T2–T6/T13 reviews (decided by Orchestrator under Owner's stand
 | AC-21 | T9 (settings), T10 (`OTEL_*`), T18 (functional) |
 | AC-24 | T11 (resource), T15 (integration with headers) |
 | AC-25 | T11 |
-| AC-26 | T8 |
+| AC-26 | T8, T22 (early replay), T24.3 |
 | AC-27 | T11 (unit), T15 (integration) |
 | AC-28 | T16 |
 | AC-29 | T8 |
@@ -515,8 +631,9 @@ Added after the T2–T6/T13 reviews (decided by Orchestrator under Owner's stand
 | AC-36 | T12 (unit), T16 (integration) |
 | AC-37 | T6 |
 | AC-38 | T19 (uses T13, T14) |
+| AC-40 | T23 |
 
-Review-only items: FR-6 read-once (T9/T18), FR-20 pass-through vars (T15), FR-24 no TLS/key/uid paths (all), FR-29 no `err.Error()`/panic values at call sites (all), FR-36 (T20), FR-38 (T3, T20).
+Review-only items: FR-6 read-once (T9/T18), FR-20 pass-through vars (T15), FR-24 no TLS/key/uid paths (all; T24.4 adds a test for TLS file paths in OTel SDK logs), FR-29 no `err.Error()`/panic values at call sites (all), FR-36 (T20), FR-38 (T3, T20).
 
 ## Decisions (former open questions Q1-Q9)
 
@@ -540,3 +657,6 @@ These came out of the T10–T15 reviews. They are not decided and not planned in
 
 - **P1 (FR-27/FR-28 area; would affect T10, T15, T18).** Emit a warning at startup when OTLP authentication headers would be sent over plaintext, i.e. `*_HEADERS` is set and the effective endpoint is `http://` or `*_INSECURE=true`. The warning names only the variable names, never header keys or values.
 - **P2 (FR-30; would affect T11).** Widen FR-30's resource-attribute ban list to also remove `process.executable.path`, `process.environment_variable.*`, `process.*user.name` (for example `process.user.name`, `process.real_user.name`, `process.saved_user.name`), `container.command*`, `user.*`, `enduser.*`, `host.ip` and `host.mac`.
+- **P3 (FR-15/FR-17 area, new behaviour; would affect T17, T20).** Add a `Host`-header allowlist on the admin listener's `/metrics` endpoint (and possibly `/healthz` and `/readyz`) to mitigate DNS-rebinding reads from a browser on the same host as a loopback-bound listener. Open points: the allowed values (the bind address, `localhost`, operator-configured names), the response for a disallowed host (for example 421 or 403 with a fixed body), and whether it is configurable. This is new behaviour and needs a spec amendment; it is not in T24.
+- **P4 (FR-29 class definitions; would affect T5, T15).** Should a gRPC `codes.Unavailable` export error (transport-level failure to reach the collector) be class `network`, and with which detail (`other`, or a mapped errno when one is available)? FR-29 defines the class enum but no class semantics, and D3 does not cover gRPC transport statuses. Today it is `internal`/`other`. The same question applies to `codes.DeadlineExceeded` (`timeout`/`deadline_exceeded`?) and `codes.Canceled`. This was dropped from T24 pending the Owner.
+- **P5 (AC-33 scope; would affect T14).** Should AC-33's `spans` scan source also include span link attributes and instrumentation-scope name, version and attributes? FR-24's "in any signal" arguably covers them, but AC-33 and the data-minimisation heading list only span names, attributes, events, status, and resource attributes. T24.5 makes the data available in the collector; extending the scanner waits for this decision.
