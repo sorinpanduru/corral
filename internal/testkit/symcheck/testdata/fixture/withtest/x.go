@@ -1,0 +1,3 @@
+package withtest
+
+func X() {}
