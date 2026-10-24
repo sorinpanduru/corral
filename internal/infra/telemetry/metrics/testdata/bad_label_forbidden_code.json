@@ -1,0 +1,1 @@
+{"metrics":[{"name":"corral_things_total","type":"counter","help":"Forbidden label.","labels":[{"name":"code_name","values":["x"]}]}]}

@@ -1,0 +1,1 @@
+{"metrics":[{"name":"corral_op_seconds","type":"histogram","help":"quantile declared as label.","labels":[{"name":"quantile","values":["0.5"]}]}]}
