@@ -6,10 +6,11 @@
 package otlpcollector
 
 import (
-	"bytes"
 	"compress/gzip"
 	"context"
-	"fmt"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	collectortrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
@@ -29,6 +31,10 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
+
+// MaxBodyBytes caps an OTLP/HTTP request body, both on the wire and after
+// gzip decompression. Larger requests get 413 and record nothing.
+const MaxBodyBytes = 4 << 20
 
 // Mode selects how the collector answers export requests.
 type Mode int
@@ -102,7 +108,11 @@ type Collector struct {
 
 	done      chan struct{}
 	closeOnce sync.Once
-	wg        sync.WaitGroup
+	wg        sync.WaitGroup // serve loops
+
+	inflightMu sync.Mutex
+	closed     bool
+	inflight   sync.WaitGroup // request handlers
 
 	mu        sync.Mutex
 	spans     []RecordedSpan
@@ -133,7 +143,7 @@ func Start(tb testing.TB, opts ...Option) *Collector {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/traces", c.handleHTTP)
-	c.httpSrv = &http.Server{Handler: mux}
+	c.httpSrv = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
 	c.grpcSrv = grpc.NewServer(grpc.StatsHandler(encodingStats{}))
 	collectortrace.RegisterTraceServiceServer(c.grpcSrv, grpcService{c: c})
@@ -156,38 +166,69 @@ func (c *Collector) GRPCEndpoint() string { return c.grpcLn.Addr().String() }
 func (c *Collector) SetMode(m Mode) { c.mode.Store(int32(m)) }
 
 // ConnCount returns the number of TCP connections accepted on either listener.
+// Read it while the collector is open, after the code under test has shut
+// down and before Close, so that late or closing connections are not missed.
 func (c *Collector) ConnCount() int { return int(c.conns.Load()) }
 
-// Spans returns a copy of all recorded spans.
+// Spans returns a deep copy of all recorded spans.
 func (c *Collector) Spans() []RecordedSpan {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return append([]RecordedSpan(nil), c.spans...)
+	out := make([]RecordedSpan, len(c.spans))
+	for i, sp := range c.spans {
+		out[i] = sp
+		out[i].Attributes = copyMap(sp.Attributes)
+		if sp.Events != nil {
+			out[i].Events = make([]RecordedEvent, len(sp.Events))
+			for j, e := range sp.Events {
+				out[i].Events[j] = RecordedEvent{Name: e.Name, Attributes: copyMap(e.Attributes)}
+			}
+		}
+	}
+	return out
 }
 
-// Resources returns one attribute map per received ResourceSpans.
+// Resources returns deep copies, one attribute map per received ResourceSpans.
 func (c *Collector) Resources() []map[string]string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return append([]map[string]string(nil), c.resources...)
+	out := make([]map[string]string, len(c.resources))
+	for i, r := range c.resources {
+		out[i] = copyMap(r)
+	}
+	return out
 }
 
-// Requests returns a copy of the received request descriptions.
+// Requests returns a deep copy of the received request descriptions. Recorded
+// headers may include credentials (for example Authorization), so the
+// collector must only be used with synthetic data.
 func (c *Collector) Requests() []RequestInfo {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return append([]RequestInfo(nil), c.requests...)
+	out := make([]RequestInfo, len(c.requests))
+	for i, r := range c.requests {
+		out[i] = r
+		out[i].Headers = make(map[string][]string, len(r.Headers))
+		for k, v := range r.Headers {
+			out[i].Headers[k] = append([]string(nil), v...)
+		}
+	}
+	return out
 }
 
 // Close stops both listeners, releases held requests and waits for the
 // servers to stop. It is safe to call repeatedly; recorded data stays readable.
 func (c *Collector) Close() {
 	c.closeOnce.Do(func() {
+		c.inflightMu.Lock()
+		c.closed = true
+		c.inflightMu.Unlock()
 		close(c.done)
 		c.grpcSrv.Stop()
 		_ = c.httpSrv.Close()
 	})
 	c.wg.Wait()
+	c.inflight.Wait()
 }
 
 // UnreachableEndpoint reserves a loopback port, releases it and returns the
@@ -225,6 +266,28 @@ func listen(n *atomic.Int64) (net.Listener, error) {
 		return nil, err
 	}
 	return countingListener{Listener: ln, n: n}, nil
+}
+
+func copyMap(m map[string]string) map[string]string {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// begin registers an in-flight handler; it reports false once Close has begun.
+func (c *Collector) begin() bool {
+	c.inflightMu.Lock()
+	defer c.inflightMu.Unlock()
+	if c.closed {
+		return false
+	}
+	c.inflight.Add(1)
+	return true
 }
 
 func (c *Collector) record(info RequestInfo) {
@@ -267,36 +330,69 @@ func attrMap(kvs []*commonpb.KeyValue) map[string]string {
 	return m
 }
 
+// anyString renders an attribute value: strings as is, int decimal, bool
+// true/false, double via FormatFloat 'g', bytes as padded standard base64,
+// arrays and kvlists as compact JSON with sorted keys.
 func anyString(v *commonpb.AnyValue) string {
+	if s, ok := v.GetValue().(*commonpb.AnyValue_StringValue); ok {
+		return s.StringValue
+	}
+	switch x := anyNatural(v).(type) {
+	case string:
+		return x
+	case nil:
+		return ""
+	case bool:
+		return strconv.FormatBool(x)
+	case int64:
+		return strconv.FormatInt(x, 10)
+	case float64:
+		return strconv.FormatFloat(x, 'g', -1, 64)
+	default:
+		b, err := json.Marshal(x) // map keys are sorted by encoding/json
+		if err != nil {
+			return ""
+		}
+		return string(b)
+	}
+}
+
+func anyNatural(v *commonpb.AnyValue) any {
 	switch x := v.GetValue().(type) {
 	case *commonpb.AnyValue_StringValue:
 		return x.StringValue
 	case *commonpb.AnyValue_BoolValue:
-		return strconv.FormatBool(x.BoolValue)
+		return x.BoolValue
 	case *commonpb.AnyValue_IntValue:
-		return strconv.FormatInt(x.IntValue, 10)
+		return x.IntValue
 	case *commonpb.AnyValue_DoubleValue:
-		return strconv.FormatFloat(x.DoubleValue, 'g', -1, 64)
+		return x.DoubleValue
 	case *commonpb.AnyValue_BytesValue:
-		return fmt.Sprintf("%x", x.BytesValue)
+		return base64.StdEncoding.EncodeToString(x.BytesValue)
 	case *commonpb.AnyValue_ArrayValue:
-		parts := make([]string, 0, len(x.ArrayValue.GetValues()))
+		out := make([]any, 0, len(x.ArrayValue.GetValues()))
 		for _, e := range x.ArrayValue.GetValues() {
-			parts = append(parts, anyString(e))
+			out = append(out, anyNatural(e))
 		}
-		return "[" + strings.Join(parts, ",") + "]"
+		return out
 	case *commonpb.AnyValue_KvlistValue:
-		parts := make([]string, 0, len(x.KvlistValue.GetValues()))
+		out := make(map[string]any, len(x.KvlistValue.GetValues()))
 		for _, kv := range x.KvlistValue.GetValues() {
-			parts = append(parts, kv.GetKey()+"="+anyString(kv.GetValue()))
+			out[kv.GetKey()] = anyNatural(kv.GetValue())
 		}
-		return "{" + strings.Join(parts, ",") + "}"
+		return out
 	}
-	return ""
+	return nil
 }
 
 // handleHTTP serves POST /v1/traces.
 func (c *Collector) handleHTTP(w http.ResponseWriter, r *http.Request) {
+	if !c.begin() {
+		http.Error(w, "collector closed", http.StatusServiceUnavailable)
+		return
+	}
+	defer c.inflight.Done()
+
 	enc := ""
 	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
 		enc = "gzip"
@@ -309,8 +405,12 @@ func (c *Collector) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		case <-c.done:
 		case <-r.Context().Done():
 		}
-		return
+		// Never acknowledge a held request: abort the connection so the
+		// client sees a failure rather than an implicit 200.
+		panic(http.ErrAbortHandler)
 	case ModeReject:
+		// Reject mode answers regardless of method or body, so the
+		// configured status always reaches the client.
 		http.Error(w, "rejected by fake collector", c.cfg.httpStatus)
 		return
 	}
@@ -319,19 +419,28 @@ func (c *Collector) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var body io.Reader = r.Body
+	var body io.Reader = http.MaxBytesReader(w, r.Body, MaxBodyBytes)
 	if enc == "gzip" {
-		zr, err := gzip.NewReader(r.Body)
+		zr, err := gzip.NewReader(body)
 		if err != nil {
-			http.Error(w, "bad gzip body", http.StatusBadRequest)
+			bodyError(w, err)
 			return
 		}
 		defer zr.Close()
 		body = zr
 	}
-	raw, err := io.ReadAll(body)
-	if err != nil {
-		http.Error(w, "read body", http.StatusBadRequest)
+	// Read one byte past the cap (also bounds decompressed gzip output).
+	// A fixed buffer (no append growth) keeps memory use bounded at about
+	// MaxBodyBytes regardless of the input.
+	buf := make([]byte, MaxBodyBytes+1)
+	n, err := io.ReadFull(body, buf)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		bodyError(w, err)
+		return
+	}
+	raw := buf[:n]
+	if len(raw) > MaxBodyBytes {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	var req collectortrace.ExportTraceServiceRequest
@@ -343,13 +452,22 @@ func (c *Collector) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	out, _ := proto.Marshal(&collectortrace.ExportTraceServiceResponse{})
 	w.Header().Set("Content-Type", "application/x-protobuf")
-	_, _ = io.Copy(w, bytes.NewReader(out))
+	_, _ = w.Write(out)
 }
+
+func bodyError(w http.ResponseWriter, err error) {
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	http.Error(w, "bad request body", http.StatusBadRequest)
+}
+
+type encodingKey struct{}
 
 // encodingStats captures the request compression of each gRPC call, which is
 // not exposed in the incoming metadata.
-type encodingKey struct{}
-
 type encodingStats struct{}
 
 type encodingBox struct{ enc atomic.Value }
@@ -376,6 +494,10 @@ type grpcService struct {
 
 func (g grpcService) Export(ctx context.Context, req *collectortrace.ExportTraceServiceRequest) (*collectortrace.ExportTraceServiceResponse, error) {
 	c := g.c
+	if !c.begin() {
+		return nil, status.Error(codes.Unavailable, "collector closed")
+	}
+	defer c.inflight.Done()
 	enc := ""
 	if b, ok := ctx.Value(encodingKey{}).(*encodingBox); ok {
 		if v, _ := b.enc.Load().(string); v == "gzip" {
