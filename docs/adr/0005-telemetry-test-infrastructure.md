@@ -38,7 +38,12 @@ responding, recording transport headers and content encoding.
   writers as an alternative but is not required by production code.
 - No Part A test needs Docker. `make test-functional` builds the binary and
   runs `tests/functional/...` against it locally; Docker-backed `mongod`
-  fixtures arrive with the first proxying spec.
+  fixtures arrive with the first proxying spec. `make test-functional` is not
+  a gate until SPEC-001 task T18 creates `tests/functional`.
+- Certificates and keys used by tests (TLS collectors, `OTEL_*` certificate
+  validation) are synthetic and generated at test runtime into a temporary
+  directory. No `*.pem`, `*.key` or `*.p12` file is committed; these
+  patterns are gitignored.
 
 ## Consequences
 

@@ -1,7 +1,9 @@
 # ADR-0006: Startup sequence, startup-complete and readiness gating
 
-- Status: Accepted (planner, 2026-10-24), with the readiness response details
-  Proposed pending Owner answer Q6 in `plans/SPEC-001.md`.
+- Status: Accepted (planner, 2026-10-24). The readiness response details
+  were decided by Orchestrator under Owner's standing instruction,
+  2026-10-24, Owner may override (former question Q6, decision D6 in
+  `plans/SPEC-001.md`).
 - Related: SPEC-001 FR-7 (lifecycle), FR-18, FR-27, FR-28, FR-34, FR-35,
   AC-3, AC-21, AC-30, AC-31
 
@@ -39,14 +41,26 @@ Startup order in `internal/app/runtime`:
    *startup-complete* record.
 
 Shutdown (SIGINT/SIGTERM or context cancel): emit `lifecycle` *shutting
-down*; mark not ready; shut down the admin server; shut down tracing with a
+down*; mark the admin listener stopping, so `/readyz` returns 503
+`shutting_down`; shut down the admin server; shut down tracing with a
 5-second bound (FR-34); exit 0. Any startup failure exits with a non-zero
 code after its error record is written.
 
-Readiness (proposed, Q6): `/readyz` returns 503 `starting` until step 9
-regardless of any registered readiness check, then delegates to the
-registered check if any, else returns 200. Response bodies are
-`text/plain; charset=utf-8`: `ok\n` for 200 and `<reason>\n` for 503.
+Readiness (D6):
+
+- All `/readyz` responses use `Content-Type: text/plain; charset=utf-8`.
+  200 has body `ok\n`; 503 has body `<reason>\n`.
+- Until step 9, `/readyz` returns 503 `starting`. Registered readiness
+  checks are not consulted before then.
+- After step 9, it delegates to the registered check if any, else returns
+  200.
+- If a registered check reports a reason outside the defined set, the
+  response is 503 `unknown`; the reported reason is not echoed.
+- Once shutdown begins, `/readyz` returns 503 `shutting_down` regardless of
+  any registered check.
+- The defined reason set therefore includes `starting`, `shutting_down` and
+  `unknown`; the spec writer is adding `unknown` and `shutting_down` to the
+  spec.
 
 ## Consequences
 

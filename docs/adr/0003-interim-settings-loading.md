@@ -1,8 +1,9 @@
 # ADR-0003: Interim loading of SPEC-001 logical settings
 
-- Status: Proposed (planner, 2026-10-24). Needs Owner confirmation; see
-  question Q1 in `plans/SPEC-001.md`. Superseded by the future configuration
-  spec.
+- Status: Accepted (2026-10-24). Decided by Orchestrator under Owner's
+  standing instruction, 2026-10-24, Owner may override (former question Q1,
+  decision D1 in `plans/SPEC-001.md`). To be superseded by the future
+  configuration spec.
 - Related: SPEC-001 Non-goals (configuration loading), Interfaces (logical
   settings), FR-27, AC-3, AC-11, AC-21, AC-30
 
@@ -15,7 +16,7 @@ binary with specific settings (AC-3 with `tracing.enabled=true`, AC-11 with a
 configured `admin.listen`, AC-21 with an invalid setting, AC-30 with an
 address in use). The binary needs some way to receive them now.
 
-## Decision (proposed)
+## Decision
 
 - Settings parsing is split into two layers:
   1. `internal/infra/config` parses and validates a map from logical setting

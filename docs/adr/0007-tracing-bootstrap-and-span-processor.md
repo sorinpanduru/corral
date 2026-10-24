@@ -25,7 +25,11 @@ and flush for at most 5 seconds on shutdown.
   `Enabled() == false`. Nothing else is constructed. The log trace-correlation
   handler is not installed when disabled (FR-8).
 - `OTEL_TRACES_EXPORTER=none` builds an SDK provider with sampler and
-  resource but no span processor or exporter; `Enabled()` is true.
+  resource but no span processor or exporter; `Enabled()` is true. The log
+  trace-correlation handler is installed, so logs carry `trace_id`/`span_id`
+  whenever tracing is enabled, including with `none` (decision D9 in
+  `plans/SPEC-001.md`, decided by Orchestrator under Owner's standing
+  instruction, 2026-10-24, Owner may override).
 - Exporters are `otlptracehttp` or `otlptracegrpc` v1.47.0. They read the
   standard `OTEL_EXPORTER_OTLP_*` variables themselves (pass-through
   semantics). corral passes no option that overrides those variables except

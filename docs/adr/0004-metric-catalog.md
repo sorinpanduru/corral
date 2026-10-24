@@ -1,7 +1,8 @@
 # ADR-0004: Metric catalog format and catalog-backed constructors
 
-- Status: Accepted (planner, 2026-10-24), except the error-label names, which
-  are Proposed pending Owner answer Q4 in `plans/SPEC-001.md`.
+- Status: Accepted (planner, 2026-10-24). The error-label names were decided
+  by Orchestrator under Owner's standing instruction, 2026-10-24, Owner may
+  override (former question Q4, decision D4 in `plans/SPEC-001.md`).
 - Related: SPEC-001 FR-10, FR-11, FR-13, FR-29, FR-31, FR-37, AC-8, AC-10
 
 ## Context
@@ -31,10 +32,13 @@ label names and allowed label values, and a constructor that cannot create a
     collectors (FR-14).
 - Startup lints the embedded catalog and fails as an `internal` error if it
   has problems, so a bad catalog cannot ship even if a test is skipped.
-- Proposed (Q4): the label holding the FR-29 error class is named
+- Error labels (D4): the label holding the FR-29 error class is named
   `error_class` and the label holding the FR-29 detail is named
   `error_detail`. FR-10 requires snake_case label names, so the span/log key
   `corral.error.detail` cannot be used verbatim as a Prometheus label name.
+  The lint checks that values of a label named `error_class` are within the
+  FR-29 class enum and values of `error_detail` within the detail enum. The
+  spec writer is amending AC-8's wording to use these names.
 
 ## Consequences
 
