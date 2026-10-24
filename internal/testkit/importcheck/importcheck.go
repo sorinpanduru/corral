@@ -1,5 +1,8 @@
-// Package importcheck enforces the SPEC-001 FR-1 domain import boundary.
-// It is test infrastructure and must not be imported by production code.
+// Package importcheck holds static import checks over `go list` output: the
+// SPEC-001 FR-1 domain import boundary (Check, Scan), forbidden direct
+// imports (Forbidden) and forbidden packages in a binary's dependency closure
+// (ForbiddenDeps). It is test infrastructure and must not be imported by
+// production code.
 package importcheck
 
 import (
@@ -17,9 +20,9 @@ import (
 // empty; adding to it requires amending the spec.
 var DomainAllowlist []string
 
-// Violation is one forbidden import in a domain package.
+// Violation is one forbidden import of Import by the package Package.
 type Violation struct {
-	Package string // import path of the domain package
+	Package string // import path of the importing package
 	Import  string // the forbidden import path
 }
 
@@ -31,6 +34,7 @@ func (v Violation) String() string {
 type listedPkg struct {
 	ImportPath string
 	Standard   bool
+	DepOnly    bool
 	Imports    []string
 }
 
@@ -38,12 +42,19 @@ const slogPath = "log/slog"
 
 // list runs go list in a hermetic environment and decodes the packages.
 func list(dir, pattern string) ([]listedPkg, error) {
+	return listEnv(dir, pattern)
+}
+
+// listEnv is list with extra environment entries appended last, so they win.
+func listEnv(dir, pattern string, extraEnv ...string) ([]listedPkg, error) {
 	if strings.HasPrefix(pattern, "-") {
 		return nil, fmt.Errorf("invalid pattern %q: must not start with \"-\"", pattern)
 	}
 	cmd := exec.Command("go", "list", "-deps", "-json", pattern)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GOFLAGS=", "GOTOOLCHAIN=local", "GOPROXY=off", "GOWORK=off")
+	cmd.Env = append(os.Environ(), "GOFLAGS=", "GOTOOLCHAIN=local", "GOPROXY=off", "GOWORK=off",
+		"GOENV=off", "GOPACKAGESDRIVER=off")
+	cmd.Env = append(cmd.Env, extraEnv...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
@@ -63,10 +74,20 @@ func list(dir, pattern string) ([]listedPkg, error) {
 	return pkgs, nil
 }
 
-// inDomain reports whether path is under prefix. The root package
+// inDomain reports whether path equals prefix or lies under it on a path
+// boundary, so "a/testkit" does not match "a/testkitx". The root package
 // (path == prefix, e.g. internal/domain) counts as domain on purpose.
 func inDomain(path, prefix string) bool {
 	return path == prefix || strings.HasPrefix(path, prefix+"/")
+}
+
+func sortViolations(vs []Violation) {
+	sort.Slice(vs, func(i, j int) bool {
+		if vs[i].Package != vs[j].Package {
+			return vs[i].Package < vs[j].Package
+		}
+		return vs[i].Import < vs[j].Import
+	})
 }
 
 // Scan returns the sorted import paths of the domain packages that pattern
@@ -129,11 +150,76 @@ func Check(dir, pattern, domainPrefix string, allow []string) ([]Violation, erro
 			out = append(out, Violation{Package: p.ImportPath, Import: imp})
 		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Package != out[j].Package {
-			return out[i].Package < out[j].Package
+	sortViolations(out)
+	return out, nil
+}
+
+func matchesAny(path string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if inDomain(path, p) {
+			return true
 		}
-		return out[i].Import < out[j].Import
-	})
+	}
+	return false
+}
+
+// Forbidden reports every non-test import, by a package matched by pattern and
+// not under an exclude prefix, of a path under a forbidden prefix. Prefixes
+// match on path boundaries. Dependency-only packages are not examined. It
+// errors on an empty forbidden list or if no matched package remains after
+// exclusion, so callers cannot pass vacuously. Results are sorted by Package
+// then Import.
+func Forbidden(dir, pattern string, exclude, forbidden []string) ([]Violation, error) {
+	if len(forbidden) == 0 {
+		return nil, fmt.Errorf("empty forbidden list")
+	}
+	pkgs, err := list(dir, pattern)
+	if err != nil {
+		return nil, err
+	}
+	var out []Violation
+	checked := 0
+	for _, p := range pkgs {
+		if p.DepOnly || matchesAny(p.ImportPath, exclude) {
+			continue
+		}
+		checked++
+		for _, imp := range p.Imports {
+			if matchesAny(imp, forbidden) {
+				out = append(out, Violation{Package: p.ImportPath, Import: imp})
+			}
+		}
+	}
+	if checked == 0 {
+		return nil, fmt.Errorf("no packages matched %q after exclusion", pattern)
+	}
+	sortViolations(out)
+	return out, nil
+}
+
+// ForbiddenDeps returns the sorted, deduplicated paths in the dependency
+// closure of pattern (including the matched packages) that fall under a
+// forbidden prefix, for the given goos/goarch with cgo disabled. It errors on
+// an empty forbidden list or when nothing matches.
+func ForbiddenDeps(dir, pattern, goos, goarch string, forbidden []string) ([]string, error) {
+	if len(forbidden) == 0 {
+		return nil, fmt.Errorf("empty forbidden list")
+	}
+	pkgs, err := listEnv(dir, pattern, "GOOS="+goos, "GOARCH="+goarch, "CGO_ENABLED=0")
+	if err != nil {
+		return nil, err
+	}
+	if len(pkgs) == 0 {
+		return nil, fmt.Errorf("no packages matched %q", pattern)
+	}
+	seen := map[string]bool{}
+	out := []string{}
+	for _, p := range pkgs {
+		if matchesAny(p.ImportPath, forbidden) && !seen[p.ImportPath] {
+			seen[p.ImportPath] = true
+			out = append(out, p.ImportPath)
+		}
+	}
+	sort.Strings(out)
 	return out, nil
 }
