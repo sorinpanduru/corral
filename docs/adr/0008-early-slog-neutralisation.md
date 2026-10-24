@@ -16,9 +16,14 @@ Package `internal/infra/telemetry/earlyslog` (stdlib imports only) sets, in its
 init, a slog default handler that keeps only a per-level counter and drops
 message and attributes. Go initialises packages in dependency order, ties
 broken by import path; `github.com/sorinpanduru/...` sorts before
-`go.opentelemetry.io/...` and earlyslog has no non-stdlib dependencies, so it
-runs first. cmd/corral blank-imports it and logbridge imports it, so it is
-always linked. `logbridge.Install` calls `earlyslog.Handoff`, which returns the counts and makes
+`go.opentelemetry.io/...` and earlyslog has no non-stdlib dependencies.
+earlyslog does not run first overall: standard-library packages, and packages
+that import only `log` (not `log/slog`), may initialise earlier. The property
+is narrower: earlyslog initialises before every linked third-party package that
+uses `log/slog` or `log` at init, apart from the reviewed allowlist. The
+init-order guard (tests/functional/initorder_test.go) enforces this property.
+cmd/corral blank-imports earlyslog and logbridge imports it, so it is always
+linked. `logbridge.Install` calls `earlyslog.Handoff`, which returns the counts and makes
 later records of handlers captured during init forward to the bridge handler.
 Every early slog record is then replayed through the rate-limited,
 fixed-message thirdparty default-slog handler (first per level emitted, the rest
@@ -32,7 +37,8 @@ Raw values are never retained or output.
 ## Consequences
 
 Correctness relies on init ordering; this is pinned by the T22 functional
-test (the binary must have empty stderr). A future dependency whose import
+test (the binary must have empty stderr) and by the init-order guard, which
+checks the property stated above against the linked dependency set. A future dependency whose import
 path sorts before `github.com/sorinpanduru` and logs at init would not be
 covered. Rejected: removing auto/sdk (unavoidable transitive dependency).
 

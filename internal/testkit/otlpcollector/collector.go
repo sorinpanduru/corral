@@ -9,6 +9,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -61,11 +62,27 @@ type RecordedEvent struct {
 	Attributes map[string]string
 }
 
+// RecordedLink is a span link. TraceID and SpanID are lowercase hex.
+type RecordedLink struct {
+	TraceID    string
+	SpanID     string
+	Attributes map[string]string
+}
+
+// RecordedScope is the instrumentation scope a span was exported under.
+type RecordedScope struct {
+	Name       string
+	Version    string
+	Attributes map[string]string
+}
+
 // RecordedSpan is a decoded span.
 type RecordedSpan struct {
 	Name          string
 	Attributes    map[string]string
 	Events        []RecordedEvent
+	Links         []RecordedLink
+	Scope         RecordedScope
 	StatusCode    int32
 	StatusMessage string
 }
@@ -210,6 +227,13 @@ func (c *Collector) Spans() []RecordedSpan {
 	for i, sp := range c.spans {
 		out[i] = sp
 		out[i].Attributes = copyMap(sp.Attributes)
+		out[i].Scope.Attributes = copyMap(sp.Scope.Attributes)
+		if sp.Links != nil {
+			out[i].Links = make([]RecordedLink, len(sp.Links))
+			for j, l := range sp.Links {
+				out[i].Links[j] = RecordedLink{TraceID: l.TraceID, SpanID: l.SpanID, Attributes: copyMap(l.Attributes)}
+			}
+		}
 		if sp.Events != nil {
 			out[i].Events = make([]RecordedEvent, len(sp.Events))
 			for j, e := range sp.Events {
@@ -334,12 +358,25 @@ func (c *Collector) recordTraces(req *collectortrace.ExportTraceServiceRequest) 
 	for _, rs := range req.GetResourceSpans() {
 		resources = append(resources, attrMap(rs.GetResource().GetAttributes()))
 		for _, ss := range rs.GetScopeSpans() {
+			scope := RecordedScope{
+				Name:       ss.GetScope().GetName(),
+				Version:    ss.GetScope().GetVersion(),
+				Attributes: attrMap(ss.GetScope().GetAttributes()),
+			}
 			for _, s := range ss.GetSpans() {
 				r := RecordedSpan{
 					Name:          s.GetName(),
 					Attributes:    attrMap(s.GetAttributes()),
 					StatusCode:    int32(s.GetStatus().GetCode()),
 					StatusMessage: s.GetStatus().GetMessage(),
+					Scope:         RecordedScope{Name: scope.Name, Version: scope.Version, Attributes: copyMap(scope.Attributes)},
+				}
+				for _, l := range s.GetLinks() {
+					r.Links = append(r.Links, RecordedLink{
+						TraceID:    hex.EncodeToString(l.GetTraceId()),
+						SpanID:     hex.EncodeToString(l.GetSpanId()),
+						Attributes: attrMap(l.GetAttributes()),
+					})
 				}
 				for _, e := range s.GetEvents() {
 					r.Events = append(r.Events, RecordedEvent{Name: e.GetName(), Attributes: attrMap(e.GetAttributes())})
