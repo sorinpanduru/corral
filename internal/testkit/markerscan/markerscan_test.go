@@ -27,7 +27,7 @@ package markerscan_test
 //
 // API expected from T14 (identifiers not fixed by the plan are marked *):
 //   New() *Scanner
-//   (*Scanner).AddMarker(m string, sources ...Source) error   -- error when m is
+//   (*Scanner).AddMarker(tb testing.TB, m string, sources ...Source)   -- tb.Fatalf when m is
 //     shorter than 16 bytes or has a byte outside [A-Za-z0-9_-]; no sources = all
 //   (*Scanner).Add(src Source, data []byte)   -- may be called repeatedly; data
 //     of one source is concatenated, so a marker split across calls is found
@@ -36,7 +36,7 @@ package markerscan_test
 //   (*Scanner).Findings() []Finding
 //   (*Scanner).Truncated(src Source) bool   *  -- source exceeded the cap
 //   AssertClean(tb testing.TB) on *Scanner: (*Scanner).AssertClean(tb)   *
-//     -- fails tb on any finding or any truncated source
+//     -- fails tb on any finding, any truncated source, or no registered marker
 //   type Source; SourceStdout, SourceStderr, SourceMetrics, SourceReadyz, SourceSpans
 //   type Finding struct { Marker string; Source Source; Encoding string }
 //     Encoding is one of: "raw", "raw-partial" (any 12-byte window of the
@@ -107,9 +107,7 @@ func newMarker(t testing.TB) string {
 
 func mustAdd(t testing.TB, s *markerscan.Scanner, m string, src ...markerscan.Source) {
 	t.Helper()
-	if err := s.AddMarker(m, src...); err != nil {
-		t.Fatalf("AddMarker(%q): %v", m, err)
-	}
+	s.AddMarker(t, m, src...)
 }
 
 // fakeTB records failures without stopping the test.
@@ -215,15 +213,28 @@ func TestEncodingFixtureIsMeaningful(t *testing.T) { // AC-33
 func TestAddMarkerValidation(t *testing.T) { // AC-33, D4
 	s := markerscan.New()
 	for _, bad := range []string{"", "short_marker", "0123456789abcde", "has space 0123456789abc", "plus+0123456789abcdef", "slash/0123456789abcdef", "angle<0123456789abcdef", "nl0123456789abcdef\n", "uni\u00e9_0123456789abcdef"} {
-		if err := s.AddMarker(bad); err == nil {
-			t.Errorf("AddMarker(%q) accepted an unsafe marker", bad)
+		f := &fakeTB{TB: t}
+		s.AddMarker(f, bad)
+		if !f.failed {
+			t.Errorf("AddMarker(%q) did not fail tb for an unsafe marker", bad)
 		}
 	}
-	if err := s.AddMarker("Abc_def-0123456789"); err != nil {
-		t.Errorf("safe marker rejected: %v", err)
+	for _, good := range []string{"Abc_def-0123456789", "0123456789abcdef"} {
+		f := &fakeTB{TB: t}
+		s.AddMarker(f, good)
+		if f.failed {
+			t.Errorf("safe marker %q rejected", good)
+		}
 	}
-	if err := s.AddMarker("0123456789abcdef"); err != nil {
-		t.Errorf("16-byte marker rejected: %v", err)
+}
+
+func TestAssertCleanFailsWithoutMarkers(t *testing.T) { // AC-33
+	s := markerscan.New()
+	s.Add(markerscan.SourceStdout, []byte("nothing"))
+	f := &fakeTB{TB: t}
+	s.AssertClean(f)
+	if !f.failed {
+		t.Error("AssertClean passed although no marker was registered")
 	}
 }
 
@@ -322,11 +333,13 @@ func TestNegativeControl(t *testing.T) { // AC-33
 	mustAdd(t, s, m)
 	for _, src := range textSources {
 		s.Add(src, []byte("level=info msg=started\n# TYPE corral_up gauge\nok\n"))
-		s.Add(src, []byte(other))                             // a different marker
-		s.Add(src, []byte(m[:11]))                            // shorter than a 12-byte window
-		s.Add(src, []byte(m[13:]))                            // 11 bytes
-		s.Add(src, []byte(hex.EncodeToString([]byte(other)))) // other marker, hex
-		s.Add(src, []byte(base64.StdEncoding.EncodeToString([]byte("Q"+other))))
+		// Add joins calls into one stream: end every plant with a newline so
+		// fragments cannot join into a window of the marker.
+		s.Add(src, []byte(other+"\n"))                             // a different marker
+		s.Add(src, []byte(m[:11]+"\n"))                            // shorter than a 12-byte window
+		s.Add(src, []byte(m[13:]+"\n"))                            // 11 bytes
+		s.Add(src, []byte(hex.EncodeToString([]byte(other))+"\n")) // other marker, hex
+		s.Add(src, []byte(base64.StdEncoding.EncodeToString([]byte("Q"+other))+"\n"))
 		s.Add(src, nil)
 	}
 	if fs := s.Findings(); len(fs) != 0 {
