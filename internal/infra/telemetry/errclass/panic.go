@@ -1,7 +1,5 @@
 package errclass
 
-import "errors"
-
 // panicError is the error returned by FromPanic. It deliberately holds no
 // reference to the recovered value (FR-24).
 type panicError struct{ stack []byte }
@@ -21,9 +19,10 @@ func FromPanic(recovered any, stack []byte) error {
 
 // Stack returns the stack kept by FromPanic, if any.
 func Stack(err error) ([]byte, bool) {
-	var p *panicError
-	if errors.As(err, &p) && len(p.stack) > 0 {
-		return append([]byte(nil), p.stack...), true
+	for _, n := range walk(err) {
+		if p, ok := n.(*panicError); ok && len(p.stack) > 0 {
+			return append([]byte(nil), p.stack...), true
+		}
 	}
 	return nil, false
 }

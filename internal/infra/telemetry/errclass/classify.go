@@ -11,7 +11,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
 	"io"
 	"net"
 	"os"
@@ -101,29 +100,98 @@ var errnoDetails = []struct {
 	{syscall.EADDRINUSE, DetailEADDRINUSE},
 }
 
+const (
+	maxWalkDepth = 64  // deepest Unwrap level visited
+	maxWalkNodes = 256 // total errors visited, bounds join fan-out
+)
+
+// walk flattens the Unwrap tree of err (breadth first) into at most
+// maxWalkNodes errors, no deeper than maxWalkDepth. It is used instead of
+// errors.Is/As so that a cyclic Unwrap chain terminates.
+func walk(err error) []error {
+	type item struct {
+		err   error
+		depth int
+	}
+	var out []error
+	queue := []item{{err, 0}}
+	for len(queue) > 0 && len(out) < maxWalkNodes {
+		it := queue[0]
+		queue = queue[1:]
+		if it.err == nil {
+			continue
+		}
+		out = append(out, it.err)
+		if it.depth >= maxWalkDepth {
+			continue
+		}
+		switch u := it.err.(type) {
+		case interface{ Unwrap() error }:
+			queue = append(queue, item{u.Unwrap(), it.depth + 1})
+		case interface{ Unwrap() []error }:
+			for _, e := range u.Unwrap() {
+				queue = append(queue, item{e, it.depth + 1})
+			}
+		}
+	}
+	return out
+}
+
+// anyNode reports whether pred holds for any node.
+func anyNode(nodes []error, pred func(error) bool) bool {
+	for _, n := range nodes {
+		if pred(n) {
+			return true
+		}
+	}
+	return false
+}
+
+// isTarget reports whether n is target or says it is via an Is method.
+func isTarget(n, target error) bool {
+	if n == target {
+		return true
+	}
+	if x, ok := n.(interface{ Is(error) bool }); ok {
+		return x.Is(target)
+	}
+	return false
+}
+
+func hasTarget(nodes []error, target error) bool {
+	return anyNode(nodes, func(n error) bool { return isTarget(n, target) })
+}
+
 // Classify maps err to its FR-29 class and detail (plan decision D3). It
 // never reads the error text.
+//
+// Precedence over the whole chain: recovered panic > config > server >
+// protocol > errno/sentinels. For the last group the detail is chosen in
+// this order: deadline_exceeded, canceled, errno values, eof, dns_resolution,
+// tls_handshake, then any net.Error-style Timeout() (ETIMEDOUT). EOF is
+// checked before DNS and TLS because a peer closing the stream mid-handshake
+// or mid-lookup surfaces as EOF wrapped by the higher-level error, and the
+// connection close is the actual cause.
+//
+// The chain is walked with a bounded walk (depth 64, 256 nodes), so a cyclic
+// Unwrap chain terminates and, having no match, yields internal/other. A nil
+// error also yields internal/other.
 func Classify(err error) (Class, Detail) {
-	if err == nil {
+	return classify(walk(err))
+}
+
+func classify(nodes []error) (Class, Detail) {
+	switch {
+	case anyNode(nodes, func(n error) bool { _, ok := n.(*panicError); return ok }):
 		return ClassInternal, DetailOther
-	}
-	var pe *panicError
-	if errors.As(err, &pe) {
-		return ClassInternal, DetailOther
-	}
-	var se ServerError
-	if errors.As(err, &se) {
+	case anyNode(nodes, func(n error) bool { _, ok := n.(ConfigError); return ok }):
+		return ClassConfig, detailOf(nodes)
+	case anyNode(nodes, func(n error) bool { _, ok := n.(ServerError); return ok }):
 		return ClassServer, DetailOther
-	}
-	var ce ConfigError
-	if errors.As(err, &ce) {
-		return ClassConfig, detailOf(err)
-	}
-	var pr ProtocolError
-	if errors.As(err, &pr) {
+	case anyNode(nodes, func(n error) bool { _, ok := n.(ProtocolError); return ok }):
 		return ClassProtocol, DetailOther
 	}
-	d := detailOf(err)
+	d := detailOf(nodes)
 	return classOfDetail(d), d
 }
 
@@ -138,79 +206,54 @@ func classOfDetail(d Detail) Class {
 	}
 }
 
-// detailOf derives the detail from the error chain only.
-func detailOf(err error) Detail {
+// detailOf derives the detail from the walked chain only.
+func detailOf(nodes []error) Detail {
 	switch {
-	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded):
+	case hasTarget(nodes, context.DeadlineExceeded), hasTarget(nodes, os.ErrDeadlineExceeded):
 		return DetailDeadlineExceeded
-	case errors.Is(err, context.Canceled):
+	case hasTarget(nodes, context.Canceled):
 		return DetailCanceled
 	}
 	for _, e := range errnoDetails {
-		if errors.Is(err, e.errno) {
+		if hasTarget(nodes, e.errno) {
 			return e.detail
 		}
 	}
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+	if hasTarget(nodes, io.EOF) || hasTarget(nodes, io.ErrUnexpectedEOF) {
 		return DetailEOF
 	}
-	var dns *net.DNSError
-	if errors.As(err, &dns) {
+	if anyNode(nodes, func(n error) bool {
+		switch n.(type) {
+		case *net.DNSError:
+			return true
+		}
+		return false
+	}) {
 		return DetailDNSResolution
 	}
-	if isTLS(err) {
+	if anyNode(nodes, isTLSNode) {
 		return DetailTLSHandshake
 	}
-	if hasTimeout(err) {
+	if anyNode(nodes, func(n error) bool {
+		t, ok := n.(interface{ Timeout() bool })
+		return ok && t.Timeout()
+	}) {
 		return DetailETIMEDOUT
 	}
 	return DetailOther
 }
 
-func isTLS(err error) bool {
-	var (
-		rh   tls.RecordHeaderError
-		rhp  *tls.RecordHeaderError
-		cv   *tls.CertificateVerificationError
-		alrt tls.AlertError
-		ua   x509.UnknownAuthorityError
-		uap  *x509.UnknownAuthorityError
-		hn   x509.HostnameError
-		hnp  *x509.HostnameError
-		ci   x509.CertificateInvalidError
-		cip  *x509.CertificateInvalidError
-		sr   x509.SystemRootsError
-		srp  *x509.SystemRootsError
-		cvi  x509.ConstraintViolationError
-		cvp  *x509.ConstraintViolationError
-		ia   x509.InsecureAlgorithmError
-		uc   x509.UnhandledCriticalExtension
-	)
-	return errors.As(err, &rh) || errors.As(err, &rhp) || errors.As(err, &cv) ||
-		errors.As(err, &alrt) || errors.As(err, &ua) || errors.As(err, &uap) ||
-		errors.As(err, &hn) || errors.As(err, &hnp) || errors.As(err, &ci) ||
-		errors.As(err, &cip) || errors.As(err, &sr) || errors.As(err, &srp) ||
-		errors.As(err, &cvi) || errors.As(err, &cvp) || errors.As(err, &ia) ||
-		errors.As(err, &uc)
-}
-
-// hasTimeout reports whether any error in the chain says Timeout() == true.
-func hasTimeout(err error) bool {
-	if err == nil {
-		return false
-	}
-	if t, ok := err.(interface{ Timeout() bool }); ok && t.Timeout() {
+func isTLSNode(n error) bool {
+	switch n.(type) {
+	case tls.RecordHeaderError, *tls.RecordHeaderError,
+		*tls.CertificateVerificationError, tls.AlertError,
+		x509.UnknownAuthorityError, *x509.UnknownAuthorityError,
+		x509.HostnameError, *x509.HostnameError,
+		x509.CertificateInvalidError, *x509.CertificateInvalidError,
+		x509.SystemRootsError, *x509.SystemRootsError,
+		x509.ConstraintViolationError, *x509.ConstraintViolationError,
+		x509.InsecureAlgorithmError, x509.UnhandledCriticalExtension:
 		return true
-	}
-	switch u := err.(type) {
-	case interface{ Unwrap() error }:
-		return hasTimeout(u.Unwrap())
-	case interface{ Unwrap() []error }:
-		for _, e := range u.Unwrap() {
-			if hasTimeout(e) {
-				return true
-			}
-		}
 	}
 	return false
 }
