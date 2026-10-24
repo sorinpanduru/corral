@@ -163,6 +163,12 @@ func TestIsSet(t *testing.T) {
 	}{
 		{"", false}, {" ", false}, {"  ", false}, {"\t", false}, {"\n", false}, {"\r\n", false},
 		{" \t\n ", false}, {" ", false}, {"\u0085", false}, {" ", false},
+		{"\u3000", false}, {"\u3000\u00a0 ", false},
+		// Not whitespace for unicode.IsSpace: zero-width space and BOM count as set.
+		{"\u200b", true}, {"\ufeff", true}, {" \u200b ", true},
+		// Invalid UTF-8 is never whitespace: a bare 0xff or a bare 0x85 (the
+		// C1 NEL byte, not a valid sequence on its own) counts as set.
+		{"\xff", true}, {"\x85", true}, {" \xff ", true}, {" \x85 ", true},
 		{" a ", true}, {"a", true}, {"0", true}, {"false", true}, {"\x00", true}, {"_", true},
 	}
 	for i, c := range cases {
