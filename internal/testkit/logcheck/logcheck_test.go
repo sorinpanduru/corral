@@ -423,17 +423,24 @@ func TestFailureMessagesIncludeRecordMessageAndLevel(t *testing.T) {
 	cases := []struct {
 		name  string
 		level slog.Level
-		fn    func(l *slog.Logger, msg string)
+		msg   string
+		fn    func(l *slog.Logger)
 	}{
-		{"warn_bad_key", slog.LevelWarn, func(l *slog.Logger, msg string) { l.Warn(msg, "bad_key", "v") }},
-		{"error_group", slog.LevelError, func(l *slog.Logger, msg string) { l.Error(msg, slog.Group("g", slog.Int("retry_count", 1))) }},
-		{"debug_nonnumeric", slog.LevelDebug, func(l *slog.Logger, msg string) { l.Debug(msg, "x_count", "n") }},
-		{"info_dup_component", slog.LevelInfo, func(l *slog.Logger, msg string) { l.Info(msg, "component", "grpc") }},
+		{"warn_bad_key", slog.LevelWarn, "synthetic-marker-warn_bad_key",
+			func(l *slog.Logger) { l.Warn("synthetic-marker-warn_bad_key", "bad_key", "v") }},
+		{"error_group", slog.LevelError, "synthetic-marker-error_group",
+			func(l *slog.Logger) {
+				l.Error("synthetic-marker-error_group", slog.Group("g", slog.Int("retry_count", 1)))
+			}},
+		{"debug_nonnumeric", slog.LevelDebug, "synthetic-marker-debug_nonnumeric",
+			func(l *slog.Logger) { l.Debug("synthetic-marker-debug_nonnumeric", "x_count", "n") }},
+		{"info_dup_component", slog.LevelInfo, "synthetic-marker-info_dup_component",
+			func(l *slog.Logger) { l.Info("synthetic-marker-info_dup_component", "component", "grpc") }},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			msg := "synthetic-marker-" + c.name
-			ftb, _ := run(t, func(h *logcheck.Handler) { c.fn(lg(h, "config"), msg) })
+			msg := c.msg
+			ftb, _ := run(t, func(h *logcheck.Handler) { c.fn(lg(h, "config")) })
 			if !ftb.Failed() {
 				t.Fatal("expected failure")
 			}
