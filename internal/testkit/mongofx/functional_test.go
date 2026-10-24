@@ -86,9 +86,26 @@ func TestReplicaSetAuth_FR54(t *testing.T) {
 	if _, err := svc.Database("fxtest").Collection("c").InsertOne(ctx(t, 20*time.Second), bson.D{{Key: "a", Value: 1}}); err != nil {
 		t.Fatalf("service user cannot write the test database: %v", err)
 	}
-	// The service user has only readWrite on test databases: no admin commands.
-	if err := svc.Database("admin").RunCommand(ctx(t, 20*time.Second), bson.D{{Key: "listDatabases", Value: 1}}).Err(); err == nil {
-		t.Fatal("service user can run listDatabases (too many privileges)")
+	// The service user has only readWrite on test databases. MongoDB 7.0 and
+	// 8.0 let listDatabases succeed for any user (it returns only the databases
+	// the user may see), so use commands that truly need a privilege.
+	if err := svc.Database("admin").RunCommand(ctx(t, 20*time.Second), bson.D{{Key: "serverStatus", Value: 1}}).Err(); err == nil {
+		t.Fatal("service user can run serverStatus (too many privileges)")
+	}
+	if err := svc.Database("admin").RunCommand(ctx(t, 20*time.Second), bson.D{{Key: "createUser", Value: "synthetic-extra"}, {Key: "pwd", Value: "synthetic-extra-pass-0"}, {Key: "roles", Value: bson.A{}}}).Err(); err == nil {
+		t.Fatal("service user can create users (too many privileges)")
+	}
+	var dbs struct {
+		Databases []struct {
+			Name string `bson:"name"`
+		} `bson:"databases"`
+	}
+	if err := svc.Database("admin").RunCommand(ctx(t, 20*time.Second), bson.D{{Key: "listDatabases", Value: 1}, {Key: "nameOnly", Value: true}}).Decode(&dbs); err == nil {
+		for _, d := range dbs.Databases {
+			if d.Name == "admin" || d.Name == "local" || d.Name == "config" {
+				t.Fatalf("service user can see the %q database", d.Name)
+			}
+		}
 	}
 	if err := rs.Admin().Database("admin").RunCommand(ctx(t, 20*time.Second), bson.D{{Key: "listDatabases", Value: 1}}).Err(); err != nil {
 		t.Fatalf("admin client cannot list databases: %v", err)

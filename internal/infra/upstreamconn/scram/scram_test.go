@@ -42,7 +42,10 @@ func (c creds) server(t testing.TB) *xscram.Server {
 	}
 	stored := lc.GetStoredCredentials(xscram.KeyFactors{Salt: string(c.salt), Iters: c.iters})
 	srv, err := xscram.SHA256.NewServer(func(user string) (xscram.StoredCredentials, error) {
-		if user != c.name {
+		// The library server passes the wire form of the name (RFC 5802
+		// escaping: "=2C" for ',' and "=3D" for '='). Decode it strictly, as
+		// MongoDB does, so a wrongly escaped username fails the lookup.
+		if decoded, ok := unescapeName(user); !ok || decoded != c.name {
 			return xscram.StoredCredentials{}, errors.New("unknown user")
 		}
 		return stored, nil
@@ -51,6 +54,31 @@ func (c creds) server(t testing.TB) *xscram.Server {
 		t.Fatal(err)
 	}
 	return srv
+}
+
+// unescapeName reverses RFC 5802 saslname escaping. A bare '=' not followed
+// by 2C or 3D is invalid.
+func unescapeName(s string) (string, bool) {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] != '=' {
+			b.WriteByte(s[i])
+			continue
+		}
+		if len(s)-i < 3 {
+			return "", false
+		}
+		switch s[i+1 : i+3] {
+		case "2C":
+			b.WriteByte(',')
+		case "3D":
+			b.WriteByte('=')
+		default:
+			return "", false
+		}
+		i += 2
+	}
+	return b.String(), true
 }
 
 var allSentinels = []error{scram.ErrServerSignature, scram.ErrProtocol, scram.ErrSASLprep, scram.ErrIterations}
