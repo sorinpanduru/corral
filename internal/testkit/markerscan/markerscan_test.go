@@ -88,39 +88,21 @@ func srcName(s markerscan.Source) string { return fmt.Sprintf("source#%v", s) }
 
 const safeAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
 
-// stableMiddleHasSixtyTwoOrThree reports whether, for every alignment 0..2,
-// the base64 of prefix+marker has '+' or '/' away from both edges (4 chars
-// dropped each side, stricter than any sane edge rule). Then the standard and
-// URL-safe patterns differ at every alignment.
-func stableMiddleHasSixtyTwoOrThree(m string) bool {
-	for k := range fillers {
-		e := base64.StdEncoding.EncodeToString([]byte(fillers[k] + m))
-		if len(e) < 9 || !strings.ContainsAny(e[4:len(e)-4], "+/") {
-			return false
-		}
-	}
-	return true
-}
-
-// newMarker returns a random synthetic marker in the safe alphabet, 24 bytes,
-// chosen so both base64 alphabets are exercised at every alignment.
+// newMarker returns a random synthetic marker, 24 bytes of the safe alphabet.
+// Safe markers have 6-bit groups <= 61, so standard and URL-safe base64
+// coincide; alphabet coverage is proven on Patterns directly (see
+// TestEncodingFixtureIsMeaningful).
 func newMarker(t testing.TB) string {
 	t.Helper()
-	for try := 0; try < 100000; try++ {
-		b := make([]byte, 24)
-		for i := range b {
-			n, err := rand.Int(rand.Reader, big.NewInt(int64(len(safeAlphabet))))
-			if err != nil {
-				t.Fatal(err)
-			}
-			b[i] = safeAlphabet[n.Int64()]
+	b := make([]byte, 24)
+	for i := range b {
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(safeAlphabet))))
+		if err != nil {
+			t.Fatal(err)
 		}
-		if m := string(b); stableMiddleHasSixtyTwoOrThree(m) {
-			return m
-		}
+		b[i] = safeAlphabet[n.Int64()]
 	}
-	t.Fatal("could not generate a marker")
-	return ""
+	return string(b)
 }
 
 func mustAdd(t testing.TB, s *markerscan.Scanner, m string, src ...markerscan.Source) {
@@ -178,6 +160,16 @@ func foundEnc(fs []markerscan.Finding, m string, src markerscan.Source, enc stri
 	return false
 }
 
+// foundEncAlt is foundEnc, but for base64 encodings either alphabet's name
+// is accepted (they coincide for safe-alphabet markers); the /N suffix must match.
+func foundEncAlt(fs []markerscan.Finding, m string, src markerscan.Source, enc string) bool {
+	if i := strings.Index(enc, "/"); strings.HasPrefix(enc, "base64-") && i > 0 {
+		n := enc[i:]
+		return foundEnc(fs, m, src, "base64-std"+n) || foundEnc(fs, m, src, "base64-url"+n)
+	}
+	return foundEnc(fs, m, src, enc)
+}
+
 func found(fs []markerscan.Finding, m string, src markerscan.Source) bool {
 	for _, f := range fs {
 		if f.Marker == m && f.Source == src {
@@ -187,13 +179,35 @@ func found(fs []markerscan.Finding, m string, src markerscan.Source) bool {
 	return false
 }
 
-func TestEncodingFixtureIsMeaningful(t *testing.T) {
-	m := newMarker(t)
+// TestEncodingFixtureIsMeaningful proves both base64 alphabets are produced
+// at all 3 alignments, using Patterns directly with bytes outside the safe
+// alphabet (all-ones 6-bit groups, so every stable char is '/' or '_').
+func TestEncodingFixtureIsMeaningful(t *testing.T) { // AC-33
+	m := strings.Repeat("\xff", 24)
+	pats := markerscan.Patterns(m)
+	byName := map[string][]byte{}
+	for _, p := range pats {
+		byName[p.Name] = p.Bytes
+	}
 	for k := range fillers {
-		e := encodings(m, k, "")
-		std, url := e[3].text, e[5].text
-		if std == url || !strings.ContainsAny(std[4:len(std)-4], "+/") || !strings.ContainsAny(url[4:len(url)-4], "-_") {
-			t.Fatalf("offset %d: fixture does not exercise both base64 alphabets", k)
+		std, url := byName[fmt.Sprintf("base64-std/%d", k)], byName[fmt.Sprintf("base64-url/%d", k)]
+		if len(std) == 0 || len(url) == 0 {
+			t.Fatalf("alignment %d: missing base64 pattern (std=%q url=%q)", k, std, url)
+		}
+		if !bytes.ContainsAny(std, "+/") || !bytes.ContainsAny(url, "-_") {
+			t.Errorf("alignment %d: std %q / url %q lack the alphabet-specific characters", k, std, url)
+		}
+		if bytes.Equal(std, url) {
+			t.Errorf("alignment %d: std and url patterns are equal", k)
+		}
+		raw := []byte(fillers[k] + m)
+		stdEnc := []byte(base64.RawStdEncoding.EncodeToString(raw))
+		urlEnc := []byte(base64.RawURLEncoding.EncodeToString(raw))
+		if !bytes.Contains(stdEnc, std) {
+			t.Errorf("alignment %d: std pattern %q not inside encoding %q", k, std, stdEnc)
+		}
+		if !bytes.Contains(urlEnc, url) {
+			t.Errorf("alignment %d: url pattern %q not inside encoding %q", k, url, urlEnc)
 		}
 	}
 }
@@ -225,11 +239,8 @@ func TestPlantedEncodingsDetectedInEverySource(t *testing.T) { // AC-33
 						mustAdd(t, s, m)
 						s.Add(src, []byte("ts=1 noise "+p.text+" tail\n"))
 						fs := s.Findings()
-						if !foundEnc(fs, m, src, p.enc) {
+						if !foundEncAlt(fs, m, src, p.enc) {
 							t.Fatalf("marker not detected as %q in %s; findings=%v", p.enc, p.name, fs)
-						}
-						if strings.HasPrefix(p.enc, "base64-url/") && foundEnc(fs, m, src, strings.Replace(p.enc, "url", "std", 1)) {
-							t.Fatalf("URL-safe plant matched the standard pattern: %v", fs)
 						}
 					})
 				}
@@ -363,7 +374,7 @@ func TestSplitAcrossAddCalls(t *testing.T) { // AC-33, D8
 			mustAdd(t, s, m)
 			s.Add(markerscan.SourceStdout, []byte("pre "+c.text[:cut]))
 			s.Add(markerscan.SourceStdout, []byte(c.text[cut:]+" post"))
-			if !foundEnc(s.Findings(), m, markerscan.SourceStdout, c.enc) {
+			if !foundEncAlt(s.Findings(), m, markerscan.SourceStdout, c.enc) {
 				t.Fatalf("%s cut at %d: split marker not detected: %v", c.name, cut, s.Findings())
 			}
 		}
