@@ -29,7 +29,7 @@ func cfgWith(kind tracing.SamplerKind, ratio float64) tracing.EnvConfig {
 }
 
 // decide runs the sampler for a span with the given trace ID and parent
-// (parentFlags < 0 means no parent, i.e. a root span).
+// (noParent means a root span).
 func decide(s sdktrace.Sampler, id trace.TraceID, parent parentKind) bool {
 	ctx := context.Background()
 	if parent != noParent {
@@ -144,9 +144,6 @@ func TestSamplerKindsMapToMatchingSDKSamplers(t *testing.T) {
 				t.Fatal("NewSampler returned nil")
 			}
 			for _, id := range []trace.TraceID{lowTraceID, highTraceID} {
-				if c.ratio > 0 && c.ratio < 1 {
-					continue
-				}
 				if got := decide(s, id, noParent); got != c.root {
 					t.Errorf("root: sampled=%v, want %v", got, c.root)
 				}
@@ -197,17 +194,17 @@ func TestSamplerAlwaysOnOverridesZeroRatio(t *testing.T) {
 	}
 }
 
-// FR-21, AC-16: OTEL_TRACES_SAMPLER_ARG=0.0 with sample_ratio=1.0 samples no
-// roots. Resolve (T10) puts the arg into SampleRatio; the sampler must use the
-// ratio it is given, and SampleRatio, not the unused SamplerArg pointer
-// contents, decides.
+// FR-21, AC-16: OTEL_TRACES_SAMPLER_ARG=0 with sample_ratio=1.0 samples no
+// roots. The config goes through tracing.Resolve (T10), then NewSampler.
 func TestSamplerArgZeroOverridesSampleRatioOne(t *testing.T) {
-	zero := 0.0
-	cfg := tracing.EnvConfig{SamplerArg: &zero, SampleRatio: 0.0}
+	on, cfg, err := tracing.Resolve(envOn(1.0), envMap(map[string]string{"OTEL_TRACES_SAMPLER_ARG": "0"}))
+	if err != nil || !on {
+		t.Fatalf("Resolve: on=%v err=%v", on, err)
+	}
 	s := tracing.NewSampler(cfg, cfg.SampleRatio)
 	for _, id := range []trace.TraceID{lowTraceID, highTraceID} {
 		if decide(s, id, noParent) {
-			t.Errorf("effective ratio 0.0 must sample no roots (trace %s)", id)
+			t.Errorf("effective ratio 0 must sample no roots (trace %s)", id)
 		}
 	}
 }
