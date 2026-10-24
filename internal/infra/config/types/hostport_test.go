@@ -82,18 +82,24 @@ func TestHostPort_ControlCharsAndEmptyHost(t *testing.T) {
 	}
 }
 
-// P2 (plan, pending the Owner): the interim loader accepted a trailing dot and
-// an IPv6 zone. Until the Owner answers, these two cases pin the current
-// behaviour. If the Owner decides otherwise, change these two tests (and only
-// these two) with the implementation.
-func TestHostPort_PendingOwnerP2_TrailingDot(t *testing.T) {
-	if _, err := hp.Parse("localhost.:9187"); err != nil {
-		t.Fatalf("trailing dot rejected (class %s); pending Owner P2: current behaviour accepts it", classOf(err))
-	}
+// SPEC-003 Amendment 1 (P2, AC-4): a trailing dot leaves an empty last label
+// and an IPv6 zone is not a plain IP literal; both are rejected.
+func TestHostPort_TrailingDotRejected(t *testing.T) {
+	requireIs(t, hp, "localhost.:9187", types.ErrSyntax)
+	requireRejected(t, hp, []string{"example.com.:80", "a.b.:1", ".:80", "[::1].:80"},
+		types.ErrSyntax)
 }
 
-func TestHostPort_PendingOwnerP2_IPv6Zone(t *testing.T) {
-	if _, err := hp.Parse("[fe80::1%eth0]:9187"); err != nil {
-		t.Fatalf("IPv6 zone rejected (class %s); pending Owner P2: current behaviour accepts it", classOf(err))
-	}
+func TestHostPort_IPv6ZoneRejected(t *testing.T) {
+	requireIs(t, hp, "[fe80::1%eth0]:9187", types.ErrSyntax)
+	requireRejected(t, hp, []string{"[fe80::1%25eth0]:80", "[::1%lo]:80", "[fe80::1%]:80", "[::1%1]:0"},
+		types.ErrSyntax)
+}
+
+// AC-4 accepted examples after Amendment 1.
+func TestHostPort_AC4Accepted(t *testing.T) {
+	requireAccepted(t, hp, []accept{
+		{"localhost:9187", "localhost:9187"},
+		{"[::1]:9187", "[::1]:9187"},
+	})
 }

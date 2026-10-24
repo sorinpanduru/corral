@@ -36,6 +36,22 @@ func TestList_DoesNotTrimOtherWhitespace(t *testing.T) {
 		types.ErrControlChar)
 }
 
+// AC-4 (Amendment 1): a U+00A0 at the edge of an element is kept, not
+// trimmed (FR-12 trims ASCII space and tab only), so an int list with NBSP
+// around its elements is rejected while the same list with ASCII spaces
+// is accepted.
+func TestList_NBSPAtElementEdgeIsNotTrimmed(t *testing.T) {
+	ints := listOf(types.KindInt)
+	requireAccepted(t, ints, []accept{{"1, 2", []int64{1, 2}}})
+	requireRejected(t, ints, []string{"1,\u00a02", "\u00a01,2", "1\u00a0,2", "1,2\u00a0", "1, \u00a02"},
+		types.ErrSyntax)
+	// For a string list the NBSP stays part of the element.
+	requireAccepted(t, listOf(types.KindString), []accept{
+		{"a,\u00a0b", []string{"a", "\u00a0b"}},
+		{"\u00a0a\u00a0,b", []string{"\u00a0a\u00a0", "b"}},
+	})
+}
+
 func TestList_EmptyListOnlyWithAllowEmpty(t *testing.T) {
 	requireIs(t, listOf(types.KindString), "", types.ErrEmpty)
 	s := types.Spec{Kind: types.KindList, Elem: types.KindString, AllowEmpty: true}
