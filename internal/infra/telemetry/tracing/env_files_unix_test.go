@@ -56,6 +56,7 @@ func mkfifo(tb testing.TB, path string) {
 // /dev/zero or a directory is rejected promptly as a config error naming the
 // variable, with no echo of the path (the marker is part of the path).
 func TestResolve_NonRegularFilesRejectedPromptly(t *testing.T) {
+	certs := envGenCerts(t)
 	for _, v := range envFileVars {
 		t.Run(v, func(t *testing.T) {
 			marker := envMarker(t)
@@ -76,7 +77,7 @@ func TestResolve_NonRegularFilesRejectedPromptly(t *testing.T) {
 				"directory":       dir,
 			} {
 				t.Run(name, func(t *testing.T) {
-					err := envResolveWithin(t, map[string]string{v: path})
+					err := envResolveWithin(t, envMerge(map[string]string{v: path}, envPairExtra(v, certs)))
 					envRequireRejected(t, err, v, marker)
 				})
 			}
@@ -84,7 +85,7 @@ func TestResolve_NonRegularFilesRejectedPromptly(t *testing.T) {
 	}
 }
 
-// FR-27: a regular file above the 1 MiB cap is rejected even if it starts
+// FR-27: a regular file above the 4 MiB cap is rejected even if it starts
 // with a valid PEM block; contents and path are not echoed.
 func TestResolve_OversizedFileRejected(t *testing.T) {
 	certs := envGenCerts(t)
@@ -96,12 +97,12 @@ func TestResolve_OversizedFileRejected(t *testing.T) {
 		t.Run(v, func(t *testing.T) {
 			marker := envMarker(t)
 			p := filepath.Join(t.TempDir(), marker+".big")
-			body := append(append([]byte{}, valid...), bytes.Repeat([]byte(marker+"\n"), (1<<20)/len(marker)+2)...)
-			if len(body) <= 1<<20 {
+			body := append(append([]byte{}, valid...), bytes.Repeat([]byte(marker+"\n"), (4<<20)/len(marker)+2)...)
+			if len(body) <= 4<<20 {
 				t.Fatalf("fixture too small: %d", len(body))
 			}
 			envWrite(t, p, body)
-			err := envResolveWithin(t, map[string]string{v: p})
+			err := envResolveWithin(t, envMerge(map[string]string{v: p}, envPairExtra(v, certs)))
 			envRequireRejected(t, err, v, marker)
 		})
 	}

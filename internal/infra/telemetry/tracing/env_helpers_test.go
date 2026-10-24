@@ -2,9 +2,11 @@ package tracing_test
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
@@ -148,13 +150,32 @@ func envRequireRejected(tb testing.TB, err error, setting, marker string) {
 }
 
 // envCerts holds paths of synthetic, self-signed material generated at test
-// time into t.TempDir(). Nothing is committed; the key is throwaway.
+// time into t.TempDir(). Nothing is committed; keys are throwaway.
 type envCerts struct{ Cert, Key string }
 
-func envGenCerts(tb testing.TB) envCerts {
+// envKeyKind selects the private-key encoding of a generated pair.
+type envKeyKind int
+
+const (
+	keyECPKCS8 envKeyKind = iota
+	keyECSEC1
+	keyRSAPKCS1
+	keyRSAPKCS8
+)
+
+func envGenCerts(tb testing.TB) envCerts { return envGenPair(tb, keyECPKCS8) }
+
+// envGenPair generates a self-signed certificate and its matching key.
+func envGenPair(tb testing.TB, kind envKeyKind) envCerts {
 	tb.Helper()
 	dir := tb.TempDir()
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	var priv crypto.Signer
+	var err error
+	if kind == keyRSAPKCS1 || kind == keyRSAPKCS8 {
+		priv, err = rsa.GenerateKey(rand.Reader, 2048)
+	} else {
+		priv, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	}
 	if err != nil {
 		tb.Fatalf("genkey: %v", err)
 	}
@@ -167,18 +188,68 @@ func envGenCerts(tb testing.TB) envCerts {
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, priv.Public(), priv)
 	if err != nil {
 		tb.Fatalf("cert: %v", err)
 	}
-	kder, err := x509.MarshalPKCS8PrivateKey(priv)
-	if err != nil {
-		tb.Fatalf("marshal key: %v", err)
+	var block *pem.Block
+	switch kind {
+	case keyECSEC1:
+		b, err := x509.MarshalECPrivateKey(priv.(*ecdsa.PrivateKey))
+		if err != nil {
+			tb.Fatalf("marshal key: %v", err)
+		}
+		block = &pem.Block{Type: "EC PRIVATE KEY", Bytes: b}
+	case keyRSAPKCS1:
+		block = &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv.(*rsa.PrivateKey))}
+	default:
+		b, err := x509.MarshalPKCS8PrivateKey(priv)
+		if err != nil {
+			tb.Fatalf("marshal key: %v", err)
+		}
+		block = &pem.Block{Type: "PRIVATE KEY", Bytes: b}
 	}
 	c := envCerts{Cert: filepath.Join(dir, "ca.crt"), Key: filepath.Join(dir, "client.k")}
 	envWrite(tb, c.Cert, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
-	envWrite(tb, c.Key, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: kder}))
+	envWrite(tb, c.Key, pem.EncodeToMemory(block))
 	return c
+}
+
+// envPairExtra returns the valid counterpart (same prefix) of a client
+// certificate or key variable, or nil for any other variable.
+func envPairExtra(v string, c envCerts) map[string]string {
+	switch {
+	case strings.HasSuffix(v, "_CLIENT_CERTIFICATE"):
+		return map[string]string{strings.TrimSuffix(v, "CERTIFICATE") + "KEY": c.Key}
+	case strings.HasSuffix(v, "_CLIENT_KEY"):
+		return map[string]string{strings.TrimSuffix(v, "KEY") + "CERTIFICATE": c.Cert}
+	}
+	return nil
+}
+
+// envMerge returns m plus the entries of extra.
+func envMerge(m, extra map[string]string) map[string]string {
+	for k, v := range extra {
+		m[k] = v
+	}
+	return m
+}
+
+// envRequireRejectedOneOf is envRequireRejected for errors that may
+// legitimately name any of several variables (pairing and mismatch rules).
+func envRequireRejectedOneOf(tb testing.TB, err error, marker string, names ...string) {
+	tb.Helper()
+	var ce *config.Error
+	if !errors.As(err, &ce) {
+		tb.Fatalf("error %v (%T) is not a *config.Error", err, err)
+	}
+	for _, n := range names {
+		if ce.Setting == n {
+			envRequireRejected(tb, err, n, marker)
+			return
+		}
+	}
+	tb.Fatalf("config.Error.Setting = %q, want one of %v", ce.Setting, names)
 }
 
 func envWrite(tb testing.TB, path string, b []byte) {

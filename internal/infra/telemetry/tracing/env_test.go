@@ -11,6 +11,9 @@ package tracing_test
 //	SamplerParentBasedAlwaysOn/SamplerParentBasedAlwaysOff/SamplerParentBasedTraceIDRatio.
 
 import (
+	"encoding/pem"
+	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -118,7 +121,7 @@ func TestResolve_WhenOffOnlySDKDisabledIsRead(t *testing.T) {
 func TestResolve_InvalidIgnoredWhenOff(t *testing.T) {
 	for _, c := range envInvalidCases(t) {
 		t.Run(c.name, func(t *testing.T) {
-			m := map[string]string{c.setting: c.value("whatever")}
+			m := map[string]string{c.setting: c.value(t, "whatever")}
 			for k, v := range c.extra {
 				m[k] = v
 			}
@@ -227,13 +230,155 @@ func TestResolve_QueueMapping(t *testing.T) {
 func TestResolve_BatchLargerThanQueue(t *testing.T) {
 	const batch = "OTEL_BSP_MAX_EXPORT_BATCH_SIZE"
 	for name, m := range map[string]map[string]string{
-		"explicit both":          {"OTEL_BSP_MAX_QUEUE_SIZE": "10", batch: "11"},
-		"batch above default q":  {batch: "4096"},
-		"queue below default b.": {"OTEL_BSP_MAX_QUEUE_SIZE": "100"},
+		"explicit both":                               {"OTEL_BSP_MAX_QUEUE_SIZE": "10", batch: "11"},
+		"batch above default q":                       {batch: "4096"},
+		"explicit batch 512 above explicit queue 100": {"OTEL_BSP_MAX_QUEUE_SIZE": "100", batch: "512"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, _, err := envResolveOn(m)
 			envRequireRejected(t, err, batch, envMarker(t))
+		})
+	}
+}
+
+// FR-37 (D): an unset batch size is min(512, queue), so a small queue alone is accepted.
+func TestResolve_UnsetBatchIsMinOfDefaultAndQueue(t *testing.T) {
+	cfg := envMustResolve(t, map[string]string{"OTEL_BSP_MAX_QUEUE_SIZE": "100"})
+	if cfg.Queue.MaxQueueSize != 100 || cfg.Queue.MaxExportBatchSize != 100 {
+		t.Errorf("Queue = %+v, want queue 100 and batch 100", cfg.Queue)
+	}
+	cfg = envMustResolve(t, map[string]string{"OTEL_BSP_MAX_QUEUE_SIZE": "1000"})
+	if cfg.Queue.MaxExportBatchSize != 512 {
+		t.Errorf("batch = %d, want 512", cfg.Queue.MaxExportBatchSize)
+	}
+}
+
+// FR-20/FR-21 (D): exporter, protocol and sampler values are case-insensitive.
+func TestResolve_CaseInsensitiveEnums(t *testing.T) {
+	cfg := envMustResolve(t, map[string]string{"OTEL_TRACES_EXPORTER": "NONE"})
+	if cfg.Exporter != tracing.ExporterNone {
+		t.Errorf("NONE: Exporter = %v", cfg.Exporter)
+	}
+	if cfg := envMustResolve(t, map[string]string{"OTEL_TRACES_EXPORTER": "OTLP"}); cfg.Exporter != tracing.ExporterOTLP {
+		t.Errorf("OTLP: Exporter = %v", cfg.Exporter)
+	}
+	for _, k := range []string{"OTEL_EXPORTER_OTLP_PROTOCOL", "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"} {
+		if cfg := envMustResolve(t, map[string]string{k: "GRPC"}); cfg.Protocol != tracing.ProtocolGRPC {
+			t.Errorf("%s=GRPC: Protocol = %v", k, cfg.Protocol)
+		}
+		if cfg := envMustResolve(t, map[string]string{k: "HTTP/Protobuf"}); cfg.Protocol != tracing.ProtocolHTTPProtobuf {
+			t.Errorf("%s=HTTP/Protobuf: Protocol = %v", k, cfg.Protocol)
+		}
+	}
+	if cfg := envMustResolve(t, map[string]string{"OTEL_TRACES_SAMPLER": "ALWAYS_ON"}); cfg.Sampler != tracing.SamplerAlwaysOn {
+		t.Errorf("ALWAYS_ON: Sampler = %v", cfg.Sampler)
+	}
+	if cfg := envMustResolve(t, map[string]string{"OTEL_TRACES_SAMPLER": "ParentBased_TraceIDRatio"}); cfg.Sampler != tracing.SamplerParentBasedTraceIDRatio {
+		t.Errorf("ParentBased_TraceIDRatio: Sampler = %v", cfg.Sampler)
+	}
+}
+
+// FR-27 (D): values are TrimSpace'd before the empty check, so empty and
+// whitespace-only mean unset, for every variable.
+func TestResolve_EmptyAndWhitespaceMeanUnset(t *testing.T) {
+	vars := append([]string{"OTEL_SERVICE_NAME", "OTEL_SDK_DISABLED"}, envAllVars...)
+	for _, v := range vars {
+		for _, val := range []string{"", "  ", "\t "} {
+			t.Run(v+"="+fmt.Sprintf("%q", val), func(t *testing.T) {
+				cfg := envMustResolve(t, map[string]string{v: val})
+				if cfg.Queue.MaxQueueSize != 2048 || cfg.Exporter != tracing.ExporterOTLP || cfg.Protocol != tracing.ProtocolHTTPProtobuf {
+					t.Errorf("not treated as unset: %+v", cfg)
+				}
+			})
+		}
+	}
+	// A blank _TRACES_ protocol falls back to the general variable.
+	cfg := envMustResolve(t, map[string]string{"OTEL_EXPORTER_OTLP_PROTOCOL": "grpc", "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "  "})
+	if cfg.Protocol != tracing.ProtocolGRPC {
+		t.Errorf("Protocol = %v, want grpc (blank traces variant is unset)", cfg.Protocol)
+	}
+}
+
+// FR-20 (D): header keys are RFC 7230 tokens after TrimSpace and are never
+// percent-decoded; values are percent-decoded.
+func TestResolve_HeaderKeyRules(t *testing.T) {
+	for _, v := range []string{"OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_TRACES_HEADERS"} {
+		for _, ok := range []string{" k =v", "a%20b=v", "X-Api_Key.1~!#$%&'*+^`|=v", "k=a%20b"} {
+			envMustResolve(t, map[string]string{v: ok})
+		}
+	}
+}
+
+// FR-20 (D): client certificate and key are paired under the same prefix and
+// must form a valid key pair; formats PKCS#1 RSA, SEC1 EC and PKCS#8 work.
+func TestResolve_ClientPairing(t *testing.T) {
+	good := envGenCerts(t)
+	other := envGenCerts(t)
+	for _, p := range []struct{ name, cert, key string }{
+		{"general", "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", "OTEL_EXPORTER_OTLP_CLIENT_KEY"},
+		{"traces", "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE", "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY"},
+	} {
+		t.Run(p.name, func(t *testing.T) {
+			envMustResolve(t, map[string]string{p.cert: good.Cert, p.key: good.Key})
+			for name, m := range map[string]map[string]string{
+				"cert without key": {p.cert: good.Cert},
+				"key without cert": {p.key: good.Key},
+				"mismatched key":   {p.cert: good.Cert, p.key: other.Key},
+			} {
+				t.Run(name, func(t *testing.T) {
+					marker := envMarker(t)
+					_, _, err := envResolveOn(m)
+					envRequireRejectedOneOf(t, err, marker, p.cert, p.key)
+				})
+			}
+		})
+	}
+	t.Run("mixed prefixes", func(t *testing.T) {
+		g, tr := "OTEL_EXPORTER_OTLP_", "OTEL_EXPORTER_OTLP_TRACES_"
+		for name, m := range map[string]map[string]string{
+			"general cert, traces key": {g + "CLIENT_CERTIFICATE": good.Cert, tr + "CLIENT_KEY": good.Key},
+			"traces cert, general key": {tr + "CLIENT_CERTIFICATE": good.Cert, g + "CLIENT_KEY": good.Key},
+		} {
+			t.Run(name, func(t *testing.T) {
+				_, _, err := envResolveOn(m)
+				envRequireRejectedOneOf(t, err, envMarker(t),
+					g+"CLIENT_CERTIFICATE", g+"CLIENT_KEY", tr+"CLIENT_CERTIFICATE", tr+"CLIENT_KEY")
+			})
+		}
+	})
+}
+
+// FR-20 (D): accepted key encodings.
+func TestResolve_KeyEncodingsAccepted(t *testing.T) {
+	for name, kind := range map[string]envKeyKind{
+		"EC PKCS#8": keyECPKCS8, "EC SEC1": keyECSEC1, "RSA PKCS#1": keyRSAPKCS1, "RSA PKCS#8": keyRSAPKCS8,
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := envGenPair(t, kind)
+			envMustResolve(t, map[string]string{
+				"OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE": c.Cert, "OTEL_EXPORTER_OTLP_CLIENT_KEY": c.Key})
+		})
+	}
+}
+
+// FR-20 (D): encrypted private keys are rejected, never echoed.
+func TestResolve_EncryptedKeysRejected(t *testing.T) {
+	c := envGenCerts(t)
+	marker := envMarker(t)
+	dir := t.TempDir()
+	enc8 := filepath.Join(dir, "enc8")
+	envWrite(t, enc8, pem.EncodeToMemory(&pem.Block{Type: "ENCRYPTED PRIVATE KEY", Bytes: []byte(marker + "synthetic")}))
+	legacy := filepath.Join(dir, "legacy")
+	envWrite(t, legacy, pem.EncodeToMemory(&pem.Block{
+		Type:    "EC PRIVATE KEY",
+		Headers: map[string]string{"Proc-Type": "4,ENCRYPTED", "DEK-Info": "AES-128-CBC,00112233445566778899AABBCCDDEEFF"},
+		Bytes:   []byte(marker + "synthetic"),
+	}))
+	for name, path := range map[string]string{"ENCRYPTED PRIVATE KEY": enc8, "legacy Proc-Type": legacy} {
+		t.Run(name, func(t *testing.T) {
+			cert, key := "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", "OTEL_EXPORTER_OTLP_CLIENT_KEY"
+			_, _, err := envResolveOn(map[string]string{cert: c.Cert, key: path})
+			envRequireRejectedOneOf(t, err, marker, cert, key)
 		})
 	}
 }
@@ -368,7 +513,7 @@ func TestResolve_InvalidRejectedNamingVariable(t *testing.T) {
 	for _, c := range envInvalidCases(t) {
 		t.Run(c.name, func(t *testing.T) {
 			marker := envMarker(t)
-			m := map[string]string{c.setting: c.value(marker)}
+			m := map[string]string{c.setting: c.value(t, marker)}
 			for k, v := range c.extra {
 				m[k] = v
 			}
@@ -382,25 +527,11 @@ func TestResolve_InvalidRejectedNamingVariable(t *testing.T) {
 // echo for every variable whose bare marker is invalid, including via the
 // _TRACES_ variants and when the other variant is valid.
 func TestResolve_BareMarkerRejectedEverywhere(t *testing.T) {
-	vars := []string{
-		"OTEL_TRACES_EXPORTER", "OTEL_TRACES_SAMPLER", "OTEL_TRACES_SAMPLER_ARG",
-		"OTEL_EXPORTER_OTLP_PROTOCOL", "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
-		"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-		"OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
-		"OTEL_EXPORTER_OTLP_TIMEOUT", "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
-		"OTEL_EXPORTER_OTLP_COMPRESSION", "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION",
-		"OTEL_EXPORTER_OTLP_INSECURE", "OTEL_EXPORTER_OTLP_TRACES_INSECURE",
-		"OTEL_EXPORTER_OTLP_CERTIFICATE", "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
-		"OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
-		"OTEL_EXPORTER_OTLP_CLIENT_KEY", "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
-		"OTEL_RESOURCE_ATTRIBUTES",
-		"OTEL_BSP_MAX_QUEUE_SIZE", "OTEL_BSP_MAX_EXPORT_BATCH_SIZE",
-		"OTEL_BSP_SCHEDULE_DELAY", "OTEL_BSP_EXPORT_TIMEOUT",
-	}
+	vars := envAllVars
 	for _, v := range vars {
 		t.Run(v, func(t *testing.T) {
 			marker := envMarker(t)
-			_, _, err := envResolveOn(map[string]string{v: marker})
+			_, _, err := envResolveOn(envMerge(map[string]string{v: marker}, envPairExtra(v, envGenCerts(t))))
 			envRequireRejected(t, err, v, marker)
 		})
 	}
@@ -428,4 +559,22 @@ func TestResolve_GeneralVariantValidatedWhenTracesVariantValid(t *testing.T) {
 			envRequireRejected(t, err, p.trc, envMarker(t))
 		})
 	}
+}
+
+// envAllVars lists every honoured or validated variable (except
+// OTEL_SDK_DISABLED and OTEL_SERVICE_NAME, which cannot be invalid).
+var envAllVars = []string{
+	"OTEL_TRACES_EXPORTER", "OTEL_TRACES_SAMPLER", "OTEL_TRACES_SAMPLER_ARG",
+	"OTEL_EXPORTER_OTLP_PROTOCOL", "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+	"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+	"OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+	"OTEL_EXPORTER_OTLP_TIMEOUT", "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+	"OTEL_EXPORTER_OTLP_COMPRESSION", "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION",
+	"OTEL_EXPORTER_OTLP_INSECURE", "OTEL_EXPORTER_OTLP_TRACES_INSECURE",
+	"OTEL_EXPORTER_OTLP_CERTIFICATE", "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+	"OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+	"OTEL_EXPORTER_OTLP_CLIENT_KEY", "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+	"OTEL_RESOURCE_ATTRIBUTES",
+	"OTEL_BSP_MAX_QUEUE_SIZE", "OTEL_BSP_MAX_EXPORT_BATCH_SIZE",
+	"OTEL_BSP_SCHEDULE_DELAY", "OTEL_BSP_EXPORT_TIMEOUT",
 }

@@ -13,13 +13,15 @@ func lookupOS(k string) (string, bool) { return os.LookupEnv(k) }
 type envInvalidCase struct {
 	name    string
 	setting string
-	value   func(marker string) string
+	value   func(tb testing.TB, marker string) string
 	extra   map[string]string // other variables needed to make the case meaningful
 }
 
-func fixed(s string) func(string) string { return func(string) string { return s } }
-func withMarker(pre, post string) func(string) string {
-	return func(m string) string { return pre + m + post }
+func fixed(s string) func(testing.TB, string) string {
+	return func(testing.TB, string) string { return s }
+}
+func withMarker(pre, post string) func(testing.TB, string) string {
+	return func(_ testing.TB, m string) string { return pre + m + post }
 }
 
 // both lists a variable and its _TRACES_ variant.
@@ -34,8 +36,9 @@ func envInvalidCases(tb testing.TB) []envInvalidCase {
 	dir := tb.TempDir()
 	nonPEM := filepath.Join(dir, "not-pem.txt")
 	empty := filepath.Join(dir, "empty.txt")
+	certs := envGenCerts(tb)
 	var cases []envInvalidCase
-	add := func(name, setting string, v func(string) string, extra ...map[string]string) {
+	add := func(name, setting string, v func(testing.TB, string) string, extra ...map[string]string) {
 		c := envInvalidCase{name: name + " [" + setting + "]", setting: setting, value: v}
 		if len(extra) > 0 {
 			c.extra = extra[0]
@@ -93,7 +96,12 @@ func envInvalidCases(tb testing.TB) []envInvalidCase {
 		add("headers truncated percent value", v, withMarker("k=", "%4"))
 		add("headers bad percent in second", v, withMarker("a=b,Authorization=", "%g1"))
 		add("headers entry without equals second", v, withMarker("a=b,", ""))
-		add("headers bad percent key", v, withMarker("%zz", "=v"))
+		// Keys are RFC 7230 tokens, never percent-decoded.
+		add("headers key with space", v, withMarker("bad key", "=v"))
+		add("headers key with space before marker value", v, withMarker("bad key=", ""))
+		add("headers key with paren", v, withMarker("k(", "=v"))
+		add("headers key non-ASCII", v, withMarker("ключ", "=v"))
+		add("headers key non-ASCII marker value", v, withMarker("ключ=", ""))
 	}
 
 	// Timeout (D8): non-negative integer ms.
@@ -109,6 +117,8 @@ func envInvalidCases(tb testing.TB) []envInvalidCase {
 	for _, v := range both("COMPRESSION", "COMPRESSION") {
 		add("compression zstd", v, fixed("zstd"))
 		add("compression deflate marker", v, withMarker("deflate-", ""))
+		add("compression GZIP is case-sensitive", v, fixed("GZIP"))
+		add("compression None is case-sensitive", v, fixed("None"))
 	}
 	// Insecure true|false.
 	for _, v := range both("INSECURE", "INSECURE") {
@@ -123,17 +133,25 @@ func envInvalidCases(tb testing.TB) []envInvalidCase {
 	for _, base := range []string{"CERTIFICATE", "CLIENT_CERTIFICATE", "CLIENT_KEY"} {
 		for _, v := range both(base, base) {
 			v := v
-			add("file non-PEM content", v, func(m string) string {
-				_ = os.WriteFile(nonPEM, []byte("this is not PEM "+m+"\n"), 0o600)
+			ex := envPairExtra(v, certs) // valid counterpart so the offender is unambiguous
+			add("file non-PEM content", v, func(tb testing.TB, m string) string {
+				envWrite(tb, nonPEM, []byte("this is not PEM "+m+"\n"))
 				return nonPEM
-			})
-			add("file empty", v, func(string) string {
-				_ = os.WriteFile(empty, nil, 0o600)
+			}, ex)
+			add("file empty", v, func(tb testing.TB, _ string) string {
+				envWrite(tb, empty, nil)
 				return empty
-			})
-			add("file missing, marker in path", v, func(m string) string { return filepath.Join(dir, m, "absent.pem") })
-			add("file is directory", v, func(string) string { return dir })
+			}, ex)
+			add("file missing, marker in path", v, func(_ testing.TB, m string) string { return filepath.Join(dir, m, "absent.pem") }, ex)
+			add("file is directory", v, func(testing.TB, string) string { return dir }, ex)
 		}
+	}
+	// Key/cert type confusion (cert-only and key-only PEM files).
+	for _, v := range both("CERTIFICATE", "CERTIFICATE") {
+		add("CERTIFICATE points at key-only PEM", v, fixed(certs.Key))
+	}
+	for _, v := range both("CLIENT_KEY", "CLIENT_KEY") {
+		add("CLIENT_KEY points at cert-only PEM", v, fixed(certs.Cert), envPairExtra(v, certs))
 	}
 
 	// Resource attributes (D8): comma-separated key=value, valid percent-encoding.
@@ -192,11 +210,12 @@ func envValidCases(c envCerts) []envValidCase {
 	for _, v := range both("CERTIFICATE", "CERTIFICATE") {
 		add(v, c.Cert)
 	}
+	// Client cert and key are valid only as a pair under the same prefix.
 	for _, v := range both("CLIENT_CERTIFICATE", "CLIENT_CERTIFICATE") {
-		add(v, c.Cert)
+		out = append(out, envValidCase{label: "pair", setting: v, value: c.Cert, extra: envPairExtra(v, c)})
 	}
 	for _, v := range both("CLIENT_KEY", "CLIENT_KEY") {
-		add(v, c.Key)
+		out = append(out, envValidCase{label: "pair", setting: v, value: c.Key, extra: envPairExtra(v, c)})
 	}
 	for _, e := range []string{"service.version=1.2.3", "a=b,c=d", "k=v%20w"} {
 		add("OTEL_RESOURCE_ATTRIBUTES", e)
@@ -210,6 +229,7 @@ func envValidCases(c envCerts) []envValidCase {
 		}
 	}
 	add("OTEL_BSP_MAX_QUEUE_SIZE", "4096")
+	add("OTEL_BSP_MAX_QUEUE_SIZE", "100") // effective batch becomes min(512, queue)
 	add("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "256")
 	add("OTEL_TRACES_SAMPLER_ARG", "0.0")
 	add("OTEL_TRACES_SAMPLER_ARG", "1.0")
