@@ -176,11 +176,12 @@ then `OTEL_*` errors.
 |---|---|
 | `0` | graceful shutdown, `--help`, `--version`, or a successful `--check-config` |
 | `2` | configuration error (including misuse of control flags) |
-| `1` | any other startup or runtime failure, including failure to bind the admin listener |
+| `1` | any other startup or runtime failure, including failure to bind the admin listener (record `admin listener bind failed`, `component=config`, `setting=admin.listen`; it is not an `invalid configuration` record) |
 
 The Go runtime also exits with code 2 on an unrecovered panic or fatal runtime
 error. Exit code 2 therefore does not by itself mean a configuration error:
-look for `invalid configuration` records.
+look for `invalid configuration` records. A failed admin bind is not a
+configuration error: it exits 1 with an `admin listener bind failed` record.
 
 ## Control flags
 

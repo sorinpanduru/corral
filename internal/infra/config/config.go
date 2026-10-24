@@ -66,11 +66,15 @@ func LogError(l *slog.Logger, err error) {
 	if err == nil {
 		return
 	}
+	l.LogAttrs(context.Background(), slog.LevelError, logMsg, errorAttrs(err)...)
+}
+
+// errorAttrs returns the setting and errclass attributes of err; never values.
+func errorAttrs(err error) []slog.Attr {
 	var attrs []slog.Attr
 	var ce errclass.ConfigError
 	if errors.As(err, &ce) {
 		attrs = append(attrs, slog.String(attr.Setting, ce.ConfigSetting()))
 	}
-	attrs = append(attrs, errclass.LogAttrs(err)...)
-	l.LogAttrs(context.Background(), slog.LevelError, logMsg, attrs...)
+	return append(attrs, errclass.LogAttrs(err)...)
 }

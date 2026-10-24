@@ -116,8 +116,9 @@ other settings.
   `0`, `127.1` and `0x0`, which resolvers may read as unexpected addresses.
   Hostnames with whitespace or underscores are rejected.
 - If the address cannot be bound at startup, startup fails with a non-zero
-  exit. The error record has `component=config` and `setting=admin.listen`, and
-  does not contain the address.
+  exit 1. The error record has the message `admin listener bind failed`,
+  `component=config` and `setting=admin.listen`, and does not contain the
+  address.
 
 ## Admin endpoints
 

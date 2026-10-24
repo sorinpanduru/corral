@@ -227,7 +227,7 @@ func Run(ctx context.Context, in Inputs, hooks Hooks) int {
 	if err := admin.Listen(); err != nil {
 		// The error is a config.Error: constant text, the net error only as
 		// the hidden cause for errclass detail (never the address).
-		config.LogError(cfgLog, err)
+		config.LogAdminBindFailed(cfgLog, err)
 		return exitFailure
 	}
 	serveErr := make(chan error, 1)
