@@ -1,0 +1,395 @@
+package errclass_test
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/url"
+	"os"
+	"sort"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/sorinpanduru/corral/internal/infra/telemetry/errclass"
+)
+
+func strs[T ~string](in []T) []string {
+	out := make([]string, len(in))
+	for i, v := range in {
+		out[i] = string(v)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func equalSets(a, b []string) bool {
+	sort.Strings(a)
+	sort.Strings(b)
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// FR-29: the class enum is exactly the six values.
+func TestClassesEnum_FR29(t *testing.T) {
+	want := []string{"timeout", "network", "protocol", "server", "config", "internal"}
+	if got := strs(errclass.Classes()); !equalSets(got, want) {
+		t.Fatalf("Classes() = %v, want %v", got, want)
+	}
+}
+
+// FR-29: the detail enum is exactly the 14 values.
+func TestDetailsEnum_FR29(t *testing.T) {
+	want := []string{
+		"ECONNREFUSED", "ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "EPIPE",
+		"EHOSTUNREACH", "ENETUNREACH", "EADDRINUSE", "deadline_exceeded",
+		"canceled", "eof", "tls_handshake", "dns_resolution", "other",
+	}
+	if got := strs(errclass.Details()); !equalSets(got, want) {
+		t.Fatalf("Details() = %v, want %v", got, want)
+	}
+}
+
+type classCase struct {
+	name   string
+	err    error
+	class  string
+	detail string
+}
+
+func inEnums(t *testing.T, err error) (string, string) {
+	t.Helper()
+	c, d := errclass.Classify(err)
+	foundC, foundD := false, false
+	for _, x := range errclass.Classes() {
+		foundC = foundC || x == c
+	}
+	for _, x := range errclass.Details() {
+		foundD = foundD || x == d
+	}
+	if !foundC || !foundD {
+		t.Fatalf("Classify returned values outside the enums: %q %q", c, d)
+	}
+	return string(c), string(d)
+}
+
+func runCases(t *testing.T, cases []classCase) {
+	t.Helper()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, d := inEnums(t, tc.err)
+			if c != tc.class || d != tc.detail {
+				t.Fatalf("Classify = (%s, %s), want (%s, %s)", c, d, tc.class, tc.detail)
+			}
+			// Wrapping in the chain must not change the result.
+			wrapped := fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", tc.err))
+			c2, d2 := inEnums(t, wrapped)
+			if c2 != tc.class || d2 != tc.detail {
+				t.Fatalf("wrapped Classify = (%s, %s), want (%s, %s)", c2, d2, tc.class, tc.detail)
+			}
+		})
+	}
+}
+
+// AC-35 / FR-29 / D3: errno table, each wrapped like a real net error.
+func TestClassify_ErrnoTable_AC35(t *testing.T) {
+	op := func(e error) error {
+		return &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", e)}
+	}
+	runCases(t, []classCase{
+		{"ECONNREFUSED", op(syscall.ECONNREFUSED), "network", "ECONNREFUSED"},
+		{"ECONNRESET", op(syscall.ECONNRESET), "network", "ECONNRESET"},
+		{"ECONNABORTED", op(syscall.ECONNABORTED), "network", "ECONNABORTED"},
+		{"EPIPE", op(syscall.EPIPE), "network", "EPIPE"},
+		{"EHOSTUNREACH", op(syscall.EHOSTUNREACH), "network", "EHOSTUNREACH"},
+		{"ENETUNREACH", op(syscall.ENETUNREACH), "network", "ENETUNREACH"},
+		{"ETIMEDOUT", op(syscall.ETIMEDOUT), "timeout", "ETIMEDOUT"},
+	})
+}
+
+// AC-35: context, EOF, tls and dns sentinels.
+func TestClassify_Sentinels_AC35(t *testing.T) {
+	runCases(t, []classCase{
+		{"deadline", context.DeadlineExceeded, "timeout", "deadline_exceeded"},
+		{"os deadline", os.ErrDeadlineExceeded, "timeout", "deadline_exceeded"},
+		{"canceled", context.Canceled, "internal", "canceled"},
+		{"eof", io.EOF, "network", "eof"},
+		{"unexpected eof", io.ErrUnexpectedEOF, "network", "eof"},
+		{"dns not found", &net.DNSError{Err: "no such host", Name: "x.invalid", IsNotFound: true}, "network", "dns_resolution"},
+		{"tls record header", tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}, "network", "tls_handshake"},
+		{"tls cert verify", &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}, "network", "tls_handshake"},
+		{"x509 hostname", x509.HostnameError{Host: "x.invalid"}, "network", "tls_handshake"},
+		{"unmapped", errors.New("something odd"), "internal", "other"},
+	})
+}
+
+// FR-29 / D3: a net.Error timeout with no errno or sentinel is class timeout;
+// the detail must be one of the two timeout details.
+func TestClassify_NetErrorTimeout(t *testing.T) {
+	c, d := inEnums(t, fmt.Errorf("wrap: %w", timeoutErr{msg: "synthetic timeout"}))
+	if c != "timeout" || (d != "ETIMEDOUT" && d != "deadline_exceeded") {
+		t.Fatalf("Classify = (%s, %s)", c, d)
+	}
+}
+
+// D3: config errors (including the admin bind failure) are class config; the
+// detail still comes from the wrapped cause.
+func TestClassify_Config_D3(t *testing.T) {
+	bind := &fakeConfigErr{setting: "admin.listen", cause: &net.OpError{Op: "listen", Net: "tcp", Err: os.NewSyscallError("bind", syscall.EADDRINUSE)}}
+	plain := &fakeConfigErr{setting: "log.level", cause: errors.New("bad value")}
+	runCases(t, []classCase{
+		{"admin bind", bind, "config", "EADDRINUSE"},
+		{"plain config", plain, "config", "other"},
+	})
+}
+
+// D3 / AC-35: a MongoDB server reply is class server, detail other.
+func TestClassify_Server_AC35(t *testing.T) {
+	m := newMarker(t)
+	runCases(t, []classCase{
+		{"server", &fakeServerErr{code: 11000, name: "DuplicateKey", msg: "E11000 dup key: " + m}, "server", "other"},
+	})
+}
+
+// D3: a recovered panic is internal/other, whatever the panic value was.
+func TestClassify_Panic_D3(t *testing.T) {
+	m := newMarker(t)
+	runCases(t, []classCase{
+		{"string value", errclass.FromPanic(m, nil), "internal", "other"},
+		{"error value is not classified by its content", errclass.FromPanic(syscall.ECONNREFUSED, nil), "internal", "other"},
+		{"with stack", errclass.FromPanic(m, []byte("goroutine 1 [running]:\nsynthetic")), "internal", "other"},
+	})
+}
+
+// AC-35: exporter-style *url.Error whose text carries a userinfo marker.
+func TestClassify_URLError_AC35(t *testing.T) {
+	m := newMarker(t)
+	u := "http://user:" + m + "@collector.invalid:4318/v1/traces"
+	runCases(t, []classCase{
+		{"refused", &url.Error{Op: "Post", URL: u, Err: &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}}, "network", "ECONNREFUSED"},
+		{"opaque", &url.Error{Op: "Post", URL: u, Err: errors.New("opaque failure")}, "internal", "other"},
+		{"deadline", &url.Error{Op: "Post", URL: u, Err: context.DeadlineExceeded}, "timeout", "deadline_exceeded"},
+	})
+}
+
+// Real loopback: refused dial (AC-35 ECONNREFUSED).
+func TestClassify_RealRefusedDial_AC35(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	_, err = net.DialTimeout("tcp", addr, 2*time.Second)
+	if err == nil {
+		t.Skip("port unexpectedly reopened")
+	}
+	c, d := inEnums(t, err)
+	if c != "network" || d != "ECONNREFUSED" {
+		t.Fatalf("Classify = (%s, %s)", c, d)
+	}
+}
+
+// Real loopback: peer reset (AC-35 ECONNRESET).
+func TestClassify_RealReset_AC35(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		_ = c.(*net.TCPConn).SetLinger(0) // close sends RST
+		c.Close()
+	}()
+	conn, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, err = conn.Read(make([]byte, 1))
+	if !errors.Is(err, syscall.ECONNRESET) {
+		t.Skipf("platform did not surface ECONNRESET (%v)", err)
+	}
+	c, d := inEnums(t, err)
+	if c != "network" || d != "ECONNRESET" {
+		t.Fatalf("Classify = (%s, %s)", c, d)
+	}
+}
+
+// Real loopback: write to a closed connection (AC-35 EPIPE).
+func TestClassify_RealBrokenPipe_AC35(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		c.Close()
+	}()
+	conn, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	var werr error
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && werr == nil {
+		_, werr = conn.Write([]byte("synthetic"))
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !errors.Is(werr, syscall.EPIPE) {
+		t.Skipf("platform did not surface EPIPE (%v)", werr)
+	}
+	c, d := inEnums(t, werr)
+	if c != "network" || d != "EPIPE" {
+		t.Fatalf("Classify = (%s, %s)", c, d)
+	}
+}
+
+// Real loopback: TLS client against a plaintext server (AC-35 tls_handshake).
+func TestClassify_RealTLSHandshakeFailure_AC35(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_, _ = c.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\nplaintext\r\n"))
+		time.Sleep(200 * time.Millisecond)
+	}()
+	raw, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	_ = raw.SetDeadline(time.Now().Add(3 * time.Second))
+	err = tls.Client(raw, &tls.Config{ServerName: "x.invalid", MinVersion: tls.VersionTLS12}).Handshake()
+	if err == nil {
+		t.Fatal("handshake unexpectedly succeeded")
+	}
+	c, d := inEnums(t, err)
+	if c != "network" || d != "tls_handshake" {
+		t.Fatalf("Classify = (%s, %s)", c, d)
+	}
+}
+
+// Real resolver failure with a stub dialer, reserved .invalid name (AC-35).
+func TestClassify_RealDNSFailure_AC35(t *testing.T) {
+	r := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return nil, errors.New("stub resolver: no upstream")
+		},
+	}
+	_, err := r.LookupHost(context.Background(), "corral-test.invalid")
+	if err == nil {
+		t.Fatal("lookup unexpectedly succeeded")
+	}
+	var de *net.DNSError
+	if !errors.As(err, &de) {
+		t.Skipf("lookup did not return *net.DNSError: %v", err)
+	}
+	c, d := inEnums(t, err)
+	if c != "network" || d != "dns_resolution" {
+		t.Fatalf("Classify = (%s, %s)", c, d)
+	}
+}
+
+// Real loopback: double listen (AC-35 EADDRINUSE). Raw bind error keeps the
+// EADDRINUSE detail; the class is only fixed (config) once wrapped (D3).
+func TestClassify_RealAddrInUse_AC35(t *testing.T) {
+	l1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l1.Close()
+	_, err = net.Listen("tcp", l1.Addr().String())
+	if err == nil {
+		t.Fatal("second listen unexpectedly succeeded")
+	}
+	if _, d := inEnums(t, err); d != "EADDRINUSE" {
+		t.Fatalf("detail = %s, want EADDRINUSE", d)
+	}
+	cfg := &fakeConfigErr{setting: "admin.listen", cause: err}
+	if c, d := inEnums(t, cfg); c != "config" || d != "EADDRINUSE" {
+		t.Fatalf("config-wrapped Classify = (%s, %s)", c, d)
+	}
+}
+
+// Real context errors surfaced through net (AC-35 canceled, deadline_exceeded).
+func TestClassify_RealContextDial_AC35(t *testing.T) {
+	var d net.Dialer
+	cctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := d.DialContext(cctx, "tcp", "127.0.0.1:1")
+	if err == nil {
+		t.Fatal("dial with canceled context succeeded")
+	}
+	if c, det := inEnums(t, err); c != "internal" || det != "canceled" {
+		t.Fatalf("canceled: (%s, %s)", c, det)
+	}
+
+	dctx, cancel2 := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel2()
+	_, err = d.DialContext(dctx, "tcp", "127.0.0.1:1")
+	if err == nil {
+		t.Fatal("dial with expired context succeeded")
+	}
+	if c, det := inEnums(t, err); c != "timeout" || det != "deadline_exceeded" {
+		t.Fatalf("deadline: (%s, %s)", c, det)
+	}
+}
+
+// Real conn deadline (os.ErrDeadlineExceeded through net.OpError).
+func TestClassify_RealConnDeadline(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		c, err := l.Accept()
+		if err == nil {
+			defer c.Close()
+			time.Sleep(500 * time.Millisecond)
+		}
+	}()
+	conn, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+	_, err = conn.Read(make([]byte, 1))
+	if err == nil {
+		t.Fatal("read unexpectedly succeeded")
+	}
+	if c, d := inEnums(t, err); c != "timeout" || d != "deadline_exceeded" {
+		t.Fatalf("Classify = (%s, %s)", c, d)
+	}
+}
