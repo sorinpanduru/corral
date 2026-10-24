@@ -1,2 +1,10 @@
 # Hidden acceptance scenarios: kept out of the code repo (see CLAUDE.md)
 /scenarios/
+
+# Build output
+/bin/
+
+# Coverage
+*.out
+coverage.*
+*.coverprofile
