@@ -8,6 +8,8 @@ import (
 	"syscall"
 
 	"github.com/sorinpanduru/corral/internal/app/runtime"
+	// Must be linked: silences slog output of dependency initialisers (ADR-0008).
+	_ "github.com/sorinpanduru/corral/internal/infra/telemetry/earlyslog"
 )
 
 func main() {

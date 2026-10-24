@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/sorinpanduru/corral/internal/infra/telemetry/earlyslog"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logging"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/ratelimit"
 )
@@ -122,6 +123,23 @@ func (w *stdLogWriter) Write(p []byte) (int, error) {
 func Install(f *logging.Factory, level slog.Leveler, now func() time.Time) {
 	installOTel(f, now)
 	installGRPC(f, level, now)
-	slog.SetDefault(slog.New(NewSlogDefaultHandler(f, level, now)))
+	dh := NewSlogDefaultHandler(f, level, now)
+	slog.SetDefault(slog.New(dh))
+	replayEarly(dh, earlyslog.Drain())
 	log.SetOutput(NewStdLogWriter(f, level, now))
+}
+
+// replayEarly reports records that third-party package initialisers logged
+// before Install (see package earlyslog). Only the per-level occurrence is
+// replayed, once per level, through the rate-limited fixed-message handler.
+func replayEarly(h slog.Handler, c earlyslog.Counts) {
+	ctx := context.Background()
+	for _, e := range []struct {
+		n   uint64
+		lvl slog.Level
+	}{{c.Debug, slog.LevelDebug}, {c.Info, slog.LevelInfo}, {c.Warn, slog.LevelWarn}, {c.Error, slog.LevelError}} {
+		if e.n > 0 {
+			_ = h.Handle(ctx, slog.NewRecord(time.Time{}, e.lvl, "", 0))
+		}
+	}
 }
