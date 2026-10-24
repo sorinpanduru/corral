@@ -67,6 +67,10 @@ func TestAC3_UnreachableCollectorLogsOnlyRateLimitedFixedWarnings(t *testing.T) 
 				t.Errorf("first warning suppressed_count = %d, want 0", got)
 			}
 
+			if got := first[0].str("error"); got == string(errclass.ClassProtocol) {
+				t.Errorf("transport failure classified as %q, want non-protocol", got)
+			}
+
 			h.clk.Advance(rateWindow)
 			failFlushes(h, 1)
 			rs := assertOtelWarnings(t, h, 2)

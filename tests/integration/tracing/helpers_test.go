@@ -179,7 +179,12 @@ func boot(t *testing.T, o opts) *harness {
 		hd = logging.WithTraceCorrelation(hd)
 	}
 	factory := logging.NewFactory(hd)
-	// Same wiring as logbridge.Install, minus grpclog.SetLoggerV2 (see main_test.go).
+	// PINNED COPY of logbridge.Install (internal/infra/telemetry/logbridge/
+	// thirdparty.go): otel error handler, otel logger, grpclog, slog.Default,
+	// std log writer, in that order. The only difference is that grpclog goes
+	// through the delegate (see main_test.go). If Install gains a step, this
+	// copy must follow; TestHarnessInstallsEveryBridge checks every observable
+	// global is wired.
 	otel.SetErrorHandler(logbridge.NewOTelErrorHandler(factory, h.clk.Now))
 	otel.SetLogger(logr.New(logbridge.NewOTelLogSink(factory, h.clk.Now)))
 	grpcLog.set(logbridge.NewGRPCLogger(factory, lv, h.clk.Now))
