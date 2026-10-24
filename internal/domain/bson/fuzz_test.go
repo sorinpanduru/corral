@@ -46,3 +46,23 @@ func FuzzWalker(f *testing.F) {
 		sameVerdict(t, "fuzz", want, got)
 	})
 }
+
+// FuzzWalkerCaptures checks, for every valid input, that Walker captures
+// agree with Lookup on presence and scalar values (first-wins at every level),
+// not just on validity. The seed corpus covers duplicate intermediate keys.
+func FuzzWalkerCaptures(f *testing.F) {
+	seedCorpus(f)
+	f.Add(doc(eDoc("a", doc(eInt32("b", 1))), eDoc("a", doc(eInt32("c", 2)))), uint16(7))
+	f.Add(doc(eInt32("a", 1), eDoc("a", doc(eInt32("b", 2)))), uint16(3))
+	f.Add(doc(eDoc("a", doc(eInt32("b", 2))), eInt32("a", 1)), uint16(5))
+	f.Add(doc(eArray("a", eInt32("0", 1)), eDoc("a", doc(eInt32("0", 9)))), uint16(2))
+	f.Fuzz(func(t *testing.T, data []byte, split uint16) {
+		if bson.Validate(data) != nil {
+			return
+		}
+		chunk := 1 + int(split)%(len(data)+1)
+		for _, p := range allPaths() {
+			agree(t, data, p, chunk)
+		}
+	})
+}
