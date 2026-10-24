@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -18,16 +19,86 @@ func NewRegistry() *prometheus.Registry {
 	return reg
 }
 
-// Factory creates metrics from catalog entries only. Exemplars are never
-// attached (FR-11): the factory never calls the exemplar APIs.
+// Counter is a catalog-created counter. It deliberately exposes only Inc and
+// Add (plus Collector, so tests can read it), so it cannot attach exemplars
+// (FR-11): it does not implement prometheus.ExemplarAdder.
+type Counter struct{ c prometheus.Counter }
+
+// Inc adds 1.
+func (c *Counter) Inc() { c.c.Inc() }
+
+// Add adds v (must be >= 0).
+func (c *Counter) Add(v float64) { c.c.Add(v) }
+
+// Describe implements prometheus.Collector.
+func (c *Counter) Describe(ch chan<- *prometheus.Desc) { c.c.Describe(ch) }
+
+// Collect implements prometheus.Collector.
+func (c *Counter) Collect(ch chan<- prometheus.Metric) { c.c.Collect(ch) }
+
+// Gauge is a catalog-created gauge exposing only Set, Inc, Dec, Add and Sub.
+type Gauge struct{ g prometheus.Gauge }
+
+// Set sets the value.
+func (g *Gauge) Set(v float64) { g.g.Set(v) }
+
+// Inc adds 1.
+func (g *Gauge) Inc() { g.g.Inc() }
+
+// Dec subtracts 1.
+func (g *Gauge) Dec() { g.g.Dec() }
+
+// Add adds v.
+func (g *Gauge) Add(v float64) { g.g.Add(v) }
+
+// Sub subtracts v.
+func (g *Gauge) Sub(v float64) { g.g.Sub(v) }
+
+// Describe implements prometheus.Collector.
+func (g *Gauge) Describe(ch chan<- *prometheus.Desc) { g.g.Describe(ch) }
+
+// Collect implements prometheus.Collector.
+func (g *Gauge) Collect(ch chan<- prometheus.Metric) { g.g.Collect(ch) }
+
+// Histogram is a catalog-created histogram exposing only Observe. It does not
+// implement prometheus.ExemplarObserver.
+type Histogram struct{ o prometheus.Observer }
+
+// Observe records v.
+func (h *Histogram) Observe(v float64) { h.o.Observe(v) }
+
+// Factory creates metrics from catalog entries only. It works on a private
+// deep copy of the catalog. Exemplars are unreachable (FR-11): handed-out
+// values are thin wrappers that do not expose the exemplar APIs.
 type Factory struct {
 	reg  prometheus.Registerer
 	defs map[string]MetricDef
 	list []MetricDef
+
+	mu    sync.Mutex
+	cache map[string]prometheus.Collector // collectors this factory created, by name
+}
+
+func copyCatalog(c *Catalog) *Catalog {
+	out := &Catalog{Metrics: make([]MetricDef, len(c.Metrics))}
+	for i, m := range c.Metrics {
+		m.Buckets = slices.Clone(m.Buckets)
+		if m.Labels != nil {
+			labels := make([]LabelDef, len(m.Labels))
+			for j, l := range m.Labels {
+				l.Values = slices.Clone(l.Values)
+				labels[j] = l
+			}
+			m.Labels = labels
+		}
+		out.Metrics[i] = m
+	}
+	return out
 }
 
 // NewFactory binds a catalog to a registerer. It refuses a nil catalog or
-// registerer and a catalog that fails Lint.
+// registerer and a catalog that fails Lint, and keeps a deep copy of the
+// catalog so later caller mutation has no effect.
 func NewFactory(reg prometheus.Registerer, c *Catalog) (*Factory, error) {
 	if c == nil {
 		return nil, errors.New("metrics: nil catalog")
@@ -35,11 +106,12 @@ func NewFactory(reg prometheus.Registerer, c *Catalog) (*Factory, error) {
 	if reg == nil {
 		return nil, errors.New("metrics: nil registerer")
 	}
-	if ps := Lint(c); len(ps) > 0 {
+	cc := copyCatalog(c)
+	if ps := Lint(cc); len(ps) > 0 {
 		return nil, fmt.Errorf("metrics: catalog fails lint with %d problem(s), first: %s", len(ps), ps[0])
 	}
-	f := &Factory{reg: reg, defs: make(map[string]MetricDef, len(c.Metrics))}
-	for _, m := range c.Metrics {
+	f := &Factory{reg: reg, defs: make(map[string]MetricDef, len(cc.Metrics)), cache: map[string]prometheus.Collector{}}
+	for _, m := range cc.Metrics {
 		f.defs[m.Name] = m
 		f.list = append(f.list, m)
 	}
@@ -78,46 +150,69 @@ func buckets(m MetricDef) []float64 {
 	return m.Buckets
 }
 
-// register registers c, or returns the already registered equal collector.
-func register[T prometheus.Collector](f *Factory, c T) (T, error) {
-	if err := f.reg.Register(c); err != nil {
-		var are prometheus.AlreadyRegisteredError
-		if errors.As(err, &are) {
-			if ex, ok := are.ExistingCollector.(T); ok {
-				return ex, nil
-			}
+// obtain returns the collector the factory already created for name, or
+// builds, registers and caches a new one. A registration clash with a
+// collector the factory did not create is an error.
+func obtain[T prometheus.Collector](f *Factory, name string, build func() T) (T, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if ex, ok := f.cache[name]; ok {
+		if t, ok := ex.(T); ok {
+			return t, nil
 		}
-		var zero T
-		return zero, fmt.Errorf("metrics: register: %w", err)
 	}
+	c := build()
+	if err := f.reg.Register(c); err != nil {
+		var zero T
+		return zero, fmt.Errorf("metrics: register %q: %w", name, err)
+	}
+	f.cache[name] = c
 	return c, nil
 }
 
-// Counter creates a label-less counter from the catalog.
-func (f *Factory) Counter(name string) (prometheus.Counter, error) {
+// Counter creates (or returns the cached) label-less counter from the catalog.
+func (f *Factory) Counter(name string) (*Counter, error) {
 	m, err := f.lookup(name, TypeCounter, false)
 	if err != nil {
 		return nil, err
 	}
-	return register(f, prometheus.NewCounter(prometheus.CounterOpts{Name: m.Name, Help: m.Help}))
+	c, err := obtain(f, name, func() prometheus.Counter {
+		return prometheus.NewCounter(prometheus.CounterOpts{Name: m.Name, Help: m.Help})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Counter{c}, nil
 }
 
-// Gauge creates a label-less gauge from the catalog.
-func (f *Factory) Gauge(name string) (prometheus.Gauge, error) {
+// Gauge creates (or returns the cached) label-less gauge from the catalog.
+func (f *Factory) Gauge(name string) (*Gauge, error) {
 	m, err := f.lookup(name, TypeGauge, false)
 	if err != nil {
 		return nil, err
 	}
-	return register(f, prometheus.NewGauge(prometheus.GaugeOpts{Name: m.Name, Help: m.Help}))
+	g, err := obtain(f, name, func() prometheus.Gauge {
+		return prometheus.NewGauge(prometheus.GaugeOpts{Name: m.Name, Help: m.Help})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Gauge{g}, nil
 }
 
-// Histogram creates a label-less histogram from the catalog.
-func (f *Factory) Histogram(name string) (prometheus.Histogram, error) {
+// Histogram creates (or returns the cached) label-less histogram.
+func (f *Factory) Histogram(name string) (*Histogram, error) {
 	m, err := f.lookup(name, TypeHistogram, false)
 	if err != nil {
 		return nil, err
 	}
-	return register(f, prometheus.NewHistogram(prometheus.HistogramOpts{Name: m.Name, Help: m.Help, Buckets: buckets(m)}))
+	h, err := obtain(f, name, func() prometheus.Histogram {
+		return prometheus.NewHistogram(prometheus.HistogramOpts{Name: m.Name, Help: m.Help, Buckets: buckets(m)})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Histogram{h}, nil
 }
 
 // checker validates label values against the catalog declaration.
@@ -145,11 +240,15 @@ type CounterVec struct {
 }
 
 // WithLabelValues returns the counter for declared label values only.
-func (c *CounterVec) WithLabelValues(values ...string) (prometheus.Counter, error) {
+func (c *CounterVec) WithLabelValues(values ...string) (*Counter, error) {
 	if err := c.k.check(values); err != nil {
 		return nil, err
 	}
-	return c.v.GetMetricWithLabelValues(values...)
+	ch, err := c.v.GetMetricWithLabelValues(values...)
+	if err != nil {
+		return nil, err
+	}
+	return &Counter{ch}, nil
 }
 
 // GaugeVec is a catalog-checked gauge vector.
@@ -159,11 +258,15 @@ type GaugeVec struct {
 }
 
 // WithLabelValues returns the gauge for declared label values only.
-func (g *GaugeVec) WithLabelValues(values ...string) (prometheus.Gauge, error) {
+func (g *GaugeVec) WithLabelValues(values ...string) (*Gauge, error) {
 	if err := g.k.check(values); err != nil {
 		return nil, err
 	}
-	return g.v.GetMetricWithLabelValues(values...)
+	ch, err := g.v.GetMetricWithLabelValues(values...)
+	if err != nil {
+		return nil, err
+	}
+	return &Gauge{ch}, nil
 }
 
 // HistogramVec is a catalog-checked histogram vector.
@@ -172,47 +275,57 @@ type HistogramVec struct {
 	k checker
 }
 
-// WithLabelValues returns the observer for declared label values only.
-func (h *HistogramVec) WithLabelValues(values ...string) (prometheus.Observer, error) {
+// WithLabelValues returns the histogram for declared label values only.
+func (h *HistogramVec) WithLabelValues(values ...string) (*Histogram, error) {
 	if err := h.k.check(values); err != nil {
 		return nil, err
 	}
-	return h.v.GetMetricWithLabelValues(values...)
+	ch, err := h.v.GetMetricWithLabelValues(values...)
+	if err != nil {
+		return nil, err
+	}
+	return &Histogram{ch}, nil
 }
 
-// CounterVec creates a counter vector from the catalog.
+// CounterVec creates (or returns the cached) counter vector from the catalog.
 func (f *Factory) CounterVec(name string) (*CounterVec, error) {
 	m, err := f.lookup(name, TypeCounter, true)
 	if err != nil {
 		return nil, err
 	}
-	v, err := register(f, prometheus.NewCounterVec(prometheus.CounterOpts{Name: m.Name, Help: m.Help}, labelNames(m)))
+	v, err := obtain(f, name, func() *prometheus.CounterVec {
+		return prometheus.NewCounterVec(prometheus.CounterOpts{Name: m.Name, Help: m.Help}, labelNames(m))
+	})
 	if err != nil {
 		return nil, err
 	}
 	return &CounterVec{v: v, k: checker{m.Name, m.Labels}}, nil
 }
 
-// GaugeVec creates a gauge vector from the catalog.
+// GaugeVec creates (or returns the cached) gauge vector from the catalog.
 func (f *Factory) GaugeVec(name string) (*GaugeVec, error) {
 	m, err := f.lookup(name, TypeGauge, true)
 	if err != nil {
 		return nil, err
 	}
-	v, err := register(f, prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: m.Name, Help: m.Help}, labelNames(m)))
+	v, err := obtain(f, name, func() *prometheus.GaugeVec {
+		return prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: m.Name, Help: m.Help}, labelNames(m))
+	})
 	if err != nil {
 		return nil, err
 	}
 	return &GaugeVec{v: v, k: checker{m.Name, m.Labels}}, nil
 }
 
-// HistogramVec creates a histogram vector from the catalog.
+// HistogramVec creates (or returns the cached) histogram vector.
 func (f *Factory) HistogramVec(name string) (*HistogramVec, error) {
 	m, err := f.lookup(name, TypeHistogram, true)
 	if err != nil {
 		return nil, err
 	}
-	v, err := register(f, prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: m.Name, Help: m.Help, Buckets: buckets(m)}, labelNames(m)))
+	v, err := obtain(f, name, func() *prometheus.HistogramVec {
+		return prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: m.Name, Help: m.Help, Buckets: buckets(m)}, labelNames(m))
+	})
 	if err != nil {
 		return nil, err
 	}

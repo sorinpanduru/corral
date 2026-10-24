@@ -46,149 +46,165 @@ var nonBaseUnits = []string{
 	"ms", "milliseconds", "us", "microseconds", "ns", "nanoseconds",
 	"minutes", "hours", "days", "kb", "mb", "gb", "tb", "kib", "mib", "gib", "tib",
 	"kilobytes", "megabytes", "gigabytes", "percent",
+	"millis", "sec", "secs", "minute", "hour", "day", "bits", "bit",
+	"millisecond", "microsecond", "nanosecond", "kilobyte", "megabyte", "gigabyte",
 }
 
-var (
-	forbiddenExact = []string{
-		"address", "ip", "host", "port", "id", "lsid", "app_name", "appname",
-		"database", "db", "namespace", "collection", "code", "code_name", "codename",
-	}
-	forbiddenSuffix = []string{"_address", "_ip", "_host", "_port", "_id"}
-	forbiddenPrefix = []string{
-		"session", "cursor", "request", "connection", "driver", "user", "trace", "span",
-	}
-)
+// allowedLabelNames is the closed allowlist of label names (FR-11): every
+// other name is rejected, which subsumes the FR-11 deny patterns.
+var allowedLabelNames = []string{"command", LabelErrorClass, LabelErrorDetail}
 
-func forbiddenLabel(name string) bool {
-	if slices.Contains(forbiddenExact, name) {
-		return true
+// AllowedLabelNames returns a copy of the label name allowlist.
+func AllowedLabelNames() []string { return slices.Clone(allowedLabelNames) }
+
+var valueRE = regexp.MustCompile(`^[a-z0-9_]+$`)
+
+// Lint returns every rule violation in the catalog (empty when clean).
+func Lint(c *Catalog) []Problem {
+	if c == nil {
+		return []Problem{{Msg: "catalog is nil"}}
 	}
-	for _, s := range forbiddenSuffix {
-		if strings.HasSuffix(name, s) {
-			return true
+	var ps []Problem
+	seen := map[string]bool{}
+	for _, m := range c.Metrics {
+		if seen[m.Name] {
+			ps = append(ps, Problem{Metric: m.Name, Msg: "duplicate metric name"})
+		}
+		seen[m.Name] = true
+		ps = append(ps, lintName(m)...)
+		ps = append(ps, lintLabels(m)...)
+	}
+	return ps
+}
+
+// lintName checks the metric-level rules: name, type, help, buckets.
+func lintName(m MetricDef) []Problem {
+	var ps []Problem
+	add := func(format string, args ...any) {
+		ps = append(ps, Problem{Metric: m.Name, Msg: fmt.Sprintf(format, args...)})
+	}
+	if !strings.HasPrefix(m.Name, "corral_") {
+		add("name must start with corral_ (FR-10)")
+	}
+	if !snakeRE.MatchString(m.Name) {
+		add("name must be snake_case (FR-10)")
+	}
+	base := strings.TrimSuffix(m.Name, "_total")
+	for _, u := range nonBaseUnits {
+		if strings.HasSuffix(base, "_"+u) {
+			add("non-base unit suffix _%s, use base units (FR-10)", u)
+			break
 		}
 	}
-	for _, p := range forbiddenPrefix {
-		if strings.HasPrefix(name, p) {
+	switch m.Type {
+	case TypeCounter:
+		if !strings.HasSuffix(m.Name, "_total") {
+			add("counter name must end in _total (FR-10)")
+		}
+	case TypeGauge, TypeHistogram:
+		if strings.HasSuffix(m.Name, "_total") {
+			add("_total is only allowed on counters (FR-10)")
+		}
+	default:
+		add("unknown type %q, want counter, gauge or histogram", string(m.Type))
+	}
+	if strings.TrimSpace(m.Help) == "" {
+		add("help must not be empty (FR-10)")
+	}
+	if len(m.Buckets) > 0 {
+		if m.Type != TypeHistogram {
+			add("buckets are only allowed on histograms")
+		}
+		for i := 1; i < len(m.Buckets); i++ {
+			if m.Buckets[i] <= m.Buckets[i-1] {
+				add("buckets must be strictly increasing")
+				break
+			}
+		}
+	}
+	return ps
+}
+
+// lintLabels checks label names, values and the FR-13 series cap.
+func lintLabels(m MetricDef) []Problem {
+	var ps []Problem
+	emptySet := false
+	series := 1
+	labelSeen := map[string]bool{}
+	for _, l := range m.Labels {
+		ps = append(ps, lintLabel(m.Name, l, labelSeen[l.Name])...)
+		labelSeen[l.Name] = true
+		if len(l.Values) == 0 {
+			emptySet = true
+			continue
+		}
+		// Saturate at maxSeries+1 so the product cannot overflow; only
+		// "above the cap" matters.
+		series = min(series*len(l.Values), maxSeries+1)
+	}
+	if !emptySet && series > maxSeries {
+		ps = append(ps, Problem{Metric: m.Name, Msg: fmt.Sprintf("series cap exceeded: label value product exceeds %d (FR-13)", maxSeries)})
+	}
+	return ps
+}
+
+// lintLabel checks one label: name allowlist and value rules. Values are
+// rendered with %q so hostile characters stay escaped.
+func lintLabel(metric string, l LabelDef, duplicate bool) []Problem {
+	var ps []Problem
+	add := func(format string, args ...any) {
+		ps = append(ps, Problem{Metric: metric, Label: l.Name, Msg: fmt.Sprintf(format, args...)})
+	}
+	if duplicate {
+		add("duplicate label name")
+	}
+	if l.Name == "le" || l.Name == "quantile" {
+		add("label name is reserved and must not be declared (FR-13)")
+	}
+	if !slices.Contains(allowedLabelNames, l.Name) {
+		add("label name is not in the allowlist (FR-11)")
+	}
+	if len(l.Values) == 0 {
+		add("label must declare a non-empty value set (FR-11, FR-31)")
+	}
+	dup := map[string]bool{}
+	for _, v := range l.Values {
+		if dup[v] {
+			add("duplicate value %q", v)
+		}
+		dup[v] = true
+		switch l.Name {
+		case LabelErrorClass:
+			if !errclassHas(v) {
+				add("value %q is outside the FR-29 error class enum", v)
+			}
+		case LabelErrorDetail:
+			if !detailHas(v) {
+				add("value %q is outside the FR-29 error detail enum", v)
+			}
+		default:
+			if !valueRE.MatchString(v) {
+				add("value %q must be non-empty and match ^[a-z0-9_]+$", v)
+			}
+		}
+	}
+	return ps
+}
+
+func errclassHas(v string) bool {
+	for _, c := range errclass.Classes() {
+		if string(c) == v {
 			return true
 		}
 	}
 	return false
 }
 
-// Lint returns every rule violation in the catalog (empty when clean).
-func Lint(c *Catalog) []Problem {
-	var ps []Problem
-	if c == nil {
-		return []Problem{{Msg: "catalog is nil"}}
-	}
-	classes := map[string]bool{}
-	for _, v := range errclass.Classes() {
-		classes[string(v)] = true
-	}
-	details := map[string]bool{}
-	for _, v := range errclass.Details() {
-		details[string(v)] = true
-	}
-	seen := map[string]bool{}
-	for _, m := range c.Metrics {
-		add := func(label, format string, args ...any) {
-			ps = append(ps, Problem{Metric: m.Name, Label: label, Msg: fmt.Sprintf(format, args...)})
-		}
-		if seen[m.Name] {
-			add("", "duplicate metric name")
-		}
-		seen[m.Name] = true
-		if !strings.HasPrefix(m.Name, "corral_") {
-			add("", "name must start with corral_ (FR-10)")
-		}
-		if !snakeRE.MatchString(m.Name) {
-			add("", "name must be snake_case (FR-10)")
-		}
-		base := strings.TrimSuffix(m.Name, "_total")
-		for _, u := range nonBaseUnits {
-			if strings.HasSuffix(base, "_"+u) {
-				add("", "non-base unit suffix _%s, use base units (FR-10)", u)
-				break
-			}
-		}
-		switch m.Type {
-		case TypeCounter:
-			if !strings.HasSuffix(m.Name, "_total") {
-				add("", "counter name must end in _total (FR-10)")
-			}
-		case TypeGauge, TypeHistogram:
-			if strings.HasSuffix(m.Name, "_total") {
-				add("", "_total is only allowed on counters (FR-10)")
-			}
-		default:
-			add("", "unknown type %q, want counter, gauge or histogram", string(m.Type))
-		}
-		if strings.TrimSpace(m.Help) == "" {
-			add("", "help must not be empty (FR-10)")
-		}
-		if len(m.Buckets) > 0 {
-			if m.Type != TypeHistogram {
-				add("", "buckets are only allowed on histograms")
-			}
-			for i := 1; i < len(m.Buckets); i++ {
-				if m.Buckets[i] <= m.Buckets[i-1] {
-					add("", "buckets must be strictly increasing")
-					break
-				}
-			}
-		}
-
-		series := 1
-		emptySet := false
-		labelSeen := map[string]bool{}
-		for _, l := range m.Labels {
-			ladd := func(format string, args ...any) { add(l.Name, format, args...) }
-			if labelSeen[l.Name] {
-				ladd("duplicate label name")
-			}
-			labelSeen[l.Name] = true
-			if !snakeRE.MatchString(l.Name) {
-				ladd("label name must be snake_case (FR-10)")
-			}
-			if l.Name == "le" || l.Name == "quantile" {
-				ladd("label name is reserved and must not be declared (FR-13)")
-			}
-			if forbiddenLabel(l.Name) {
-				ladd("forbidden label name (FR-11)")
-			}
-			if len(l.Values) == 0 {
-				ladd("label must declare a non-empty value set (FR-11, FR-31)")
-				emptySet = true
-			}
-			switch l.Name {
-			case LabelErrorClass:
-				for _, v := range l.Values {
-					if !classes[v] {
-						ladd("value %q is outside the FR-29 error class enum", v)
-					}
-				}
-			case LabelErrorDetail:
-				for _, v := range l.Values {
-					if !details[v] {
-						ladd("value %q is outside the FR-29 error detail enum", v)
-					}
-				}
-			}
-			dup := map[string]bool{}
-			for _, v := range l.Values {
-				if dup[v] {
-					ladd("duplicate value %q", v)
-				}
-				dup[v] = true
-			}
-			if n := len(l.Values); n > 0 && series <= maxSeries*maxSeries {
-				series *= n
-			}
-		}
-		if !emptySet && series > maxSeries {
-			add("", "series cap exceeded: label value product exceeds %d (FR-13)", maxSeries)
+func detailHas(v string) bool {
+	for _, d := range errclass.Details() {
+		if string(d) == v {
+			return true
 		}
 	}
-	return ps
+	return false
 }
