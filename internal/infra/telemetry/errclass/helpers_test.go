@@ -37,7 +37,13 @@ type fakeConfigErr struct {
 	cause   error
 }
 
-func (e *fakeConfigErr) Error() string         { return "config error for " + e.setting }
+func (e *fakeConfigErr) Error() string {
+	// Like real wrappers: the text includes the cause text.
+	if e.cause != nil {
+		return "config " + e.setting + ": " + e.cause.Error()
+	}
+	return "config " + e.setting
+}
 func (e *fakeConfigErr) Unwrap() error         { return e.cause }
 func (e *fakeConfigErr) ConfigSetting() string { return e.setting }
 

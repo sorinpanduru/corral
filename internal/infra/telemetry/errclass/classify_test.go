@@ -134,12 +134,12 @@ func TestClassify_Sentinels_AC35(t *testing.T) {
 	})
 }
 
-// FR-29 / D3: a net.Error timeout with no errno or sentinel is class timeout;
-// the detail must be one of the two timeout details.
+// FR-29 / D3: a net.Error timeout with no errno or sentinel is exactly
+// timeout/ETIMEDOUT.
 func TestClassify_NetErrorTimeout(t *testing.T) {
 	c, d := inEnums(t, fmt.Errorf("wrap: %w", timeoutErr{msg: "synthetic timeout"}))
-	if c != "timeout" || (d != "ETIMEDOUT" && d != "deadline_exceeded") {
-		t.Fatalf("Classify = (%s, %s)", c, d)
+	if c != "timeout" || d != "ETIMEDOUT" {
+		t.Fatalf("Classify = (%s, %s), want (timeout, ETIMEDOUT)", c, d)
 	}
 }
 

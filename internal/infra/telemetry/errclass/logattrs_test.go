@@ -98,8 +98,12 @@ func TestLogAttrs_AC35(t *testing.T) {
 					t.Errorf("unexpected key %q", k)
 				}
 			}
-			if _, has := got[attr.Stack]; has && !tc.panicStack {
+			st, has := got[attr.Stack]
+			if has && !tc.panicStack {
 				t.Error("stack attribute present on a non-panic error")
+			}
+			if tc.panicStack && (!has || st.Kind() != slog.KindString) {
+				t.Errorf("stack attr missing or not a string (present=%v)", has)
 			}
 		})
 	}
