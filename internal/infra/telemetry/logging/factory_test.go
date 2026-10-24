@@ -117,11 +117,6 @@ func TestBootstrapLogger(t *testing.T) {
 	}
 }
 
-// FR-27: the bootstrap logger suppresses debug output.
-func TestBootstrapLoggerSuppressesDebug(t *testing.T) {
-	var buf syncBuffer
-	logging.BootstrapLogger(&buf).Debug("synthetic debug")
-	if buf.String() != "" {
-		t.Errorf("debug produced output: %q", buf.String())
-	}
-}
+// SPEC-003 FR-29: the bootstrap logger filters nothing by level; the contract
+// is TestBootstrapLoggerFiltersNothing (bootstrap_level_test.go). The earlier
+// SPEC-001 behaviour (info level, debug suppressed) is retired.

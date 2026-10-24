@@ -33,6 +33,7 @@ import (
 	"google.golang.org/grpc/codes"
 
 	corralrt "github.com/sorinpanduru/corral/internal/app/runtime"
+	"github.com/sorinpanduru/corral/internal/infra/osfile"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logbridge"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logging"
 	"github.com/sorinpanduru/corral/internal/testkit/markerscan"
@@ -378,7 +379,13 @@ func runSetup(t *testing.T, s setup) {
 	defer cancel()
 	done := make(chan int, 1)
 	args := []string{"-tracing.enabled=true", "-log.level=debug", "-admin.listen=" + admin}
-	go func() { done <- corralrt.Run(ctx, args, os.LookupEnv, out, hooks) }()
+	// The exporters read the real process environment, so the snapshot given to
+	// validation is the same one (SPEC-003 FR-19, FR-25).
+	in := corralrt.Inputs{
+		Args: args, Env: os.Environ(), ReadFile: osfile.Read, Stdout: out,
+		HUP: make(chan os.Signal), Version: "test",
+	}
+	go func() { done <- corralrt.Run(ctx, in, hooks) }()
 
 	var h corralrt.Handles
 	select {
