@@ -59,7 +59,7 @@ func TestFactoryComponentTopLevelOnce(t *testing.T) {
 func TestFactoryRejectsUnknownComponent(t *testing.T) {
 	var buf syncBuffer
 	fac := logging.NewFactory(checked(t, logging.NewHandler(&buf, logging.FormatJSON, slog.LevelInfo), false))
-	for _, bad := range []string{"", "proxy", "CONFIG", "third_party", "admin-http", "unknown", marker(t, "cmp-")} {
+	for _, bad := range []string{"", "proxies", "CONFIG", "third_party", "admin-http", "unknown", marker(t, "cmp-")} {
 		l, err := fac.Logger(logging.Component(bad))
 		if err == nil {
 			t.Errorf("Logger(%q) succeeded, want error", bad)

@@ -114,22 +114,35 @@ func allTypes() []byte {
 	)
 }
 
-// nested returns a document nested n levels deep, counting the top-level
-// document as level 1 (so nested(1) is a flat document holding one scalar).
-// It is built iteratively.
-func nested(n int) []byte {
-	d := doc(eInt32("leaf", 1))
-	for i := 1; i < n; i++ {
-		d = doc(eDoc("d", d))
+// deep builds a document nested n levels deep in one linear pass: n opening
+// headers (each with a placeholder length), the leaf, then n closers with the
+// lengths patched from the inside out. wrap(level) returns the element prefix
+// (type byte plus key cstring) used to open the child of that level.
+func deep(n int, childPrefix []byte) []byte {
+	leaf := doc(eInt32("leaf", 1))
+	if n <= 1 {
+		return leaf
 	}
-	return d
+	// Level i (1 = top) has total length leafLen + (n-i)*(5+len(prefix)+0)
+	// where each wrapper adds 4 (length) + len(prefix) + 1 (terminator) + the
+	// element's own terminator: wrapper = 4 + prefix + child + 1.
+	wrapper := 4 + len(childPrefix) + 1
+	out := make([]byte, 0, len(leaf)+(n-1)*wrapper)
+	for i := 1; i < n; i++ {
+		total := len(leaf) + (n-i)*wrapper
+		out = append(out, le32(int32(total))...)
+		out = append(out, childPrefix...)
+	}
+	out = append(out, leaf...)
+	for i := 1; i < n; i++ {
+		out = append(out, 0)
+	}
+	return out
 }
 
+// nested returns a document nested n levels deep, counting the top-level
+// document as level 1 (so nested(1) is a flat document holding one scalar).
+func nested(n int) []byte { return deep(n, cat([]byte{0x03}, cstr("d"))) }
+
 // nestedArray is nested() with arrays instead of subdocuments.
-func nestedArray(n int) []byte {
-	d := doc(eInt32("leaf", 1))
-	for i := 1; i < n; i++ {
-		d = doc(el(0x04, "0", d))
-	}
-	return d
-}
+func nestedArray(n int) []byte { return deep(n, cat([]byte{0x04}, cstr("0"))) }

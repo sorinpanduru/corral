@@ -65,8 +65,13 @@ func TestLintAcceptsValidCatalog(t *testing.T) {
 		metricSpec{Name: "corral_b", Type: "gauge", Help: "A gauge."},
 		metricSpec{Name: "corral_c_seconds", Type: "histogram", Help: "A histogram."},
 		metricSpec{Name: "corral_d_bytes", Type: "gauge", Help: "Bytes."},
-		metricSpec{Name: "corral_e_total", Type: "counter", Help: "Errors.", Labels: []labelSpec{
+		// Class and detail are declared on separate metrics: independent label
+		// value lists multiply (7 x 28 = 196 series would exceed the FR-13 cap
+		// of 100), and every class and every detail must still be accepted.
+		metricSpec{Name: "corral_e_total", Type: "counter", Help: "Errors by class.", Labels: []labelSpec{
 			{Name: "error_class", Values: classValues()},
+		}},
+		metricSpec{Name: "corral_f_total", Type: "counter", Help: "Errors by detail.", Labels: []labelSpec{
 			{Name: "error_detail", Values: detailValues()},
 		}},
 	)

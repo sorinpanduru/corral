@@ -117,7 +117,7 @@ func TestThirdPartyComponentAccepted(t *testing.T) {
 func TestComponentViolations(t *testing.T) {
 	wantFail(t, "missing", func(h *logcheck.Handler) { slog.New(h).Info("synthetic") })
 	wantFail(t, "empty", func(h *logcheck.Handler) { lg(h, "").Info("synthetic") })
-	wantFail(t, "unknown", func(h *logcheck.Handler) { lg(h, "proxy").Info("synthetic") })
+	wantFail(t, "unknown", func(h *logcheck.Handler) { lg(h, "bogus_component").Info("synthetic") })
 	wantFail(t, "wrong_case", func(h *logcheck.Handler) { lg(h, "CONFIG").Info("synthetic") })
 	wantFail(t, "third_party_underscore", func(h *logcheck.Handler) { lg(h, "third_party").Info("synthetic") })
 	wantFail(t, "non_string", func(h *logcheck.Handler) { slog.New(h).With("component", 7).Info("synthetic") })
