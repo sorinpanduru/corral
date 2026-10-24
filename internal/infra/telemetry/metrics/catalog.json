@@ -1,0 +1,10 @@
+{
+  "metrics": [
+    {
+      "name": "corral_tracing_spans_dropped_total",
+      "type": "counter",
+      "help": "Spans dropped because the trace export queue was full.",
+      "labels": []
+    }
+  ]
+}
