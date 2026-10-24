@@ -4,7 +4,7 @@ package tracing_test
 // Expected API (plans/SPEC-001.md T10, names of constants are the test-writer's
 // reading of the plan; see the task report):
 //
-//	tracing.LookupEnv, tracing.Resolve(config.Settings, LookupEnv) (bool, EnvConfig, error)
+//	tracing.LookupEnv, tracing.Resolve(ResolveInputs, LookupEnv, source.ReadFile) (bool, EnvConfig, []error)
 //	tracing.EnvConfig{Exporter, Protocol, Sampler, SamplerArg *float64, SampleRatio float64, Queue}
 //	tracing.ExporterOTLP/ExporterNone, tracing.ProtocolHTTPProtobuf/ProtocolGRPC,
 //	tracing.SamplerUnset/SamplerAlwaysOn/SamplerAlwaysOff/SamplerTraceIDRatio/
@@ -17,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sorinpanduru/corral/internal/infra/config"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/tracing"
 )
 
@@ -54,7 +53,7 @@ func TestResolve_SDKDisabledOtherValuesAreFalse(t *testing.T) {
 				t.Fatalf("OTEL_SDK_DISABLED=%q: enabled = false, want true (counts as false)", v)
 			}
 			// It cannot switch tracing on when tracing.enabled is false.
-			on, _, err = tracing.Resolve(config.Defaults(), envMap(map[string]string{"OTEL_SDK_DISABLED": v}))
+			on, _, err = envResolve(envOff(), envMap(map[string]string{"OTEL_SDK_DISABLED": v}))
 			if err != nil || on {
 				t.Fatalf("tracing.enabled=false: on=%v err=%v, want false/nil", on, err)
 			}
@@ -65,7 +64,7 @@ func TestResolve_SDKDisabledOtherValuesAreFalse(t *testing.T) {
 // AC-14 (unit) through the real process environment API: yes is false, no error.
 func TestResolve_SDKDisabledYesViaRealEnv(t *testing.T) {
 	t.Setenv("OTEL_SDK_DISABLED", "yes")
-	on, _, err := tracing.Resolve(envOn(1.0), lookupOS)
+	on, _, err := envResolve(envOn(1.0), lookupOS)
 	if err != nil || !on {
 		t.Fatalf("on=%v err=%v, want true/nil", on, err)
 	}
@@ -73,7 +72,7 @@ func TestResolve_SDKDisabledYesViaRealEnv(t *testing.T) {
 
 // FR-19: tracing is off by default.
 func TestResolve_OffByDefault(t *testing.T) {
-	on, _, err := tracing.Resolve(config.Defaults(), envMap(nil))
+	on, _, err := envResolve(envOff(), envMap(nil))
 	if err != nil || on {
 		t.Fatalf("defaults: on=%v err=%v, want false/nil", on, err)
 	}
@@ -84,11 +83,11 @@ func TestResolve_OffByDefault(t *testing.T) {
 func TestResolve_WhenOffOnlySDKDisabledIsRead(t *testing.T) {
 	cases := []struct {
 		name string
-		s    config.Settings
+		s    tracing.ResolveInputs
 		sdk  string
 	}{
-		{"tracing.enabled=false", config.Defaults(), "false"},
-		{"tracing.enabled=false SDK unset", config.Defaults(), ""},
+		{"tracing.enabled=false", envOff(), "false"},
+		{"tracing.enabled=false SDK unset", envOff(), ""},
 		{"SDK_DISABLED=TRUE", envOn(1.0), "TRUE"},
 	}
 	for _, c := range cases {
@@ -104,7 +103,7 @@ func TestResolve_WhenOffOnlySDKDisabledIsRead(t *testing.T) {
 				}
 				return "garbage", true
 			}
-			on, _, err := tracing.Resolve(c.s, lookup)
+			on, _, err := envResolve(c.s, lookup)
 			if err != nil || on {
 				t.Fatalf("on=%v err=%v, want false/nil", on, err)
 			}
@@ -125,7 +124,7 @@ func TestResolve_InvalidIgnoredWhenOff(t *testing.T) {
 			for k, v := range c.extra {
 				m[k] = v
 			}
-			if on, _, err := tracing.Resolve(config.Defaults(), envMap(m)); err != nil || on {
+			if on, _, err := envResolve(envOff(), envMap(m)); err != nil || on {
 				t.Fatalf("tracing.enabled=false: on=%v err=%v, want false/nil", on, err)
 			}
 			m["OTEL_SDK_DISABLED"] = "TRUE"
@@ -139,7 +138,7 @@ func TestResolve_InvalidIgnoredWhenOff(t *testing.T) {
 // FR-20 defaults: with no OTEL_* set, otlp, http/protobuf, FR-37 defaults and
 // the default sampler with tracing.sample_ratio.
 func TestResolve_Defaults(t *testing.T) {
-	on, cfg, err := tracing.Resolve(envOn(0.25), envMap(nil))
+	on, cfg, err := envResolve(envOn(0.25), envMap(nil))
 	if err != nil || !on {
 		t.Fatalf("on=%v err=%v, want true/nil", on, err)
 	}
@@ -405,7 +404,7 @@ func TestResolve_SamplerAcceptsSixValues(t *testing.T) {
 
 // AC-16: OTEL_TRACES_SAMPLER=always_on wins over tracing.sample_ratio=0.0.
 func TestResolve_SamplerOverridesSettingsRatio(t *testing.T) {
-	on, cfg, err := tracing.Resolve(envOn(0.0), envMap(map[string]string{"OTEL_TRACES_SAMPLER": "always_on"}))
+	on, cfg, err := envResolve(envOn(0.0), envMap(map[string]string{"OTEL_TRACES_SAMPLER": "always_on"}))
 	if err != nil || !on {
 		t.Fatalf("on=%v err=%v", on, err)
 	}
@@ -440,7 +439,7 @@ func TestResolve_SamplerArgPrecedence(t *testing.T) {
 			if c.arg != "" {
 				m["OTEL_TRACES_SAMPLER_ARG"] = c.arg
 			}
-			on, cfg, err := tracing.Resolve(envOn(c.setting), envMap(m))
+			on, cfg, err := envResolve(envOn(c.setting), envMap(m))
 			if err != nil || !on {
 				t.Fatalf("on=%v err=%v", on, err)
 			}

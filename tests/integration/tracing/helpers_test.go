@@ -6,7 +6,7 @@ package tracing_test
 //
 // Expected API (plans/SPEC-001.md T15, "Interfaces defined"):
 //
-//	tracing.Options{Settings config.Settings; Env tracing.LookupEnv;
+//	tracing.Options{Env tracing.LookupEnv;
 //	    Config tracing.EnvConfig; Enabled bool; Metrics *metrics.Factory;
 //	    Logger *slog.Logger; Exporter sdktrace.SpanExporter}
 //	tracing.Start(ctx, Options) (*tracing.Tracing, error)
@@ -40,7 +40,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"google.golang.org/grpc/grpclog"
 
-	"github.com/sorinpanduru/corral/internal/infra/config"
+	"github.com/sorinpanduru/corral/internal/infra/osfile"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logbridge"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logging"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/metrics"
@@ -161,11 +161,12 @@ func boot(t *testing.T, o opts) *harness {
 	h := &harness{t: t, clk: fakeclock.New(clockStart)}
 	h.stopIO = markerscan.CaptureStdio(t)
 
-	st := config.Defaults()
-	st.TracingEnabled = o.on
-	enabled, cfg, err := tracing.Resolve(st, os.LookupEnv)
-	if err != nil {
-		t.Fatalf("Resolve returned an error for a valid environment: %v", err)
+	// The exporters read the real environment and files (SPEC-003 FR-19), so
+	// the validation here uses the real lookup and osfile.Read too.
+	st := tracing.ResolveInputs{Enabled: o.on, SampleRatio: 1.0}
+	enabled, cfg, errs := tracing.Resolve(st, os.LookupEnv, osfile.Read)
+	if len(errs) > 0 {
+		t.Fatalf("Resolve returned %d errors for a valid environment: first %v", len(errs), errs[0])
 	}
 	h.enabled, h.cfg = enabled, cfg
 	if o.afterResolve != nil {
@@ -217,7 +218,6 @@ func boot(t *testing.T, o opts) *harness {
 	}
 
 	tr, err := tracing.Start(context.Background(), tracing.Options{
-		Settings: st,
 		Env:      os.LookupEnv,
 		Config:   cfg,
 		Enabled:  enabled,

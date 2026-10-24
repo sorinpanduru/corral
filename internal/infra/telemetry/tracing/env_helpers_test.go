@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/sorinpanduru/corral/internal/infra/config"
+	"github.com/sorinpanduru/corral/internal/infra/osfile"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/errclass"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logging"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/tracing"
@@ -48,17 +49,37 @@ func envMap(m map[string]string) tracing.LookupEnv {
 	}
 }
 
-// envOn returns settings with tracing enabled and the given ratio.
-func envOn(ratio float64) config.Settings {
-	s := config.Defaults()
-	s.TracingEnabled = true
-	s.SampleRatio = ratio
-	return s
+// envOn returns resolve inputs with tracing enabled and the given ratio.
+func envOn(ratio float64) tracing.ResolveInputs {
+	return tracing.ResolveInputs{Enabled: true, SampleRatio: ratio}
+}
+
+// envOff returns resolve inputs with tracing disabled (tracing.enabled=false,
+// the default ratio).
+func envOff() tracing.ResolveInputs {
+	return tracing.ResolveInputs{Enabled: false, SampleRatio: 1.0}
+}
+
+// envResolveAll runs Resolve with the real file reader (osfile.Read), for the
+// cases that exercise real files, FIFOs and devices.
+func envResolveAll(in tracing.ResolveInputs, env tracing.LookupEnv) (bool, tracing.EnvConfig, []error) {
+	return tracing.Resolve(in, env, osfile.Read)
+}
+
+// envResolve is the single-error view used by the parity tests migrated from
+// SPEC-001: it returns the first error (errors are sorted by setting) or nil.
+// Tests that need every error call envResolveAll or tracing.Resolve.
+func envResolve(in tracing.ResolveInputs, env tracing.LookupEnv) (bool, tracing.EnvConfig, error) {
+	on, cfg, errs := envResolveAll(in, env)
+	if len(errs) > 0 {
+		return on, cfg, errs[0]
+	}
+	return on, cfg, nil
 }
 
 // envResolveOn resolves with tracing enabled (ratio 1.0).
 func envResolveOn(m map[string]string) (bool, tracing.EnvConfig, error) {
-	return tracing.Resolve(envOn(1.0), envMap(m))
+	return envResolve(envOn(1.0), envMap(m))
 }
 
 // envMustResolve fails the test unless Resolve succeeds with tracing on.

@@ -15,7 +15,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"google.golang.org/grpc/grpclog"
 
-	"github.com/sorinpanduru/corral/internal/infra/config"
+	"github.com/sorinpanduru/corral/internal/infra/osfile"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/tracing"
 	"github.com/sorinpanduru/corral/internal/testkit/otlpcollector"
 )
@@ -78,14 +78,13 @@ func TestStartWithoutMetricsFactoryFails(t *testing.T) {
 			m := newMarker(t)
 			col := otlpcollector.Start(t)
 			setEnv(t, map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://synthuser:" + m + "@" + col.HTTPEndpoint()})
-			st := config.Defaults()
-			st.TracingEnabled = true
-			enabled, cfg, err := tracing.Resolve(st, os.LookupEnv)
-			if err != nil || !enabled {
-				t.Fatalf("Resolve: enabled=%v err=%v", enabled, err)
+			st := tracing.ResolveInputs{Enabled: true, SampleRatio: 1.0}
+			enabled, cfg, errs := tracing.Resolve(st, os.LookupEnv, osfile.Read)
+			if len(errs) > 0 || !enabled {
+				t.Fatalf("Resolve: enabled=%v errors=%d", enabled, len(errs))
 			}
 			tr, err := tracing.Start(context.Background(), tracing.Options{
-				Settings: st, Env: os.LookupEnv, Config: cfg, Enabled: true, Exporter: ov,
+				Env: os.LookupEnv, Config: cfg, Enabled: true, Exporter: ov,
 			})
 			if err == nil {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
