@@ -41,6 +41,18 @@ func (e *fakeConfigErr) Error() string         { return "config error for " + e.
 func (e *fakeConfigErr) Unwrap() error         { return e.cause }
 func (e *fakeConfigErr) ConfigSetting() string { return e.setting }
 
+// fakeProtocolErr satisfies the duck-typed errclass protocol contract
+// (interface{ ProtocolError() }). It stands in for wire-parse failures and
+// OTLP collector rejections; msg carries a marker in tests.
+type fakeProtocolErr struct {
+	msg   string
+	cause error
+}
+
+func (e *fakeProtocolErr) Error() string  { return e.msg }
+func (e *fakeProtocolErr) Unwrap() error  { return e.cause }
+func (e *fakeProtocolErr) ProtocolError() {}
+
 // timeoutErr is a net.Error-style timeout with no errno or context sentinel.
 type timeoutErr struct{ msg string }
 

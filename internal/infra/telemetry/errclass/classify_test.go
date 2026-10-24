@@ -154,6 +154,26 @@ func TestClassify_Config_D3(t *testing.T) {
 	})
 }
 
+// D3 / AC-35: protocol errors (wire-parse failures, OTLP collector
+// rejections) are class protocol, detail other.
+func TestClassify_Protocol_D3(t *testing.T) {
+	m := newMarker(t)
+	runCases(t, []classCase{
+		{"protocol", &fakeProtocolErr{msg: "bad frame " + m}, "protocol", "other"},
+	})
+	// %w-wrapped inside another error with marker text.
+	w := fmt.Errorf("export to endpoint %s: %w", m, &fakeProtocolErr{msg: "rejected"})
+	if c, d := inEnums(t, w); c != "protocol" || d != "other" {
+		t.Fatalf("wrapped Classify = (%s, %s)", c, d)
+	}
+	// A protocol error wrapping a network errno keeps class protocol; the
+	// detail only has to be an enum value (checked by inEnums).
+	perr := &fakeProtocolErr{msg: "reset mid-frame", cause: &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}}
+	if c, _ := inEnums(t, perr); c != "protocol" {
+		t.Fatalf("protocol wrapping errno: class = %s, want protocol", c)
+	}
+}
+
 // D3 / AC-35: a MongoDB server reply is class server, detail other.
 func TestClassify_Server_AC35(t *testing.T) {
 	m := newMarker(t)
@@ -320,8 +340,8 @@ func TestClassify_RealDNSFailure_AC35(t *testing.T) {
 	}
 }
 
-// Real loopback: double listen (AC-35 EADDRINUSE). Raw bind error keeps the
-// EADDRINUSE detail; the class is only fixed (config) once wrapped (D3).
+// Real loopback: double listen (AC-35 EADDRINUSE). Raw bind error is
+// network/EADDRINUSE; wrapped as a config error it becomes config (D3).
 func TestClassify_RealAddrInUse_AC35(t *testing.T) {
 	l1, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -332,8 +352,8 @@ func TestClassify_RealAddrInUse_AC35(t *testing.T) {
 	if err == nil {
 		t.Fatal("second listen unexpectedly succeeded")
 	}
-	if _, d := inEnums(t, err); d != "EADDRINUSE" {
-		t.Fatalf("detail = %s, want EADDRINUSE", d)
+	if c, d := inEnums(t, err); c != "network" || d != "EADDRINUSE" {
+		t.Fatalf("raw Classify = (%s, %s), want (network, EADDRINUSE)", c, d)
 	}
 	cfg := &fakeConfigErr{setting: "admin.listen", cause: err}
 	if c, d := inEnums(t, cfg); c != "config" || d != "EADDRINUSE" {

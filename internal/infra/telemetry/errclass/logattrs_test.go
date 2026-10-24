@@ -39,6 +39,8 @@ func markedCases(m string) []markedCase {
 		{name: "net.OpError", err: &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}, class: "network", detail: "ECONNRESET"},
 		{name: "text with marker around timeout", err: fmt.Errorf("%s: %w", m, context.DeadlineExceeded), class: "timeout", detail: "deadline_exceeded"},
 		{name: "server reply", err: &fakeServerErr{code: 11000, name: "DuplicateKey", msg: "E11000 duplicate key { a: \"" + m + "\" }"}, class: "server", detail: "other", server: true, code: "11000", codeName: "DuplicateKey"},
+		{name: "protocol", err: &fakeProtocolErr{msg: "collector rejected: " + m}, class: "protocol", detail: "other"},
+		{name: "protocol wrapped", err: fmt.Errorf("export %s: %w", m, &fakeProtocolErr{msg: "bad reply " + m}), class: "protocol", detail: "other"},
 		{name: "config", err: &fakeConfigErr{setting: "admin.listen", cause: errors.New("value " + m)}, class: "config", detail: "other"},
 		{name: "panic", err: errclass.FromPanic(m, []byte("goroutine 1 [running]:\nsynthetic")), class: "internal", detail: "other", panicStack: true},
 	}
