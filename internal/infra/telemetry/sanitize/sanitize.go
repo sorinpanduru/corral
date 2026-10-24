@@ -29,28 +29,26 @@ func DriverVersion(s string) string { return clean(s, maxDriverVersionLen) }
 
 // clean replaces each invalid UTF-8 byte with U+FFFD, then truncates to at
 // most limit bytes on a rune boundary. Replacement comes first, so U+FFFD
-// counts toward the limit.
+// counts toward the limit. Work and allocation are bounded by limit, not by
+// the input length, so oversized client input cannot be used for resource
+// exhaustion.
 func clean(s string, limit int) string {
-	if !utf8.ValidString(s) {
-		var b strings.Builder
-		b.Grow(len(s))
-		for i := 0; i < len(s); {
-			r, n := utf8.DecodeRuneInString(s[i:])
-			if r == utf8.RuneError && n == 1 {
-				b.WriteRune(utf8.RuneError)
-			} else {
-				b.WriteString(s[i : i+n])
-			}
-			i += n
-		}
-		s = b.String()
+	// Every input byte yields at least one output byte, so output offset >=
+	// input offset. Only the first limit+UTFMax input bytes can influence the
+	// kept output; a rune cut by this prefix starts beyond limit and is dropped.
+	if len(s) > limit+utf8.UTFMax {
+		s = s[:limit+utf8.UTFMax]
 	}
-	if len(s) <= limit {
+	if len(s) <= limit && utf8.ValidString(s) {
 		return s
 	}
-	cut := limit
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
+	var b strings.Builder
+	b.Grow(limit + utf8.UTFMax)
+	for _, r := range s { // yields RuneError once per invalid byte
+		if b.Len()+utf8.RuneLen(r) > limit {
+			break
+		}
+		b.WriteRune(r)
 	}
-	return s[:cut]
+	return b.String()
 }
