@@ -1,8 +1,8 @@
 # SPEC-001: Observability conventions (logging, metrics, tracing)
 
-Status: approved (Owner, 2026-10-24); Amendment 1 approved (Owner, 2026-10-24); Amendment 2 approved (Owner, 2026-10-24)
+Status: approved (Owner, 2026-10-24); Amendment 1 approved (Owner, 2026-10-24); Amendment 2 approved (Owner, 2026-10-24); Amendment 3 approved (Owner, 2026-10-24)
 Owner: Sorin Panduru
-Last updated: 2026-10-24 (Amendment 2)
+Last updated: 2026-10-24 (Amendment 3)
 
 ## Goal
 
@@ -14,9 +14,9 @@ telemetry, and the domain layer stays free of observability infrastructure.
 
 - Defining the specific metrics, log events or spans of individual features
   (pooling, sessions, routing). Those specs add them under these conventions.
-- Defining what "ready" means. That belongs to the future pooling spec. This
-  spec defines only the readiness endpoint contract and its behaviour when no
-  readiness check is registered.
+- Defining what "ready" means. That belongs to the pooling spec (SPEC-002
+  FR-46). This spec defines only the readiness endpoint contract, the reason
+  set, and its behaviour when no readiness check is registered.
 - Defining how configuration is loaded (flags, env vars, file). That belongs to
   a future configuration spec. This spec names logical settings only.
 - A latency-overhead target for observability. That moves to a later
@@ -91,6 +91,10 @@ at the end of the list.
   from a fixed set:
   - this spec defines `config`, `lifecycle`, `admin_http`, `tracing`, `otel`,
     `grpc` and `thirdparty`;
+  - Amendment 3 adds `proxy` (wire listener, client connections, requests),
+    `pool` (upstream connection leases, wait queue) and `upstream` (upstream
+    and monitoring connections, upstream authentication, topology), used by
+    SPEC-002;
   - `lifecycle` is used for the starting, startup-complete and shutting-down
     records;
   - `thirdparty` is used for records routed from Go's standard `log` package
@@ -126,8 +130,23 @@ at the end of the list.
   Label names are snake_case.
 - **FR-11:** Labels. Every label has a fixed, enumerated set of values
   declared in the metric catalog (FR-31).
-  - Errors are labelled only by error class, using the FR-29 class enum
-    values, under the label name `error_class`.
+  - **Label-name allowlist.** A metric may use only these label names. This
+    spec owns the list, and feature specs extend it by amending this spec:
+    - original: `command`, `error_class`, `error_detail`;
+    - added by Amendment 3 for SPEC-002: `outcome`, `reason`, `side`,
+      `state`, `opcode`, `kind`.
+
+    The forbidden list below still applies to every name.
+  - Errors are labelled only by `error_class` (FR-29 class enum values), or
+    by `error_detail` where the metric's catalog entry declares it (see
+    below).
+  - **Outcome and cause labels (Amendment 3).** `outcome`, `reason`, `state`,
+    `side`, `opcode` and `kind` hold non-error categories: an operation's
+    outcome, a lifecycle cause, a state, a direction or a message type. These
+    may include coarse values that mean "an error occurred", such as `error`,
+    `failed`, `server_error`, `proxy_error` or `protocol_error`. None of their
+    values may equal an FR-29 class or detail value. Any breakdown by error
+    class or detail uses only `error_class` or `error_detail`.
   - These must never be used as metric labels:
     - client network address or port;
     - upstream host or port;
@@ -148,6 +167,18 @@ at the end of the list.
 - **FR-12:** Command names. This spec owns one central command-name allowlist.
   Feature specs extend it by amending this spec, so the series cap (FR-13) is
   checked in one place.
+  - **Allowlist contents** (case-sensitive, 27 names):
+    - from the original spec: `find`, `hello`;
+    - added by Amendment 3 for SPEC-002: `getMore`, `killCursors`, `insert`,
+      `update`, `delete`, `findAndModify`, `aggregate`, `count`, `distinct`,
+      `bulkWrite`, `createIndexes`, `dropIndexes`, `listIndexes`,
+      `listCollections`, `listDatabases`, `create`, `drop`, `ping`,
+      `buildInfo`, `endSessions`, `commitTransaction`, `abortTransaction`,
+      `saslStart`, `saslContinue`, `authenticate`.
+
+    With `other`, a `command` label has at most 28 values. Any metric that
+    combines `command` with another label must still respect FR-13; for
+    example, `command` × a 3-value label gives 84 series.
   - Matching against the allowlist is case-sensitive.
   - An alias table maps `isMaster` and `ismaster` to `hello`. The alias is
     applied only for allowlist matching.
@@ -186,11 +217,16 @@ at the end of the list.
     200 body is `ok\n`. A 503 body is `<reason>\n`, where `<reason>` is a
     short, fixed reason string from the defined set, with no FR-24 data and no
     client addresses.
-  - **Reason set:** this spec defines `starting`, `shutting_down` and
-    `unknown`. Feature specs add readiness reasons by amending this spec, the
-    same way as FR-12 and FR-40.
+  - **Reason set:**
+    - this spec defines `starting`, `shutting_down` and `unknown`;
+    - Amendment 3 adds `upstream_unavailable`, `upstream_auth_failed` and
+      `upstream_incompatible` for SPEC-002. When each applies, and which one
+      wins when several conditions hold, is defined only in SPEC-002 FR-46;
+    - when not ready, a readiness check reports exactly one reason;
+    - feature specs add readiness reasons by amending this spec, the same way
+      as FR-12 and FR-40.
   - Readiness is supplied to the admin listener through a readiness port; its
-    meaning is defined by the pooling spec.
+    meaning is defined by the pooling spec (SPEC-002 FR-46).
   - **Before startup has completed:** `/readyz` returns 503 with reason
     `starting`, without consulting any registered readiness check.
   - **From the start of graceful shutdown:** `/readyz` returns 503 with reason
@@ -310,6 +346,13 @@ at the end of the list.
   | `db.response.status_code` | MongoDB server error `code`, as a string | root, round-trip, on server errors |
   | `corral.db.response.code_name` | MongoDB server error `codeName` | root, round-trip, on server errors |
 
+  *Server errors* in this table and in FR-29 means errors carried in a
+  MongoDB reply that corral received from the upstream (Amendment 3). Errors
+  that corral synthesizes itself (SPEC-002) never carry
+  `db.response.status_code` or `corral.db.response.code_name` in any signal
+  (spans or logs), even when their class is `server`. They are identified by
+  `error.type` and `corral.error.detail` only.
+
   Optional attributes (may be set; never required):
 
   | Attribute | Value | Allowed on |
@@ -329,7 +372,11 @@ at the end of the list.
   whether corral retries, answers locally or pins connections.
   - **Client `OP_MSG` with `moreToCome` (no reply expected):** one root span
     and one round-trip span. Both end when the message has been written
-    upstream.
+    upstream. As for any exchange, there is also a checkout child (FR-22)
+    whenever a checkout happens (Amendment 3; for SPEC-002 this is always,
+    because it has no pinning). Any follow-up exchange corral sends on its
+    own behalf after the message (such as SPEC-002's barrier `ping`) gets no
+    span and does not extend these spans.
   - **Exhaust cursor (one request, many replies):** one root span and one
     round-trip span. Both end at the final reply (`moreToCome` not set) or
     when the stream ends. There are no per-reply spans.
@@ -482,7 +529,11 @@ at the end of the list.
 - **FR-29:** Error classification and sanitisation.
   - Every error reported in any signal is classified into exactly one value of
     the fixed error-class enum: `timeout`, `network`, `protocol`, `server`,
-    `config`, `internal`. Changing the enum requires amending this spec.
+    `config`, `internal`, `rejected`. Changing the enum requires amending this
+    spec. `rejected` (added by Amendment 3) means corral itself refused a
+    request or connection by policy: a limit, shutdown, a blocked command or
+    an authentication command, or a refused handshake option. No upstream or
+    network failure is involved.
   - **Error detail.** Every error also gets exactly one value from the fixed
     detail enum. The key is `corral.error.detail` in both spans and logs.
     Changing the enum requires amending this spec.
@@ -502,13 +553,47 @@ at the end of the list.
     | `eof` | the peer closed the connection: `io.EOF` or `io.ErrUnexpectedEOF` |
     | `tls_handshake` | TLS handshake failed |
     | `dns_resolution` | host name resolution failed |
-    | `other` | anything not mapped above, including MongoDB server errors (which use `code` / `codeName`) |
+    | `other` | an error that no more specific detail describes. Errors carried in an upstream MongoDB reply use `other`, and are further identified by `code` / `codeName` (FR-23). Synthesized error replies (SPEC-002 Interfaces, "Synthesized error replies") always use one of the specific details below, never `other` |
+
+    Details added by Amendment 3 (SPEC-002). Each is always reported with the
+    class shown. "Emitted by" names the SPEC-002 requirement that produces
+    it, and the same tokens are used wherever SPEC-002 refers to these
+    conditions (metric `error_detail` values, span and log
+    `corral.error.detail`):
+
+    | Detail | Class | Meaning | Emitted by (SPEC-002) |
+    |---|---|---|---|
+    | `pool_wait_timeout` | `timeout` | a request waited longer than the pool checkout timeout | FR-27, FR-56 |
+    | `pool_queue_full` | `rejected` | a request was refused because the pool wait queue was full | FR-27 |
+    | `upstream_unavailable` | `network` | the upstream has never been reached since startup, so no target is usable | FR-19, FR-56 |
+    | `upstream_auth_failed` | `server` | the upstream rejected corral's service authentication (code 18 `AuthenticationFailed` or 334 `MechanismUnavailable` in reply to an authentication command), or the upstream's SCRAM server signature failed verification. Other error replies, network errors and timeouts during authentication keep their own class and detail (SPEC-002 FR-22) | FR-22, FR-56 |
+    | `upstream_incompatible` | `config` | the configured upstream is not a supported deployment: an unsupported wire-version range, a standalone server, a topology mismatch, or a replica set name mismatch | FR-18, FR-19, FR-56 |
+    | `shutting_down` | `rejected` | a request was refused because graceful shutdown is in progress | FR-47 |
+    | `client_auth_unsupported` | `rejected` | a client sent an authentication command (`saslStart`, `saslContinue`, `authenticate`, `getnonce`, `logout`), which corral does not accept | FR-23 |
+    | `command_blocked` | `rejected` | a client sent a cross-client administrative command that corral blocks | FR-33 |
+    | `handshake_rejected` | `rejected` | a client handshake asked for something corral refuses (client metadata sent again, or load-balanced mode) | FR-16, FR-17 |
+    | `unsupported_opcode` | `protocol` | a message used an opcode corral does not accept (including OP_COMPRESSED and legacy opcodes), or used OP_QUERY for something other than the handshake | FR-6, FR-8 |
+    | `message_too_large` | `protocol` | a client or upstream message length was above the allowed maximum, or a locally handled message did not fit the request buffer | FR-5, FR-38, FR-58 |
+    | `malformed_message` | `protocol` | a message was malformed: length below the minimum, unknown required flag bits, bad sections, invalid BSON, a missing command name, or a deciding field outside the request buffer | FR-5, FR-7, FR-38, FR-58 |
+    | `checksum_mismatch` | `protocol` | an OP_MSG checksum did not match | FR-7, FR-58 |
+    | `unexpected_response` | `protocol` | an upstream reply did not match an outstanding request, or had `moreToCome` set | FR-11, FR-58 |
+
+    *Note:* `upstream_unavailable` is both an error detail and an FR-18
+    readiness reason, with different scope:
+    - as an *error detail*, it means only "never reached since startup"
+      (requests in other unavailable states wait and end with
+      `pool_wait_timeout`);
+    - as a *readiness reason*, it covers every unavailable state that SPEC-002
+      FR-46 lists, including elections and failed checks.
+
+    The same token is kept for both on purpose, and their meanings are not
+    interchangeable.
   - This covers server replies, network errors, exporter errors, config errors
     and recovered panics (which are `internal`).
   - **Spans:** a failed span has status Error with an empty description,
     `error.type` set to the class, and `corral.error.detail` set to the
-    detail. Server errors also get
-    `db.response.status_code` and `corral.db.response.code_name` (FR-23).
+    detail. Server errors (errors carried in an upstream reply, FR-23) also
+    get `db.response.status_code` and `corral.db.response.code_name` (FR-23).
     `span.RecordError` is not called, and no `exception` event or
     `exception.*` attribute is recorded on any corral span.
   - **Logs:** the `error` attribute holds the class value produced by a
@@ -538,7 +623,12 @@ at the end of the list.
   - `corral_` metrics are created only through a constructor backed by the
     catalog, so a metric that is not in the catalog cannot be created.
   - Feature specs add their metrics to the catalog. This spec contributes the
-    metric in FR-37.
+    metric in FR-37. Feature-spec metrics are declared in the feature spec
+    (for example SPEC-002, Interfaces, "Metrics added by this spec") and are
+    not repeated here. A feature spec may add metrics without amending this
+    spec only when every label name it uses is already in the FR-11 label-name
+    allowlist. A new label name requires amending this spec. Every metric must
+    pass FR-10, FR-11 and FR-13 and the AC-8 / AC-10 lint.
 - **FR-33:** OTLP export failures, and every other record from the otel error
   handler or otel logger, are rate-limited:
   - export failures are logged as warnings with `component=otel`;
@@ -584,6 +674,11 @@ at the end of the list.
   - The keys a log record may carry are an allowlist:
     - `time`, `level`, `msg`, `component`, `error`, `trace_id`, `span_id`,
       `stack`, `setting`;
+    - `reason` (added by Amendment 3): a string whose value is a fixed token
+      from the enumeration that the owning feature spec declares for the
+      event carrying it (for example SPEC-002's connection-close reasons and
+      readiness reasons). It never holds runtime data such as an address,
+      name, ID or error text;
     - the FR-23 attribute keys (required and optional), which include
       `corral.error.detail`;
     - numeric duration, size and count keys: snake_case names ending in
@@ -693,7 +788,7 @@ when tracing is enabled (FR-27).
 |---|---|---|---|
 | `/metrics` | 200, Prometheus text by default (FR-9) | n/a | metrics |
 | `/healthz` | 200, `text/plain; charset=utf-8` | n/a (no response if the process is down) | `ok\n` |
-| `/readyz` | 200, `text/plain; charset=utf-8` | 503, `text/plain; charset=utf-8` | `ok\n` on 200; `<reason>\n` on 503, reason from the FR-18 set (`starting`, `shutting_down`, `unknown`, plus reasons added by amending this spec) |
+| `/readyz` | 200, `text/plain; charset=utf-8` | 503, `text/plain; charset=utf-8` | `ok\n` on 200; `<reason>\n` on 503, reason from the FR-18 set (`starting`, `shutting_down`, `unknown`, `upstream_unavailable`, `upstream_auth_failed`, `upstream_incompatible`, plus reasons added by amending this spec) |
 | any other path, including trailing-slash variants | n/a | 404 | n/a |
 
 ### Observer and readiness ports
@@ -703,10 +798,11 @@ when tracing is enabled (FR-27).
   (FR-2, FR-3). Method sets are defined by the feature specs that introduce
   them.
 - Readiness port: answers "ready / not ready + fixed reason". It is implemented
-  by the component the pooling spec makes responsible, and consumed by the
-  admin listener. A reason outside the FR-18 set is reported on `/readyz` as
-  `unknown`. The port is not consulted before startup has completed or after
-  graceful shutdown has started (FR-18).
+  by the component the pooling spec makes responsible (SPEC-002: the upstream
+  monitoring component), and consumed by the admin listener. A reason outside
+  the FR-18 set is reported on `/readyz` as `unknown`. The port is not
+  consulted before startup has completed or after graceful shutdown has
+  started (FR-18).
 
 ### Metrics defined by this spec
 
@@ -718,11 +814,16 @@ Metric label names reserved by this spec for errors: `error_class` (FR-29
 class enum) and `error_detail` (FR-29 detail enum, only where the catalog
 declares it).
 
+Metrics of feature specs are declared in those specs and added to the
+catalog under FR-31 (for SPEC-002: SPEC-002 Interfaces, "Metrics added by
+this spec"). They are not repeated here.
+
 ### Project artifacts owned by this spec
 
 - Domain import allowlist (FR-1), currently empty.
 - Logger component set (FR-7).
 - Log attribute-key allowlist (FR-39).
+- Metric label-name allowlist (FR-11).
 - Central command-name allowlist and alias table (FR-12).
 - Collection-name command list (FR-40).
 - Error-class enum (FR-29).
@@ -1143,6 +1244,29 @@ attribute rules but are subject to FR-24.
     tracing off, or with `OTEL_TRACES_EXPORTER=none`, an `http://` endpoint
     with valid TLS variables produces no FR-41 record. With no endpoint
     variable set and a valid CA certificate set, no FR-41 record is emitted.
+- **AC-41** (FR-7, FR-11, FR-12, FR-13, FR-18, FR-23, FR-29, FR-31, FR-39;
+  Amendment 3): Unit:
+  - the logger factory accepts `proxy`, `pool` and `upstream`;
+  - the command allowlist equals exactly the 27 FR-12 names. Each maps to
+    itself for metric labels, and `GetMore` (wrong case) maps to `other`;
+  - the metric label-name allowlist equals exactly the nine FR-11 names. The
+    AC-8 lint rejects a catalog entry with any other label name, and rejects
+    an `outcome`, `reason`, `state`, `side`, `opcode` or `kind` label that
+    has a value equal to an FR-29 class or detail value;
+  - the readiness reason set equals exactly the six FR-18 reasons. A
+    readiness-port fake reporting each of `upstream_unavailable`,
+    `upstream_auth_failed` and `upstream_incompatible` yields 503 with that
+    body;
+  - the error-class enum equals exactly the seven FR-29 classes, and the
+    detail enum equals exactly the 28 FR-29 details. Each Amendment 3 detail
+    is reported with its declared class;
+  - the AC-5 test handler accepts a `reason` attribute with a string value,
+    rejects a `reason` attribute with a non-string value (number, bool,
+    group or other kind), and still rejects unknown keys;
+  - the AC-8 lint accepts an `error_class` label that includes `rejected`;
+  - a synthesized error with class `server` (detail `upstream_auth_failed`)
+    yields a span and a log record with no `db.response.status_code` and no
+    `corral.db.response.code_name`.
 
 ### Part B: convention checks every feature spec inherits, re-runs and extends
 
@@ -1247,6 +1371,9 @@ They are not part of SPEC-001's acceptance gate.
   attribute.
 - FR-36: the operator documentation contains all three required statements.
 - FR-38: log output is synchronous, and the accepted stall risk is documented.
+- FR-39 (Amendment 3): every `reason` value emitted comes from the
+  enumeration that the owning feature spec declares for that event (for
+  SPEC-002: Interfaces, "Log components and events").
 
 ## Open questions
 
@@ -1299,3 +1426,7 @@ None.
 | 2026-10-24 | Auth-success records are logged at debug only, the same as handshake and hello records (OD-5). | Owner decision. |
 | 2026-10-24 | Amendment 1: (1) metric label names for errors are `error_class` and `error_detail` (snake_case per FR-10); the span/log attribute stays `corral.error.detail` (FR-11, FR-29, AC-8). (2) Component `thirdparty` added to the FR-7 set; Go standard `log` package records and third-party `slog.Default()` calls are routed with component `thirdparty` and a fixed constant message, never the third-party text (FR-7, FR-28, FR-39, AC-5, AC-26). (3) `/readyz` adds reasons `unknown` (503, a check reported a reason outside the defined set) and `shutting_down` (503, from the start of graceful shutdown); bodies are `<reason>\n` / `ok\n` with `Content-Type: text/plain; charset=utf-8`; before startup completes it returns 503 `starting` without consulting registered checks (FR-18, AC-13, AC-31). (4) `thirdparty` records keep the source's level (std `log` records are info) and are rate-limited per source (std `log` bridge, `slog.Default()` bridge) and level, at most 1 per 30s with `suppressed_count` (FR-28, AC-26). (5) Graceful shutdown starts when corral emits the `lifecycle` shutting-down record; `/readyz` returns 503 `shutting_down` from then (FR-18, AC-31). (6) Feature specs add readiness reasons by amending this spec, as for FR-12 and FR-40 (FR-18). Points 4 to 6 close gaps found while drafting and were relayed by the Orchestrator. | Amendment 1, 2026-10-24, requested by the Orchestrator under the Owner's standing instruction (2026-10-24). Drafted in `specs/drafts/` by the spec-writer, which may not edit approved specs. Approved and promoted to `specs/` by the Owner, 2026-10-24. |
 | 2026-10-24 | Amendment 2: when the effective OTLP traces endpoint (`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, else `OTEL_EXPORTER_OTLP_ENDPOINT`) uses `http://`, the exporter's effective transport uses no TLS for both `http/protobuf` and `grpc`: corral overrides any TLS configuration the SDK derives from the certificate, client-certificate and client-key variables (general and `_TRACES_`) and from `OTEL_EXPORTER_OTLP_INSECURE` / `_TRACES_INSECURE`. Startup continues normally (not a config error, not fatal), and exactly one FR-41 warn record (subject to FR-6) is emitted with `component=config`, a fixed constant message, and `setting` listing the names of the ignored variables. Variable values (file paths) are not logged, because FR-7/FR-27 allow only names in configuration records; file contents stay banned (FR-24). FR-27 PEM/readability validation still applies; when it fails, startup fails and no FR-41 record is emitted. "Set" means non-empty after trimming whitespace, as in the SDK. `https://` and no-endpoint defaults are unchanged (FR-7, FR-20, FR-41, AC-33, AC-40, Verified by review). Deliberately out of scope and left SDK-defined: TLS variables with `INSECURE=true` on an `https://` or default endpoint, and TLS variables with a gRPC `unix://` endpoint. Protocol behaviour there is known to diverge, and any startup failure there is reported through the existing startup error rules (FR-27, FR-29); no new behaviour is added. The Owner declined two further proposals for now, and they are not added: a warning when auth headers are sent over a plaintext endpoint, and a wider FR-30 resource-attribute ban list. | Owner decision, 2026-10-24, answering an escalated ambiguity: Go OTel SDK v1.47 behaves inconsistently with TLS settings and an `http://` endpoint (otlptracehttp refuses to start; otlptracegrpc silently uses TLS). Drafted in `specs/drafts/` by the spec-writer; approved and promoted to `specs/` by the Owner, 2026-10-24. |
+| 2026-10-24 | Amendment 3 (for SPEC-002, proxy core), **Q12 package content**: (1) components `proxy`, `pool` and `upstream` added to the FR-7 set. (2) 25 SPEC-002 commands added to the FR-12 allowlist; with `other`, a `command` label has 28 values, and SPEC-002's `command` × 3-value `outcome` metric has 84 series, within the FR-13 cap. (3) Readiness reasons `upstream_unavailable`, `upstream_auth_failed` and `upstream_incompatible` added to the FR-18 set. (4) Error class `rejected` added (7 classes), with the Q12 error details and their classes (FR-29). (5) Log key `reason` added to the FR-39 allowlist. FR-40 is unchanged, and there are no span-name or span-attribute allowlist changes: SPEC-002 uses only existing FR-23 attributes. | Package content approved by the Owner via SPEC-002 Q12, 2026-10-24 (relayed by the Orchestrator). Drafted in `specs/drafts/` by the spec-writer, which may not edit approved specs. Promotion to `specs/` awaits Owner approval of this text. |
+| 2026-10-24 | Amendment 3, **additions beyond the Q12 package**, from the spec-writer's drafting and from challenge-review fixes. Each needs Owner approval of the text before promotion: (a) the FR-12 allowlist is written out in the spec, including `find` and `hello`, which were previously only in code. (b) FR-11 gains a closed label-name allowlist, which ADR-0004 already enforced in code but SPEC-001 never listed: the original `command`, `error_class` and `error_detail`, plus `outcome`, `reason`, `side`, `state`, `opcode` and `kind` for SPEC-002. (c) An FR-11 rule: outcome and cause labels hold non-error categories, may use coarse error values, and may not use FR-29 class or detail values, with a matching lint check (AC-41). (d) FR-31 reworded: feature specs add metrics without amending this spec only when their label names are already allowlisted. (e) Three details beyond the package: `upstream_incompatible` (class `config`), `command_blocked` (`rejected`, needed by the Owner's 2026-10-24 decision to block cross-client admin commands) and `handshake_rejected` (`rejected`). Every SPEC-002 synthesized error now has a class and a detail. The protocol tokens are unified into one vocabulary (SPEC-002 no longer uses `invalid_length`, `compressed` or `invalid_flags`), and an "Emitted by" column was added. The meaning of `upstream_unavailable` is narrowed to "never reached since startup", following the Owner's 2026-10-24 "wait when transient" decision. (f) `upstream_auth_failed` is narrowed to an auth error reply or a failed SCRAM server-signature check; network errors and timeouts keep their own details. (g) FR-23 / FR-29: "server errors" means errors carried in an upstream reply, and synthesized errors never carry `db.response.status_code` or `corral.db.response.code_name` in any signal. (h) The FR-29 `other` row is reworded. (i) FR-18: precedence among reasons is defined only in SPEC-002 FR-46, and exactly one reason is reported when not ready. (j) Non-goals, FR-18 and Interfaces name SPEC-002 as the pooling spec; "Metric label-name allowlist" added to the artifacts list; AC-41 added (including rejection of a non-string `reason`); one "Verified by review" item. | Challenge review REQUEST_CHANGES (M1, M2, S1 to S7), relayed by the Orchestrator, 2026-10-24. No product decision was taken by the spec-writer beyond those listed for Owner approval. |
+| 2026-10-24 | Amendment 3, revision 3: optional wording fixes from the re-review, which returned APPROVE. None changes an Owner decision or the Q12 package; all are part of the text awaiting Owner approval: (a) FR-11 opening: errors are labelled only by `error_class`, or `error_detail` where the catalog declares it. (b) FR-29 `other` row: synthesized error replies (SPEC-002 Interfaces) always use specific details. (c) FR-29 note: `upstream_unavailable` means "never reached since startup" as a detail, but any unavailable state as a readiness reason. (d) `rejected` definition names blocked commands and authentication commands. (e) FR-32: a `moreToCome` exchange has a checkout child whenever a checkout happens; corral's own follow-up exchanges (SPEC-002's barrier `ping`) get no span. (f) The `upstream_auth_failed` meaning is aligned with SPEC-002 revision 4: codes 18 and 334, or a failed SCRAM signature check. | Re-review APPROVE with optional wording, relayed by the Orchestrator, 2026-10-24. |
+| 2026-10-24 | Amendment 3 text (revision 3), including additions (a)–(j) beyond the Q12 package, approved by the Owner and promoted to `specs/`. | Owner approval, 2026-10-24. |
