@@ -719,3 +719,26 @@ func TestIndependentCollectors(t *testing.T) {
 		t.Errorf("collector b saw traffic meant for a")
 	}
 }
+
+// Reject body and message options: the configured synthetic text is echoed.
+func TestRejectEchoesConfiguredText(t *testing.T) {
+	const text = "echo-synthetic-text-0123456789"
+	c := otlpcollector.Start(t, otlpcollector.WithMode(otlpcollector.ModeReject),
+		otlpcollector.WithHTTPRejectStatus(401), otlpcollector.WithHTTPRejectBody(text),
+		otlpcollector.WithGRPCRejectCode(codes.Unauthenticated), otlpcollector.WithGRPCRejectMessage(text))
+
+	resp, err := http.Post("http://"+c.HTTPEndpoint()+"/v1/traces", "application/x-protobuf", bytes.NewReader(nil))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 401 || !strings.Contains(string(body), text) {
+		t.Errorf("HTTP reject: status %d body %q, want 401 echoing the configured body", resp.StatusCode, body)
+	}
+
+	err = export(newGRPCExp(t, c), 5*time.Second)
+	if err == nil || !strings.Contains(err.Error(), text) {
+		t.Errorf("gRPC reject error %v does not carry the configured message", err)
+	}
+}

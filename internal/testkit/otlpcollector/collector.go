@@ -84,7 +84,11 @@ type config struct {
 	mode       Mode
 	httpStatus int
 	grpcCode   codes.Code
+	httpBody   string
+	grpcMsg    string
 }
+
+const defaultRejectText = "rejected by fake collector"
 
 // WithMode sets the initial mode.
 func WithMode(m Mode) Option { return func(c *config) { c.mode = m } }
@@ -94,6 +98,33 @@ func WithHTTPRejectStatus(s int) Option { return func(c *config) { c.httpStatus 
 
 // WithGRPCRejectCode sets the gRPC code returned in ModeReject.
 func WithGRPCRejectCode(code codes.Code) Option { return func(c *config) { c.grpcCode = code } }
+
+// WithHTTPRejectBody sets the HTTP response body returned in ModeReject
+// (default "rejected by fake collector"). The body is truncated to
+// MaxBodyBytes. Test-only: it lets a test make the fake collector echo text
+// back to the code under test; that text is synthetic and must never contain
+// real credentials or customer data.
+func WithHTTPRejectBody(body string) Option {
+	return func(c *config) {
+		if len(body) > MaxBodyBytes {
+			body = body[:MaxBodyBytes]
+		}
+		c.httpBody = body
+	}
+}
+
+// WithGRPCRejectMessage sets the gRPC status message returned in ModeReject
+// (default "rejected by fake collector"). The message is truncated to
+// MaxBodyBytes. Test-only: the echoed text is synthetic and must never
+// contain real credentials or customer data.
+func WithGRPCRejectMessage(msg string) Option {
+	return func(c *config) {
+		if len(msg) > MaxBodyBytes {
+			msg = msg[:MaxBodyBytes]
+		}
+		c.grpcMsg = msg
+	}
+}
 
 // Collector is the fake collector. Create it with Start.
 type Collector struct {
@@ -124,7 +155,8 @@ type Collector struct {
 func Start(tb testing.TB, opts ...Option) *Collector {
 	tb.Helper()
 	c := &Collector{
-		cfg:  config{mode: ModeAccept, httpStatus: http.StatusServiceUnavailable, grpcCode: codes.Unavailable},
+		cfg: config{mode: ModeAccept, httpStatus: http.StatusServiceUnavailable, grpcCode: codes.Unavailable,
+			httpBody: defaultRejectText, grpcMsg: defaultRejectText},
 		done: make(chan struct{}),
 	}
 	for _, o := range opts {
@@ -411,7 +443,7 @@ func (c *Collector) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	case ModeReject:
 		// Reject mode answers regardless of method or body, so the
 		// configured status always reaches the client.
-		http.Error(w, "rejected by fake collector", c.cfg.httpStatus)
+		http.Error(w, c.cfg.httpBody, c.cfg.httpStatus)
 		return
 	}
 
@@ -520,7 +552,7 @@ func (g grpcService) Export(ctx context.Context, req *collectortrace.ExportTrace
 		}
 		return nil, status.Error(codes.Unavailable, "collector closed")
 	case ModeReject:
-		return nil, status.Error(c.cfg.grpcCode, "rejected by fake collector")
+		return nil, status.Error(c.cfg.grpcCode, c.cfg.grpcMsg)
 	}
 	c.recordTraces(req)
 	return &collectortrace.ExportTraceServiceResponse{}, nil
