@@ -20,6 +20,8 @@ import (
 type DropCounter interface{ Add(float64) }
 
 // Config holds the queue and export settings (OTEL_BSP_* mapping, FR-37).
+// Values are expected to be validated upstream (FR-27, T10); the clamping and
+// fallbacks in New are defence in depth only.
 type Config struct {
 	MaxQueueSize       int
 	MaxExportBatchSize int
@@ -59,6 +61,7 @@ func realTicker(d time.Duration) (<-chan time.Time, func()) {
 
 type flushReq struct {
 	ctx   context.Context
+	limit int // max spans to export: the queue length when ForceFlush was called
 	reply chan error
 }
 
@@ -70,7 +73,8 @@ type Processor struct {
 	dropped   DropCounter
 	newTicker NewTicker
 
-	mu      sync.Mutex
+	mu sync.Mutex // guards queue and stopped
+	// queue is a mutex-guarded slice (not a channel) so Shutdown can clear it atomically.
 	queue   []sdktrace.ReadOnlySpan
 	stopped bool
 
@@ -164,7 +168,7 @@ func (p *Processor) ForceFlush(ctx context.Context) error {
 }
 
 func (p *Processor) flush(ctx context.Context) error {
-	req := flushReq{ctx: ctx, reply: make(chan error, 1)}
+	req := flushReq{ctx: ctx, limit: p.queueLen(), reply: make(chan error, 1)}
 	select {
 	case p.flushCh <- req:
 	case <-p.done:
@@ -189,9 +193,10 @@ func (p *Processor) Shutdown(ctx context.Context) error {
 		p.mu.Unlock()
 		select {
 		case <-p.closed:
+			return nil
 		case <-ctx.Done():
+			return ctx.Err()
 		}
-		return nil
 	}
 	p.stopped = true
 	p.mu.Unlock()
@@ -205,13 +210,13 @@ func (p *Processor) Shutdown(ctx context.Context) error {
 	p.queue = nil
 	p.mu.Unlock()
 	if err != nil {
+		// Abort the in-flight export before waiting for the worker to exit.
 		p.baseCancel()
 	}
 	close(p.stop)
 	select {
 	case <-p.done:
 	case <-ctx.Done():
-		p.baseCancel()
 	}
 	p.baseCancel()
 
@@ -230,19 +235,27 @@ func (p *Processor) run() {
 		case <-p.stop:
 			return
 		case <-tick:
-			p.drain(nil, 1)
+			p.drain(nil, 1, p.queueLen())
 		case <-p.wake:
-			p.drain(nil, p.cfg.MaxExportBatchSize)
+			p.drain(nil, p.cfg.MaxExportBatchSize, p.queueLen())
+			// The drain is bounded; re-arm if a full batch is still queued.
+			if p.queueLen() >= p.cfg.MaxExportBatchSize {
+				select {
+				case p.wake <- struct{}{}:
+				default:
+				}
+			}
 		case req := <-p.flushCh:
-			req.reply <- p.drain(req.ctx, 1)
+			req.reply <- p.drain(req.ctx, 1, req.limit)
 		}
 	}
 }
 
 // drain exports batches while at least min spans are queued. If ctx is
-// non-nil it is checked between batches.
-func (p *Processor) drain(ctx context.Context, min int) error {
-	for {
+// non-nil it is checked between batches. If limit >= 0, at most limit spans
+// are exported in total.
+func (p *Processor) drain(ctx context.Context, min, limit int) error {
+	for limit != 0 {
 		if ctx != nil {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -253,15 +266,19 @@ func (p *Processor) drain(ctx context.Context, min int) error {
 			return nil
 		default:
 		}
-		batch := p.take(min)
+		batch := p.take(min, limit)
 		if batch == nil {
 			return nil
 		}
 		p.export(batch)
+		if limit >= 0 {
+			limit -= len(batch)
+		}
 	}
+	return nil
 }
 
-func (p *Processor) take(min int) []sdktrace.ReadOnlySpan {
+func (p *Processor) take(min, limit int) []sdktrace.ReadOnlySpan {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	n := len(p.queue)
@@ -270,6 +287,12 @@ func (p *Processor) take(min int) []sdktrace.ReadOnlySpan {
 	}
 	if n > p.cfg.MaxExportBatchSize {
 		n = p.cfg.MaxExportBatchSize
+	}
+	if limit >= 0 && n > limit {
+		if limit < min {
+			return nil // never export a partial batch on a size trigger
+		}
+		n = limit
 	}
 	batch := make([]sdktrace.ReadOnlySpan, n)
 	copy(batch, p.queue[:n])
@@ -285,4 +308,13 @@ func (p *Processor) export(batch []sdktrace.ReadOnlySpan) {
 	if err := p.exp.ExportSpans(ctx, batch); err != nil {
 		otel.Handle(err)
 	}
+}
+
+// queueLen returns the current queue length. Timer and wake drains are bounded
+// by it so the worker returns to its select loop (and serves flushes) under
+// continuous load.
+func (p *Processor) queueLen() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.queue)
 }
