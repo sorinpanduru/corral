@@ -293,8 +293,34 @@ OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE=<YOUR_CLIENT_CERT_PEM_PATH>
 OTEL_EXPORTER_OTLP_CLIENT_KEY=<YOUR_CLIENT_KEY_PEM_PATH>
 ```
 
-Headers sent over a plain `http://` endpoint (or with `..._INSECURE=true`) are
-not encrypted; corral does not warn about this today.
+#### Plaintext `http://` endpoints (FR-41)
+
+The effective traces endpoint is `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` if set,
+otherwise `OTEL_EXPORTER_OTLP_ENDPOINT` (values are trimmed; the scheme is
+case-insensitive). When it uses `http://`, the connection is plaintext for
+both the `http/protobuf` and the `grpc` protocol:
+
+- `OTEL_EXPORTER_OTLP_INSECURE` and its `_TRACES_` form are overridden, even
+  when set to `false`.
+- The TLS variables (`..._CERTIFICATE`, `..._CLIENT_CERTIFICATE`,
+  `..._CLIENT_KEY`, and their `_TRACES_` forms) are not passed to the exporter.
+  This is not an error and startup continues. The files are still validated
+  (readable, valid PEM); an invalid file is still fatal.
+- If at least one TLS variable is set, corral logs one `WARN` record with
+  `component=config` before the startup-complete record. Its message is exactly
+  `OTLP TLS settings ignored because the traces endpoint uses http://`, and its
+  `setting` attribute lists the names of the ignored variables, sorted and
+  comma-separated. It never contains values, paths, file contents or the
+  endpoint URL.
+
+With an `https://` endpoint, no endpoint, or another scheme, behaviour is
+unchanged and there is no such record.
+
+**Caution:** over `http://`, span data and the values of
+`OTEL_EXPORTER_OTLP_HEADERS` / `OTEL_EXPORTER_OTLP_TRACES_HEADERS` (which may
+carry authentication tokens such as `<YOUR_API_KEY>`) are sent unencrypted.
+Use `https://` for any collector outside a trusted network. corral does not
+warn about headers sent over `http://`.
 
 ### Precedence
 
