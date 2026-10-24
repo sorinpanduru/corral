@@ -6,6 +6,7 @@ import (
 	"context"
 	"log/slog"
 	sl "log/slog"
+	"time"
 )
 
 const prefix = "synthetic prefix"
@@ -48,6 +49,11 @@ func Calls(ctx context.Context, l *slog.Logger, dynamic string) {
 	slog.Default().Info("synthetic default")
 	// A dynamic value as an attribute value or message-less call is fine.
 	l.Info("synthetic", "setting", dynamic)
+	// Method expression with a constant message.
+	(*slog.Logger).Info(l, "synthetic method expression")
+	(*slog.Logger).Log(l, ctx, slog.LevelInfo, "synthetic method expression")
+	// Record construction with a constant message.
+	_ = slog.NewRecord(time.Time{}, slog.LevelInfo, "synthetic record", 0)
 	// Not slog: a type with a similarly named method is not checked.
 	var f fake
 	f.Info(dynamic)

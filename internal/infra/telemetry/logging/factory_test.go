@@ -110,6 +110,11 @@ func TestBootstrapLogger(t *testing.T) {
 	if r["setting"] != "log.level" || r["error"] != "config" {
 		t.Errorf("attributes lost: %v", r)
 	}
+	for k := range r {
+		if !logging.AllowedKey(k) {
+			t.Errorf("bootstrap output key %q is not allowlisted (FR-39)", k)
+		}
+	}
 }
 
 // FR-27: the bootstrap logger suppresses debug output.

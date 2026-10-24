@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"runtime"
 	"strings"
@@ -32,10 +33,10 @@ func (f *fakeTB) record(m string) {
 	f.failed = true
 	f.msgs = append(f.msgs, m)
 }
-func (f *fakeTB) Error(args ...any)                 { f.record("error") }
-func (f *fakeTB) Errorf(format string, args ...any) { f.record(format) }
-func (f *fakeTB) Fatal(args ...any)                 { f.record("fatal"); runtime.Goexit() }
-func (f *fakeTB) Fatalf(format string, args ...any) { f.record(format); runtime.Goexit() }
+func (f *fakeTB) Error(args ...any)                 { f.record(fmt.Sprint(args...)) }
+func (f *fakeTB) Errorf(format string, args ...any) { f.record(fmt.Sprintf(format, args...)) }
+func (f *fakeTB) Fatal(args ...any)                 { f.record(fmt.Sprint(args...)); runtime.Goexit() }
+func (f *fakeTB) Fatalf(format string, args ...any) { f.record(fmt.Sprintf(format, args...)); runtime.Goexit() }
 func (f *fakeTB) Fail()                             { f.record("fail") }
 func (f *fakeTB) FailNow()                          { f.record("failnow"); runtime.Goexit() }
 func (f *fakeTB) Failed() bool {
@@ -389,4 +390,64 @@ func TestViolationDoesNotPanic(t *testing.T) {
 	if !ftb.Failed() {
 		t.Error("expected failure")
 	}
+}
+
+// FR-39: msg, level and time are produced by the handler, never by callers; a
+// caller attribute with one of these keys (call site or With) fails.
+func TestReservedHandlerKeysFail(t *testing.T) {
+	for _, k := range []string{"msg", "level", "time"} {
+		wantFail(t, k+"_call", func(h *logcheck.Handler) { lg(h, "config").Info("synthetic", k, "x") })
+		wantFail(t, k+"_with", func(h *logcheck.Handler) { lg(h, "config").With(k, "x").Info("synthetic") })
+		wantFail(t, k+"_call_no_component_with", func(h *logcheck.Handler) { slog.New(h).With("component", "config").Info("synthetic", slog.Int(k, 1)) })
+	}
+}
+
+// FR-7: exactly one component per record. A factory-bound component plus a
+// call-site component fails even when both are valid and even when equal.
+func TestDuplicateComponentFails(t *testing.T) {
+	wantFail(t, "valid_and_different", func(h *logcheck.Handler) { lg(h, "config").Info("synthetic", "component", "grpc") })
+	wantFail(t, "valid_and_same", func(h *logcheck.Handler) { lg(h, "config").Info("synthetic", "component", "config") })
+	wantFail(t, "with_twice", func(h *logcheck.Handler) { lg(h, "config").With("component", "otel").Info("synthetic") })
+	wantFail(t, "via_factory", func(h *logcheck.Handler) {
+		l, _ := logging.NewFactory(h).Logger(logging.Tracing)
+		l.Info("synthetic", "component", "tracing")
+	})
+}
+
+// A failure message must identify the offending record (message and level)
+// so the author can find the log call. It must not need attribute values.
+func TestFailureMessagesIncludeRecordMessageAndLevel(t *testing.T) {
+	cases := []struct {
+		name  string
+		level slog.Level
+		fn    func(l *slog.Logger, msg string)
+	}{
+		{"warn_bad_key", slog.LevelWarn, func(l *slog.Logger, msg string) { l.Warn(msg, "bad_key", "v") }},
+		{"error_group", slog.LevelError, func(l *slog.Logger, msg string) { l.Error(msg, slog.Group("g", slog.Int("retry_count", 1))) }},
+		{"debug_nonnumeric", slog.LevelDebug, func(l *slog.Logger, msg string) { l.Debug(msg, "x_count", "n") }},
+		{"info_dup_component", slog.LevelInfo, func(l *slog.Logger, msg string) { l.Info(msg, "component", "grpc") }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			msg := "synthetic-marker-" + c.name
+			ftb, _ := run(t, func(h *logcheck.Handler) { c.fn(lg(h, "config"), msg) })
+			if !ftb.Failed() {
+				t.Fatal("expected failure")
+			}
+			all := strings.Join(ftb.msgs, "\n")
+			if !strings.Contains(all, msg) {
+				t.Errorf("failure text lacks the record message: %q", all)
+			}
+			if !strings.Contains(strings.ToUpper(all), c.level.String()) {
+				t.Errorf("failure text lacks the level %s: %q", c.level, all)
+			}
+		})
+	}
+	t.Run("missing_component", func(t *testing.T) {
+		ftb, _ := run(t, func(h *logcheck.Handler) { slog.New(h).Info("synthetic-marker-nocomp") })
+		all := strings.Join(ftb.msgs, "\n")
+		if !strings.Contains(all, "synthetic-marker-nocomp") || !strings.Contains(strings.ToUpper(all), "INFO") {
+			t.Errorf("failure text = %q", all)
+		}
+	})
 }

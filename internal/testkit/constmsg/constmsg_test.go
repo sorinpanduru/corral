@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"os"
 	"path/filepath"
-	"sort"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -20,22 +20,40 @@ func fixture(t *testing.T) string {
 	return dir
 }
 
-// wantLines returns the 1-based line numbers carrying a "// want" marker.
-func wantLines(t *testing.T, path string) []int {
+type loc struct {
+	file string
+	line int
+}
+
+// wantLocs returns, for every .go file in dir (build tags ignored), the lines
+// ending in "// want" or "// want value".
+func wantLocs(t *testing.T, dir string) (all []loc, value map[loc]bool) {
 	t.Helper()
-	f, err := os.Open(path)
-	if err != nil {
-		t.Fatal(err)
+	value = map[loc]bool{}
+	files, err := filepath.Glob(filepath.Join(dir, "*.go"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("no fixture files in %s: %v", dir, err)
 	}
-	defer f.Close()
-	var out []int
-	sc := bufio.NewScanner(f)
-	for n := 1; sc.Scan(); n++ {
-		if strings.HasSuffix(strings.TrimSpace(sc.Text()), "// want") {
-			out = append(out, n)
+	for _, path := range files {
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
 		}
+		sc := bufio.NewScanner(f)
+		for n := 1; sc.Scan(); n++ {
+			txt := strings.TrimSpace(sc.Text())
+			l := loc{filepath.Base(path), n}
+			switch {
+			case strings.HasSuffix(txt, "// want value"):
+				all = append(all, l)
+				value[l] = true
+			case strings.HasSuffix(txt, "// want"):
+				all = append(all, l)
+			}
+		}
+		f.Close()
 	}
-	return out
+	return all, value
 }
 
 // AC-5 (static check): a package whose slog messages are all constants (and
@@ -52,41 +70,65 @@ func TestConstantMessagesAreNotReported(t *testing.T) {
 
 // AC-5 (static check), FR-39: every slog call whose message is not a
 // compile-time constant is reported, at the right file and line, across all
-// package-level functions and *slog.Logger methods taking a message.
+// package-level functions and *slog.Logger methods taking a message, method
+// expressions, slog.NewRecord, multi-value spreads (fail closed), and files
+// behind the functional build tag (Check must load with that tag). Method
+// values and function variables are reported as "used as a value".
 func TestNonConstantMessagesAreReported(t *testing.T) {
 	dir := fixture(t)
 	fs, err := constmsg.Check(dir, "./bad")
 	if err != nil {
 		t.Fatalf("Check: %v", err)
 	}
-	want := wantLines(t, filepath.Join(dir, "bad", "bad.go"))
-	if len(want) < 20 {
+	want, value := wantLocs(t, filepath.Join(dir, "bad"))
+	if len(want) < 28 {
 		t.Fatalf("fixture has only %d want markers", len(want))
 	}
-	var got []int
+	got := map[loc]constmsg.Finding{}
 	for _, f := range fs {
-		if filepath.Base(f.File) != "bad.go" {
-			t.Errorf("finding in unexpected file %q", f.File)
+		l := loc{filepath.Base(f.File), f.Line}
+		if _, dup := got[l]; dup {
+			t.Errorf("duplicate finding at %v", l)
 		}
-		got = append(got, f.Line)
+		got[l] = f
 	}
-	sort.Ints(got)
-	if len(got) != len(want) {
-		t.Fatalf("findings = %d (lines %v), want %d (lines %v)", len(got), got, len(want), want)
+	for _, l := range want {
+		f, ok := got[l]
+		if !ok {
+			t.Errorf("missing finding at %s:%d", l.file, l.line)
+			continue
+		}
+		if value[l] && !strings.Contains(f.Message, "used as a value") {
+			t.Errorf("%s:%d message %q lacks %q", l.file, l.line, f.Message, "used as a value")
+		}
+		delete(got, l)
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("finding lines = %v, want %v", got, want)
-			break
+	for l := range got {
+		t.Errorf("unexpected finding at %s:%d", l.file, l.line)
+	}
+}
+
+// AC-5: the file behind //go:build functional is reported without the caller
+// passing any tag.
+func TestBuildTaggedFilesAreChecked(t *testing.T) {
+	fs, err := constmsg.Check(fixture(t), "./bad")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range fs {
+		if filepath.Base(f.File) == "tagged.go" {
+			return
 		}
 	}
+	t.Error("no finding from the //go:build functional file tagged.go")
 }
 
 // AC-5: the pattern list is honoured; both packages together report exactly
 // the bad ones, and "./..." finds them as well.
 func TestPatternsSelectPackages(t *testing.T) {
 	dir := fixture(t)
-	want := len(wantLines(t, filepath.Join(dir, "bad", "bad.go")))
+	all, _ := wantLocs(t, filepath.Join(dir, "bad"))
+	want := len(all)
 	for _, patterns := range [][]string{{"./..."}, {"./good", "./bad"}} {
 		fs, err := constmsg.Check(dir, patterns...)
 		if err != nil {
@@ -104,5 +146,42 @@ func TestLoadFailureIsError(t *testing.T) {
 	fs, err := constmsg.Check(filepath.Join(t.TempDir(), "does-not-exist"), "./...")
 	if err == nil {
 		t.Fatalf("Check on a missing directory succeeded with %d findings", len(fs))
+	}
+}
+
+// writeFakeTool creates an executable script in dir that records its
+// execution in sentinel.
+func writeFakeTool(t *testing.T, dir, name, sentinel string) {
+	t.Helper()
+	script := "#!/bin/sh\necho ran >> '" + sentinel + "'\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Hermetic load: Check must set GOPACKAGESDRIVER=off and CGO_ENABLED=0 for the
+// load, so neither an external packages driver found on PATH nor a C
+// toolchain is ever executed, whatever the caller's environment says.
+func TestLoadIsHermetic(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fakes need a unix-like system")
+	}
+	bin := t.TempDir()
+	sentinel := filepath.Join(t.TempDir(), "executed")
+	writeFakeTool(t, bin, "gopackagesdriver", sentinel)
+	for _, cc := range []string{"gcc", "cc", "clang"} {
+		writeFakeTool(t, bin, cc, sentinel)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GOPACKAGESDRIVER", "") // unset-equivalent: go/packages would search PATH
+	t.Setenv("CGO_ENABLED", "1")
+	t.Setenv("CC", filepath.Join(bin, "gcc"))
+
+	if _, err := constmsg.Check(fixture(t), "./hermetic", "./good"); err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if _, err := os.Stat(sentinel); err == nil {
+		b, _ := os.ReadFile(sentinel)
+		t.Errorf("an external tool (gopackagesdriver or C compiler) was executed %d time(s)", strings.Count(string(b), "ran"))
 	}
 }

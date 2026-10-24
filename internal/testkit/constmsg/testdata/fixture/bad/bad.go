@@ -8,7 +8,12 @@ import (
 	"fmt"
 	"log/slog"
 	sl "log/slog"
+	"time"
 )
+
+var fv = slog.Info // want value
+
+func two() (context.Context, string) { return context.Background(), "synthetic" }
 
 var global = "synthetic global"
 
@@ -39,6 +44,18 @@ func Calls(ctx context.Context, l *slog.Logger, param string, h holder, err erro
 	l.With("setting", "x").WithGroup("g").Info(param) // want
 	slog.Default().Info(param)                        // want
 	l.Info(string([]byte(param)))                     // want
+
+	// Used as a value: the call target cannot be tracked, so the use is reported.
+	f := l.Info // want value
+	f(param)
+	fv(param)
+
+	// Method expression: reported on the message argument.
+	(*slog.Logger).Log(l, ctx, slog.LevelInfo, param) // want
+	// Record construction with a non-constant message.
+	_ = slog.NewRecord(time.Time{}, slog.LevelInfo, param, 0) // want
+	// Multi-value spread: the message cannot be proven constant (fail closed).
+	slog.InfoContext(two()) // want
 
 	// Constant calls in the same function are not reported.
 	l.Info("synthetic constant")

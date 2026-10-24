@@ -18,10 +18,17 @@ import (
 // handler is exercised unchanged while logcheck validates the record.
 type fanout struct{ out, check slog.Handler }
 
-func (f fanout) Enabled(ctx context.Context, l slog.Level) bool { return f.out.Enabled(ctx, l) }
+// Enabled is true whenever either side is enabled, so records below the output
+// level still reach logcheck; only out.Handle is level-gated.
+func (f fanout) Enabled(ctx context.Context, l slog.Level) bool {
+	return f.check.Enabled(ctx, l) || f.out.Enabled(ctx, l)
+}
 func (f fanout) Handle(ctx context.Context, r slog.Record) error {
 	if err := f.check.Handle(ctx, r.Clone()); err != nil {
 		return err
+	}
+	if !f.out.Enabled(ctx, r.Level) {
+		return nil
 	}
 	return f.out.Handle(ctx, r)
 }
