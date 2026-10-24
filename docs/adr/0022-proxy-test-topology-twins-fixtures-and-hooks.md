@@ -3,7 +3,8 @@
 - Status: Accepted (planner, 2026-10-24, for SPEC-002). Extends ADR-0014 and
   ADR-0005. The new network access (Docker on Linux with host networking,
   Docker Hub images, PECL, all pinned) was granted by the Owner on
-  2026-10-24 (P1 in `plans/SPEC-002.md`).
+  2026-10-24 (P1 in `plans/SPEC-002.md`). SPEC-002 Amendment 1 (FR-64)
+  makes the hook set normative. Updated the same day.
 - Related: SPEC-002 FR-54, AC types (unit, twin, functional), AC-1, AC-12,
   AC-14, AC-16, AC-19 to AC-22, AC-26, AC-30, AC-35; ADR-0001, ADR-0005,
   ADR-0014
@@ -87,6 +88,19 @@ The `corraltest` build (`cmd/corral/testbuild_on.go`) adds:
 | `CORRALTEST_POOL_ORDER=roundrobin` | The pool hands out idle connections in round-robin order (AC-16). The default is most-recently-used. |
 | `CORRALTEST_PANIC_COMMAND=<name>` | The client handler panics after classifying a message whose command name equals `<name>` (AC-22). |
 | `CORRALTEST_PROBE_LISTEN=127.0.0.1:0` | Starts a loopback-only HTTP probe server and writes its address to `<CORRALTEST_HOLD_DIR>/probe.addr`. `GET /conns` returns JSON with, per client connection ID, the bytes read for the current message before a lease, the maximum bytes read before a lease, and the peak bytes held for one reply. `GET /constants` returns the request buffer limit and the reply chunk. It exposes counts only, never message bytes. |
+
+Amendment 1 (FR-64, AC-47, AC-48) adds one hold point and makes the
+following normative:
+
+- Extra hold point `shutdown_drain`: while held, the drain is kept open as
+  if an exchange were in progress. Releasing it lets the drain finish
+  normally, and a second signal (FR-63) ends it at once. AC-47 uses this
+  point on a real `mongod`.
+- `GET /constants` returns `{"L": 65536, "K": 65536}`.
+- The production build (`make build`) contains no hook code. It never reads
+  any `CORRALTEST_*` variable, starts no probe server and creates no hold
+  file. SPEC-003 FR-8 does not report these variables, because they do not
+  start with `CORRAL_`.
 
 The production build (`testbuild_off.go`) has none of these. A lint test
 (extending SPEC-003 T14) asserts that the default build's closure contains no

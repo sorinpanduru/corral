@@ -97,12 +97,47 @@ client.
   monitored. A server that reports `arbiterOnly: true` is dropped from the
   known members.
 
-### Upstream close reasons (planner choice for the boundary cases)
+### Amendment 1 rules for upstream connections
+
+- **Unsolicited data on idle pool connections (FR-62, G-17).**
+  - While a pool connection is idle, `upstreamconn` runs a non-consuming
+    readability watch on it (the same netpoller peek as ADR-0018, for both
+    plaintext and TLS sockets). Readability on an idle connection means
+    either bytes or a close.
+    - Bytes: the connection is discarded with `reason=error`, counted as
+      an upstream protocol error `unexpected_response`, with the rate-limited
+      `upstream protocol error` record.
+    - Close: discarded with `reason=error`.
+  - As a second line, `pool.Conn.CheckIdle()` runs a zero-deadline
+    non-consuming probe at checkout, before any request byte is written. On
+    failure the pool discards the connection and continues the same
+    checkout with another connection: idle, newly opened, or waiting. The
+    checkout's wait time and timeout are unchanged.
+- **Not-primary marking by mode (FR-35, G-13, G-20).**
+  - The engine reports every forwarded reply's top-level `code` and
+    `writeConcernError.code`, and every barrier `ping` reply's top-level
+    `code`, to the monitor. The monitor applies the mode rule:
+    - replica-set mode: the FR-35 code list, top-level or
+      `writeConcernError`;
+    - single-`mongos` mode: only a top-level 91 or 11600 in an `ok: 0`
+      reply.
+  - `writeErrors` is never read.
+  - A barrier `ping` reply that marks the host also fails the barrier
+    (`reason=error`) (FR-29, G-12).
+- **"Reached" (FR-19, G-8).** "Reached" is set by the first target check
+  whose `hello` succeeded and passed FR-18, whatever the outcome of
+  authentication on that monitoring connection.
+- **Readiness follows monitoring (FR-46, G-9).** A failed pool connect,
+  TLS or timeout attempt never changes readiness directly. It only triggers
+  an immediate check. Pool authentication failures still set the
+  authentication state.
+
+### Upstream close reasons (accepted by the Owner, P7)
 
 | Cause | `kind=pool` `reason` | `kind=monitor` `reason` |
 |---|---|---|
 | idle past `upstream.max_idle_time` | `idle` | n/a |
-| upstream network or protocol failure, failed barrier, check failure, replaced monitoring connection | `error` | `error` |
+| upstream network or protocol failure, failed barrier (including a not-primary `ping` reply), unsolicited data or peer close on an idle pool connection (FR-62), check failure, replaced monitoring connection | `error` | `error` |
 | host marked not primary or unusable, or a primary change | `not_primary` | n/a (monitoring continues) |
 | discarded because the client side failed mid-exchange: client closed, client I/O timeout, late request validation failure | `client_abandoned` | n/a |
 | FR-47 step 5 | `shutdown` | `shutdown` |

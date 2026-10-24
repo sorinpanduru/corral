@@ -1,8 +1,8 @@
 # ADR-0018: Client connection handling: buffer limits, I/O timeouts, liveness and accounting
 
-- Status: Accepted (planner, 2026-10-24, for SPEC-002). The items marked
-  "planner choice" (P4, P8 in `plans/SPEC-002.md`) were accepted by the
-  Owner on 2026-10-24.
+- Status: Accepted (planner, 2026-10-24, for SPEC-002). The planner
+  choices (P4, P8) were accepted by the Owner, and SPEC-002 Amendment 1
+  made them normative (G-4, G-10, G-12, G-15, S4). Updated the same day.
 - Related: SPEC-002 FR-2, FR-4, FR-12, FR-38, FR-41, FR-44, FR-48, FR-57,
   FR-58, NFR resource bounds, AC-2, AC-19, AC-21, AC-34, AC-35
 
@@ -22,10 +22,9 @@
 - Prefix and chunk buffers are pooled (`sync.Pool`) and returned at the end
   of each exchange. No buffer outlives an exchange (Data and compliance:
   transit-only).
-- 64 KiB is the spec minimum. Every message corral answers or refuses
-  locally (handshakes, auth commands, blocked commands) is far smaller in
-  practice. Real `hello` documents are under 2 KiB, and drivers cap client
-  metadata at 512 bytes.
+- Since SPEC-002 Amendment 1 (G-10, FR-38, FR-58, FR-65), L = K = 65,536
+  bytes is normative, not a planner choice. L includes the 16-byte header.
+  The corraltest probe's `/constants` reports both (AC-48).
 
 ### Client I/O timeout (FR-57)
 
@@ -46,7 +45,9 @@
 
 - While a fully read request waits for a lease, or while its request is in
   flight upstream, the engine watches the client socket without consuming
-  bytes. On Linux it uses `syscall.RawConn.Read` with `recvfrom(MSG_PEEK |
+  bytes. It does **not** watch during a barrier `ping`: a barrier is not
+  "in flight" under FR-41 (Amendment 1, G-12). A barrier always runs to
+  completion, and on success the connection returns to the pool. On Linux it uses `syscall.RawConn.Read` with `recvfrom(MSG_PEEK |
   MSG_DONTWAIT)`. A 0-byte result means the peer closed, and EAGAIN means
   wait for readability through the netpoller. Any pending data means the
   client is alive, so watching stops (the client is pipelining).
@@ -57,16 +58,32 @@
   nothing is sent. Detected close while in flight: the upstream connection
   is discarded (`client_abandoned`).
 
-### Client TLS handshake (FR-44) (planner choice)
+### Client TLS handshake (FR-2, FR-44, FR-57; normative since Amendment 1, G-15)
 
-- The TLS handshake runs in the per-connection goroutine, bounded by
-  `proxy.client_io_timeout`. A failure or timeout closes the connection with
-  `reason=tls_failure` and the `client TLS handshake failed` record.
+- The connection limit is checked right after `Accept` and **before** the
+  TLS handshake starts. An over-limit connection is closed without any TLS
+  byte being sent: the listener accepts plain TCP and wraps it with
+  `tls.Server` only after admission.
+- The TLS handshake runs in the per-connection goroutine with a deadline of
+  `proxy.client_io_timeout`. A failure closes the connection with
+  `reason=tls_failure` and the `client TLS handshake failed` record. On
+  timeout the record carries class `timeout` and detail
+  `deadline_exceeded`.
 - `tls.Config` has `MinVersion: tls.VersionTLS12`. With
   `proxy.tls.client_ca_path` set it uses `ClientAuth:
   tls.RequireAndVerifyClientCert`. No certificate field is ever logged.
 
-### Connection accounting (planner choice)
+### Connection and request accounting (normative since Amendment 1, G-4 and S4)
+
+- A message that is closed by a client protocol error (FR-5 to FR-8,
+  FR-38, FR-60) or by a client I/O timeout, after its first byte was read,
+  counts as one request:
+  - `corral_requests_total{outcome="proxy_error"}`, with `command` = the
+    FR-12 label of the command name if it was read, else `other`;
+  - once in `corral_request_errors_total`, with class `protocol`, or
+    `timeout` for FR-57.
+
+  Connections closed before any message byte is read are not requests.
 
 - Every TCP connection accepted by the listener increments
   `corral_client_connections_accepted_total`, including connections over

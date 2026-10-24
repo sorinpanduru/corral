@@ -3,7 +3,9 @@
 - Status: Accepted (planner, 2026-10-24, for SPEC-002). Amends ADR-0006
   (SPEC-001 Amendment 3, item 10: binding the wire listener is the last
   startup step) and extends the ADR-0013 success path.
-- Related: SPEC-002 FR-1, FR-43, FR-46, FR-47, AC-1, AC-26; SPEC-001 FR-18,
+  Updated the same day for SPEC-002 Amendment 1 (FR-63 second signal).
+- Related: SPEC-002 FR-1, FR-43, FR-46, FR-47, FR-63, AC-1, AC-26, AC-47;
+  SPEC-001 FR-18,
   FR-34; ADR-0006, ADR-0013, ADR-0015
 
 ## Decision
@@ -52,6 +54,23 @@ From cancellation (SIGINT, SIGTERM or context cancel):
 
 The admin listener stays up during the drain, so `/readyz` keeps answering
 `shutting_down` while connections drain.
+
+### Second signal (SPEC-002 FR-63, Amendment 1, G-18)
+
+- `cmd/corral` keeps receiving SIGINT and SIGTERM on a channel after the
+  first one has started shutdown. It no longer relies only on
+  `signal.NotifyContext`, which stops delivery after the first signal.
+- The second signal is passed to the runtime as `Inputs.Force` (a
+  `<-chan struct{}` closed on the second signal). The runtime:
+  - emits one `lifecycle` warn record, `shutdown forced by second signal`,
+    with no attributes;
+  - calls `proxyapp.Service.ForceDrainEnd()`, which ends the drain at once
+    as if `proxy.shutdown.drain_timeout` had elapsed. Steps 4 and 5 run,
+    then admin and tracing shutdown within their bounds (FR-34), and the
+    process exits 0.
+- Further signals are drained and ignored, with no further record. A second
+  signal before shutdown has reached the drain also skips the remaining
+  `listener_close_delay`. The record is still emitted once.
 
 ### Required upstream settings and existing tests
 
