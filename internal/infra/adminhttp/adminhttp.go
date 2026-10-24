@@ -8,6 +8,8 @@ package adminhttp
 
 import (
 	"context"
+	"errors"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/expfmt"
 
 	"github.com/sorinpanduru/corral/internal/domain/health"
 	"github.com/sorinpanduru/corral/internal/infra/config"
@@ -24,10 +27,24 @@ import (
 // DefaultAddr is the FR-16 default admin bind address.
 const DefaultAddr = "127.0.0.1:9187"
 
+// Server limits for an unauthenticated listener.
 const (
-	contentTypePlain  = "text/plain; charset=utf-8"
+	IdleTimeout    time.Duration = 60 * time.Second
+	ReadTimeout    time.Duration = 10 * time.Second
+	WriteTimeout   time.Duration = 30 * time.Second
+	MaxHeaderBytes int           = 16 << 10
+
 	readHeaderTimeout = 5 * time.Second
+	metricsTimeout    = 10 * time.Second
+	metricsInFlight   = 4
+	contentTypePlain  = "text/plain; charset=utf-8"
 )
+
+// ErrNotListening is returned by Serve when Listen has not succeeded.
+var ErrNotListening = errors.New("adminhttp: Serve called before Listen")
+
+// ErrAlreadyListening is returned by a second Listen call.
+var ErrAlreadyListening = errors.New("adminhttp: Listen called twice")
 
 // Options configures a Server.
 type Options struct {
@@ -35,11 +52,16 @@ type Options struct {
 	Gatherer  prometheus.Gatherer
 	Readiness health.Readiness
 	ErrorLog  *log.Logger
+	// IdleTimeout and ReadTimeout override the package defaults when non-zero
+	// (intended for tests).
+	IdleTimeout time.Duration
+	ReadTimeout time.Duration
 }
 
 // Server is the admin HTTP server.
 type Server struct {
 	opts     Options
+	listened atomic.Bool
 	srv      *http.Server
 	handler  http.Handler
 	ln       atomic.Pointer[net.Listener]
@@ -51,6 +73,16 @@ type Server struct {
 func New(opts Options) *Server {
 	if opts.Addr == "" {
 		opts.Addr = DefaultAddr
+	}
+	if opts.ErrorLog == nil {
+		// Never a typed-nil interface, and net/http must not fall back to stderr.
+		opts.ErrorLog = log.New(io.Discard, "", 0)
+	}
+	if opts.IdleTimeout == 0 {
+		opts.IdleTimeout = IdleTimeout
+	}
+	if opts.ReadTimeout == 0 {
+		opts.ReadTimeout = ReadTimeout
 	}
 	s := &Server{opts: opts}
 
@@ -75,6 +107,13 @@ func New(opts Options) *Server {
 		Handler:           s.handler,
 		ReadHeaderTimeout: readHeaderTimeout,
 		ErrorLog:          opts.ErrorLog,
+		ReadTimeout:       opts.ReadTimeout,
+		WriteTimeout:      WriteTimeout,
+		IdleTimeout:       opts.IdleTimeout,
+		MaxHeaderBytes:    MaxHeaderBytes,
+
+		// OPTIONS * must not be answered by net/http's built-in handler.
+		DisableGeneralOptionsHandler: true,
 	}
 	return s
 }
@@ -84,12 +123,52 @@ func (s *Server) metricsHandler() http.Handler {
 	if g == nil {
 		g = prometheus.NewRegistry()
 	}
-	// EnableOpenMetrics stays false so exemplars are never exposed.
-	return promhttp.HandlerFor(g, promhttp.HandlerOpts{
-		EnableOpenMetrics: false,
-		ErrorLog:          s.opts.ErrorLog, // may be nil; promhttp tolerates nil
-		ErrorHandling:     promhttp.HTTPErrorOnError,
+	// Exemplars are only emitted by the OpenMetrics encoder, so
+	// EnableOpenMetrics stays false and only the text format is accepted.
+	// The metric factory wrappers (T7) are the real guard against exemplars
+	// being registered at all.
+	inner := promhttp.HandlerFor(g, promhttp.HandlerOpts{
+		EnableOpenMetrics:   false,
+		AcceptedFormats:     []expfmt.Format{expfmt.NewFormat(expfmt.TypeTextPlain)},
+		ErrorLog:            s.opts.ErrorLog,
+		ErrorHandling:       promhttp.HTTPErrorOnError,
+		Timeout:             metricsTimeout,
+		MaxRequestsInFlight: metricsInFlight,
 	})
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r2 := r.Clone(r.Context())
+		r2.URL.RawQuery = "" // query strings are ignored
+		inner.ServeHTTP(&errorBodyWriter{ResponseWriter: w}, r2)
+	})
+}
+
+// errorBodyWriter replaces promhttp's 500 error body (which carries the
+// gatherer error text) with a fixed one.
+type errorBodyWriter struct {
+	http.ResponseWriter
+	failed bool
+}
+
+func (e *errorBodyWriter) WriteHeader(code int) {
+	if code == http.StatusInternalServerError {
+		e.failed = true
+		h := e.Header()
+		h.Del("Content-Encoding")
+		h.Del("Content-Length")
+		h.Set("Content-Type", contentTypePlain)
+		h.Set("X-Content-Type-Options", "nosniff")
+		e.ResponseWriter.WriteHeader(code)
+		_, _ = e.ResponseWriter.Write([]byte("error\n"))
+		return
+	}
+	e.ResponseWriter.WriteHeader(code)
+}
+
+func (e *errorBodyWriter) Write(p []byte) (int, error) {
+	if e.failed {
+		return len(p), nil
+	}
+	return e.ResponseWriter.Write(p)
 }
 
 func writePlain(w http.ResponseWriter, code int, body string) {
@@ -140,9 +219,13 @@ func (s *Server) readiness(ctx context.Context) health.Reason {
 // admin.listen that wraps the net error (errors.Is works) and carries no
 // address text.
 func (s *Server) Listen() error {
+	if !s.listened.CompareAndSwap(false, true) {
+		return ErrAlreadyListening
+	}
 	ln, err := net.Listen("tcp", s.opts.Addr)
 	if err != nil {
-		return config.NewError("admin.listen", err)
+		s.listened.Store(false)
+		return config.NewError(config.SettingAdminListen, err)
 	}
 	s.ln.Store(&ln)
 	return nil
@@ -152,7 +235,7 @@ func (s *Server) Listen() error {
 func (s *Server) Serve() error {
 	lp := s.ln.Load()
 	if lp == nil {
-		return config.NewError("admin.listen", nil)
+		return ErrNotListening
 	}
 	return s.srv.Serve(*lp)
 }
@@ -175,4 +258,13 @@ func (s *Server) MarkStopping() { s.stopping.Store(true) }
 func (s *Server) Handler() http.Handler { return s.handler }
 
 // Shutdown gracefully stops the server.
-func (s *Server) Shutdown(ctx context.Context) error { return s.srv.Shutdown(ctx) }
+// A listener that was bound but never served is closed too.
+func (s *Server) Shutdown(ctx context.Context) error {
+	err := s.srv.Shutdown(ctx)
+	if lp := s.ln.Load(); lp != nil {
+		if cerr := (*lp).Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) && err == nil {
+			err = cerr
+		}
+	}
+	return err
+}
