@@ -132,6 +132,9 @@ type opts struct {
 	env map[string]string
 	// exporter is the test-only exporter override.
 	exporter sdktrace.SpanExporter
+	// afterResolve, when set, runs between tracing.Resolve and tracing.Start
+	// (T24.4: make validated files unreadable).
+	afterResolve func()
 }
 
 type harness struct {
@@ -165,6 +168,9 @@ func boot(t *testing.T, o opts) *harness {
 		t.Fatalf("Resolve returned an error for a valid environment: %v", err)
 	}
 	h.enabled, h.cfg = enabled, cfg
+	if o.afterResolve != nil {
+		o.afterResolve()
+	}
 
 	lv := new(slog.LevelVar)
 	lv.Set(o.level)
