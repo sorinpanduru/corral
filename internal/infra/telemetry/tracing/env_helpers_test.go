@@ -268,23 +268,6 @@ func envMerge(m, extra map[string]string) map[string]string {
 	return m
 }
 
-// envRequireRejectedOneOf is envRequireRejected for errors that may
-// legitimately name any of several variables (pairing and mismatch rules).
-func envRequireRejectedOneOf(tb testing.TB, err error, marker string, names ...string) {
-	tb.Helper()
-	var ce *config.Error
-	if !errors.As(err, &ce) {
-		tb.Fatalf("error %v (%T) is not a *config.Error", err, err)
-	}
-	for _, n := range names {
-		if ce.Setting == n {
-			envRequireRejected(tb, err, n, marker)
-			return
-		}
-	}
-	tb.Fatalf("config.Error.Setting = %q, want one of %v", ce.Setting, names)
-}
-
 func envWrite(tb testing.TB, path string, b []byte) {
 	tb.Helper()
 	if err := os.WriteFile(path, b, 0o600); err != nil {

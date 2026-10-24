@@ -319,15 +319,21 @@ func TestResolve_ClientPairing(t *testing.T) {
 	} {
 		t.Run(p.name, func(t *testing.T) {
 			envMustResolve(t, map[string]string{p.cert: good.Cert, p.key: good.Key})
-			for name, m := range map[string]map[string]string{
-				"cert without key": {p.cert: good.Cert},
-				"key without cert": {p.key: good.Key},
-				"mismatched key":   {p.cert: good.Cert, p.key: other.Key},
+			// FR-19 fixed names: a certificate without a key is reported under
+			// the key variable, a key without a certificate under the
+			// certificate variable, a mismatched pair under the key variable.
+			for name, c := range map[string]struct {
+				env  map[string]string
+				want string
+			}{
+				"cert without key": {map[string]string{p.cert: good.Cert}, p.key},
+				"key without cert": {map[string]string{p.key: good.Key}, p.cert},
+				"mismatched key":   {map[string]string{p.cert: good.Cert, p.key: other.Key}, p.key},
 			} {
 				t.Run(name, func(t *testing.T) {
 					marker := envMarker(t)
-					_, _, err := envResolveOn(m)
-					envRequireRejectedOneOf(t, err, marker, p.cert, p.key)
+					_, _, err := envResolveOn(c.env) // exactly one error, or the helper fails
+					envRequireRejected(t, err, c.want, marker)
 				})
 			}
 		})
@@ -389,8 +395,10 @@ func TestResolve_EncryptedKeysRejected(t *testing.T) {
 	for name, path := range map[string]string{"ENCRYPTED PRIVATE KEY": enc8, "legacy Proc-Type": legacy} {
 		t.Run(name, func(t *testing.T) {
 			cert, key := "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", "OTEL_EXPORTER_OTLP_CLIENT_KEY"
+			// The key has its own error, so the pairing check is skipped and
+			// the one record names the key variable.
 			_, _, err := envResolveOn(map[string]string{cert: c.Cert, key: path})
-			envRequireRejectedOneOf(t, err, marker, cert, key)
+			envRequireRejected(t, err, key, marker)
 		})
 	}
 }

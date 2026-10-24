@@ -1,6 +1,8 @@
 package loader_test
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/sorinpanduru/corral/internal/infra/config/loader"
@@ -30,6 +32,22 @@ func FuzzParseArgs(f *testing.F) {
 			flagNames[s.FileFlag] = true
 		}
 	}
+	// Constant text a problem may legitimately contain: sentinel texts and the
+	// fixed setting names. Supplied text is only checked when it is not part
+	// of these, so short coincidences cannot cause false failures.
+	constants := []string{"unknown", "argument"}
+	for _, e := range []error{loader.ErrUnknownFlag, loader.ErrPositional, loader.ErrMissingValue, loader.ErrRepeated,
+		loader.ErrSecretOnCommandLine, loader.ErrControlFlagValue} {
+		constants = append(constants, e.Error())
+	}
+	secretNames := map[string]bool{}
+	for _, s := range r.Settings() {
+		constants = append(constants, s.Name, s.FileFlag)
+		if s.Secret {
+			secretNames[s.Name] = true
+		}
+	}
+	constText := strings.Join(constants, "\x00")
 	f.Fuzz(func(t *testing.T, a, b, c, d string) {
 		args := []string{a, b, c, d}
 		for n := 0; n <= len(args); n++ {
@@ -54,7 +72,27 @@ func FuzzParseArgs(f *testing.F) {
 					}
 				}
 			}
+			// No supplied text appears in any rendering of a problem (FR-8,
+			// FR-14: a mistyped name or a secret literal is never echoed).
+			for _, p := range pr {
+				var shown []string
+				shown = append(shown, p.Setting, p.Err.Error(), fmt.Sprintf("%v", p.Err), fmt.Sprintf("%+v", p.Err), fmt.Sprintf("%#v", p.Err))
+				rendered := strings.Join(shown, "\x00")
+				for _, arg := range args[:n] {
+					_, val, _ := strings.Cut(arg, "=")
+					for _, secret := range []string{arg, val} {
+						if len(secret) >= 6 && !strings.Contains(constText, secret) && strings.Contains(rendered, secret) {
+							t.Fatalf("a problem at %d renders supplied text of length %d", p.Pos, len(secret))
+						}
+					}
+				}
+			}
 			for _, i := range in {
+				// A secret literal is never an input: the only input form for a
+				// secret is a file reference, and its value is a path.
+				if secretNames[i.Setting] && !i.FileRef {
+					t.Fatalf("secret literal for %s returned as an input", i.Setting)
+				}
 				if i.Pos < 0 || i.Pos >= n {
 					t.Fatalf("input position %d out of range", i.Pos)
 				}
