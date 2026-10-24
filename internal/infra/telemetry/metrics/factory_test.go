@@ -4,12 +4,14 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/metrics"
 )
 
+// Expected wrapper API: Counter/Gauge/Histogram return *metrics.Counter,
+// *metrics.Gauge and *metrics.Histogram (Inc/Add; Set/Inc/Dec/Add/Sub;
+// Observe), which do NOT implement prometheus.Collector or Metric.
 // Expected vector wrapper API (catalog-checked, ADR-0004):
 //   (*Factory).CounterVec(name)   -> wrapper with WithLabelValues(...string) (prometheus.Counter, error)
 //   (*Factory).GaugeVec(name)     -> wrapper with WithLabelValues(...string) (prometheus.Gauge, error)
@@ -64,10 +66,10 @@ func TestFactoryCounterFromCatalog(t *testing.T) {
 	}
 	c.Inc()
 	c.Add(2)
-	if got := testutil.ToFloat64(c); got != 3 {
+	fam := familyNames(t, reg)["corral_events_total"]
+	if got := fam.GetMetric()[0].GetCounter().GetValue(); got != 3 {
 		t.Fatalf("value = %v, want 3", got)
 	}
-	fam := familyNames(t, reg)["corral_events_total"]
 	if fam == nil {
 		t.Fatal("family not registered")
 	}
@@ -165,7 +167,7 @@ func TestFactoryGaugeAndHistogram(t *testing.T) {
 	}
 	g.Set(7)
 	g.Dec()
-	if got := testutil.ToFloat64(g); got != 6 {
+	if got := familyNames(t, reg)["corral_depth"].GetMetric()[0].GetGauge().GetValue(); got != 6 {
 		t.Fatalf("gauge = %v", got)
 	}
 	h, err := f.Histogram("corral_wait_seconds")
@@ -279,6 +281,13 @@ func TestFactoryValuesCannotAttachExemplars(t *testing.T) {
 		if _, ok := v.(prometheus.ExemplarObserver); ok {
 			t.Errorf("%s implements prometheus.ExemplarObserver", name)
 		}
+		// The wrappers must not leak the underlying collector either.
+		if _, ok := v.(prometheus.Collector); ok {
+			t.Errorf("%s implements prometheus.Collector", name)
+		}
+		if _, ok := v.(prometheus.Metric); ok {
+			t.Errorf("%s implements prometheus.Metric", name)
+		}
 	}
 	c, err := f.Counter("corral_events_total")
 	must(t, err)
@@ -375,9 +384,10 @@ func TestVectorConstructorsAreIdempotent(t *testing.T) {
 		t.Fatalf("second Gauge: %v", err)
 	}
 	g1.Set(5)
-	if got := testutil.ToFloat64(g2); got != 5 {
+	if got := familyNames(t, reg)["corral_depth"].GetMetric()[0].GetGauge().GetValue(); got != 5 {
 		t.Fatalf("gauge handles do not share state: %v", got)
 	}
+	_ = g2
 }
 
 // A foreign collector with the same name on the registry makes the factory

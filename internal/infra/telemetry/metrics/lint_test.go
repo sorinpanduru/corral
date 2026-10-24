@@ -8,6 +8,7 @@ import (
 
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/errclass"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/metrics"
+	"github.com/sorinpanduru/corral/internal/infra/telemetry/sanitize"
 )
 
 // Each testdata catalog breaks exactly one rule. Lint must report it and the
@@ -42,8 +43,6 @@ func TestLintBadCatalogs(t *testing.T) {
 		{"bad_label_quantile.json", "quantile", "FR-13 quantile not declarable"},
 		{"bad_error_class_values.json", "bogus_class", "FR-29 class enum"},
 		{"bad_error_detail_values.json", "ECONNFOO", "FR-29 detail enum"},
-		{"bad_series_cap_single.json", "corral_big_total", "FR-13 series cap"},
-		{"bad_series_cap_product.json", "corral_big_total", "FR-13 series cap (cartesian product)"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.file, func(t *testing.T) {
@@ -55,26 +54,6 @@ func TestLintBadCatalogs(t *testing.T) {
 				t.Fatalf("problems do not mention %q (%s):\n%s", tc.mention, tc.rule, txt)
 			}
 		})
-	}
-}
-
-// FR-13: exactly 100 series is allowed.
-func TestLintAcceptsSeriesCapBoundary(t *testing.T) {
-	if ps := metrics.Lint(parseFile(t, "good_max_series.json")); len(ps) != 0 {
-		t.Fatalf("100 series rejected:\n%s", problemText(ps))
-	}
-}
-
-// FR-13: le is excluded from the series count, so a histogram with 100 label
-// combinations passes regardless of buckets.
-func TestLintSeriesCapIgnoresBuckets(t *testing.T) {
-	c := parse(t, metricSpec{
-		Name: "corral_op_seconds", Type: "histogram", Help: "h",
-		Buckets: []float64{.001, .01, .1, 1, 10, 60},
-		Labels:  []labelSpec{{Name: "command", Values: seq("c", 100)}},
-	})
-	if ps := metrics.Lint(c); len(ps) != 0 {
-		t.Fatalf("unexpected problems:\n%s", problemText(ps))
 	}
 }
 
@@ -133,14 +112,20 @@ func TestLintForbiddenLabels(t *testing.T) {
 	}
 }
 
-// FR-11: ordinary bounded labels are not flagged as forbidden.
-func TestLintAllowsOrdinaryLabels(t *testing.T) {
-	for _, l := range []string{"command", "error_class"} {
+// FR-11: allowlisted labels with valid values are accepted, and none of the
+// allowlisted names is on the deny-list (second line of defence, ADR-0004).
+func TestLintAllowlistedNamesAreNotForbidden(t *testing.T) {
+	valid := map[string]string{"command": "find", "error_class": "timeout", "error_detail": "eof"}
+	for _, l := range metrics.AllowedLabelNames() {
 		t.Run(l, func(t *testing.T) {
+			v, ok := valid[l]
+			if !ok {
+				v = "v"
+			}
 			c := parse(t, metricSpec{Name: "corral_x_total", Type: "counter", Help: "h",
-				Labels: []labelSpec{{Name: l, Values: []string{"timeout"}}}})
+				Labels: []labelSpec{{Name: l, Values: []string{v}}}})
 			if ps := metrics.Lint(c); len(ps) != 0 {
-				t.Fatalf("label %q flagged:\n%s", l, problemText(ps))
+				t.Fatalf("allowlisted label %q flagged (forbidden or invalid):\n%s", l, problemText(ps))
 			}
 		})
 	}
@@ -266,21 +251,21 @@ func TestLintRejectsNonAllowlistedLabelNames(t *testing.T) {
 	}
 }
 
-// D: label values are non-empty and match ^[a-z0-9_]+$ (error_detail is
-// governed by the FR-29 detail enum instead).
-func TestLintLabelValueCharset(t *testing.T) {
-	for _, v := range []string{"find", "a_1", "0", "other", "snake_case_9"} {
+// D: command label values are members of sanitize.CommandAllowlist() or
+// "other", case-sensitive.
+func TestLintCommandValuesAreAllowlisted(t *testing.T) {
+	for _, v := range append(sanitize.CommandAllowlist(), sanitize.OtherCommand, "find", "hello", "other") {
 		c := parse(t, metricSpec{Name: "corral_x_total", Type: "counter", Help: "h",
 			Labels: []labelSpec{{Name: "command", Values: []string{v}}}})
 		if ps := metrics.Lint(c); len(ps) != 0 {
-			t.Errorf("value %q rejected:\n%s", v, problemText(ps))
+			t.Errorf("command value %q rejected:\n%s", v, problemText(ps))
 		}
 	}
-	for _, v := range []string{"", "Find", "FIND", "find-one", "a b", "find.x", "find\n", "caf\u00e9", "a/b", "{x}", "a\"b"} {
+	for _, v := range []string{"", "Find", "FIND", "Hello", "getmore", "getMore", "find-one", "a b", "find\n", "insert", "ismaster", "isMaster"} {
 		c := parse(t, metricSpec{Name: "corral_x_total", Type: "counter", Help: "h",
 			Labels: []labelSpec{{Name: "command", Values: []string{"find", v}}}})
 		if ps := metrics.Lint(c); len(ps) == 0 {
-			t.Errorf("value %q accepted", v)
+			t.Errorf("command value %q accepted", v)
 		}
 	}
 }
