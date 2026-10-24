@@ -67,14 +67,26 @@ func envResolveAll(in tracing.ResolveInputs, env tracing.LookupEnv) (bool, traci
 }
 
 // envResolve is the single-error view used by the parity tests migrated from
-// SPEC-001: it returns the first error (errors are sorted by setting) or nil.
-// Tests that need every error call envResolveAll or tracing.Resolve.
+// SPEC-001: it returns the one error or nil. More than one error is a test
+// failure (those tests assert "exactly one error"); it is returned as a non-config error naming the settings only. Tests that expect several errors call envResolveAll or
+// tracing.Resolve.
 func envResolve(in tracing.ResolveInputs, env tracing.LookupEnv) (bool, tracing.EnvConfig, error) {
 	on, cfg, errs := envResolveAll(in, env)
-	if len(errs) > 0 {
+	switch len(errs) {
+	case 0:
+		return on, cfg, nil
+	case 1:
 		return on, cfg, errs[0]
 	}
-	return on, cfg, nil
+	var names []string
+	for _, e := range errs {
+		var ce *config.Error
+		if errors.As(e, &ce) {
+			names = append(names, ce.Setting)
+		}
+	}
+	// Not a *config.Error, so envRequireRejected and envMustResolve fail on it.
+	return on, cfg, fmt.Errorf("envResolve: Resolve returned %d errors, want at most 1: %v", len(errs), names)
 }
 
 // envResolveOn resolves with tracing enabled (ratio 1.0).

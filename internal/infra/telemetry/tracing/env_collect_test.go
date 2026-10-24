@@ -130,12 +130,40 @@ func TestResolve_ErrorsSortedBySettingByteOrder(t *testing.T) {
 	}
 	_, _, errs := resolveMem(onIn(), env, memfs.New())
 	got := settingsOf(t, errs)
-	if len(got) != len(env) {
-		t.Fatalf("got %d errors, want %d: %v", len(got), len(env), got)
+	// Amendment 2: with an invalid OTEL_TRACES_SAMPLER the ARG check is
+	// skipped, so ARG has no record even though its value (9) is out of range.
+	want := len(env) - 1
+	if len(got) != want {
+		t.Fatalf("got %d errors, want %d: %v", len(got), want, got)
+	}
+	for _, g := range got {
+		if g == "OTEL_TRACES_SAMPLER_ARG" {
+			t.Fatalf("OTEL_TRACES_SAMPLER_ARG reported although the sampler is invalid: %v", got)
+		}
 	}
 	if !sort.StringsAreSorted(got) {
 		t.Fatalf("errors not sorted by setting: %v", got)
 	}
+}
+
+// SPEC-003 Amendment 2 (FR-19, AC-20): when OTEL_TRACES_SAMPLER is invalid, the
+// OTEL_TRACES_SAMPLER_ARG check is skipped (the effective sampler is unknown,
+// so whether ARG is used is unknown). Exactly one record.
+func TestAC20_InvalidSamplerSkipsSamplerArgCheck(t *testing.T) {
+	for name, env := range map[string]map[string]string{
+		"arg out of range":  {"OTEL_TRACES_SAMPLER": "x", "OTEL_TRACES_SAMPLER_ARG": "9"},
+		"arg not a number":  {"OTEL_TRACES_SAMPLER": "x", "OTEL_TRACES_SAMPLER_ARG": "abc"},
+		"arg valid":         {"OTEL_TRACES_SAMPLER": "x", "OTEL_TRACES_SAMPLER_ARG": "0.5"},
+		"known-bad variant": {"OTEL_TRACES_SAMPLER": "jaeger_remote", "OTEL_TRACES_SAMPLER_ARG": "9"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, _, errs := resolveMem(onIn(), env, memfs.New())
+			requireSettings(t, errs, []string{"OTEL_TRACES_SAMPLER"})
+		})
+	}
+	// With a valid sampler the ARG check still runs.
+	_, _, errs := resolveMem(onIn(), map[string]string{"OTEL_TRACES_SAMPLER": "traceidratio", "OTEL_TRACES_SAMPLER_ARG": "9"}, memfs.New())
+	requireSettings(t, errs, []string{"OTEL_TRACES_SAMPLER_ARG"})
 }
 
 // Every value of the shared invalid table yields exactly one error naming the

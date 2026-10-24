@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -378,15 +379,20 @@ func TestWatcher_SignalAfterSetLoggerEmitsOneRecord(t *testing.T) {
 func TestWatcher_AC10(t *testing.T) {
 	r := newRig(t)
 	clk := fakeclock.New(t0)
+	// The clock is read once per signal. Counting the reads (after the time is
+	// captured) tells the test when the sixth signal has been timestamped, so
+	// advancing the fake clock cannot race with the watcher goroutine.
+	var reads atomic.Int64
+	now := func() time.Time {
+		tm := clk.Now()
+		reads.Add(1)
+		return tm
+	}
 	ch := make(chan os.Signal)
-	w := sighup.Start(ch, clk.Now)
+	w := sighup.Start(ch, now)
 	w.SetLogger(r.log)
 	send(t, ch, 6)
-	// Wait until the sixth signal has been processed: Stop is the barrier, so
-	// use a second watcher phase instead. Poll for the first record, then
-	// make sure no more arrive.
-	waitRecords(t, r, 1)
-	time.Sleep(100 * time.Millisecond)
+	waitReads(t, &reads, 6)
 	if n := len(r.records()); n != 1 {
 		t.Fatalf("6 signals gave %d records, want 1", n)
 	}
@@ -400,6 +406,17 @@ func TestWatcher_AC10(t *testing.T) {
 	}
 	if n := requireWarn(t, recs[1]); n != 5 {
 		t.Errorf("suppressed_count = %d, want 5", n)
+	}
+}
+
+func waitReads(t *testing.T, reads *atomic.Int64, n int64) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for reads.Load() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d clock reads (have %d)", n, reads.Load())
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

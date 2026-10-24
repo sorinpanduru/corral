@@ -333,15 +333,28 @@ func TestResolve_ClientPairing(t *testing.T) {
 		})
 	}
 	t.Run("mixed prefixes", func(t *testing.T) {
+		// Each form is checked on its own, so a certificate under one prefix
+		// and a key under the other leave both forms unpaired: two errors,
+		// one per form (FR-19: the missing counterpart's variable).
 		g, tr := "OTEL_EXPORTER_OTLP_", "OTEL_EXPORTER_OTLP_TRACES_"
-		for name, m := range map[string]map[string]string{
-			"general cert, traces key": {g + "CLIENT_CERTIFICATE": good.Cert, tr + "CLIENT_KEY": good.Key},
-			"traces cert, general key": {tr + "CLIENT_CERTIFICATE": good.Cert, g + "CLIENT_KEY": good.Key},
+		for name, c := range map[string]struct {
+			env  map[string]string
+			want []string
+		}{
+			"general cert, traces key": {map[string]string{g + "CLIENT_CERTIFICATE": good.Cert, tr + "CLIENT_KEY": good.Key},
+				[]string{g + "CLIENT_KEY", tr + "CLIENT_CERTIFICATE"}},
+			"traces cert, general key": {map[string]string{tr + "CLIENT_CERTIFICATE": good.Cert, g + "CLIENT_KEY": good.Key},
+				[]string{g + "CLIENT_CERTIFICATE", tr + "CLIENT_KEY"}},
 		} {
 			t.Run(name, func(t *testing.T) {
-				_, _, err := envResolveOn(m)
-				envRequireRejectedOneOf(t, err, envMarker(t),
-					g+"CLIENT_CERTIFICATE", g+"CLIENT_KEY", tr+"CLIENT_CERTIFICATE", tr+"CLIENT_KEY")
+				marker := envMarker(t)
+				_, _, errs := envResolveAll(envOn(1.0), envMap(c.env))
+				if len(errs) != len(c.want) {
+					t.Fatalf("got %d errors, want %d", len(errs), len(c.want))
+				}
+				for i, w := range c.want {
+					envRequireRejected(t, errs[i], w, marker)
+				}
 			})
 		}
 	})
