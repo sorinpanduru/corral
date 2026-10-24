@@ -229,30 +229,38 @@ func TestClassify_RealReset_AC35(t *testing.T) {
 	}
 	defer l.Close()
 	go func() {
-		c, err := l.Accept()
-		if err != nil {
-			return
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.(*net.TCPConn).SetLinger(0) // close sends RST
+			c.Close()
 		}
-		_ = c.(*net.TCPConn).SetLinger(0) // close sends RST
-		c.Close()
 	}()
+	// The RST can race the client's connect, so the reset may surface from
+	// Dial or from the first Read. Classify whichever error surfaced.
+	var got error
 	conn, err := net.Dial("tcp", l.Addr().String())
 	if err != nil {
-		t.Fatal(err)
+		got = err
+	} else {
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		_, got = conn.Read(make([]byte, 1))
 	}
-	defer conn.Close()
-	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	_, err = conn.Read(make([]byte, 1))
-	if !errors.Is(err, syscall.ECONNRESET) {
-		t.Skipf("platform did not surface ECONNRESET (%v)", err)
+	if !errors.Is(got, syscall.ECONNRESET) {
+		t.Skipf("platform did not surface ECONNRESET (%v)", got)
 	}
-	c, d := inEnums(t, err)
+	c, d := inEnums(t, got)
 	if c != "network" || d != "ECONNRESET" {
 		t.Fatalf("Classify = (%s, %s)", c, d)
 	}
 }
 
-// Real loopback: write to a closed connection (AC-35 EPIPE).
+// Real loopback: write to a closed connection (AC-35 EPIPE). The peer's
+// close can race the connect (Dial may fail with a reset) or a write may see
+// ECONNRESET before EPIPE, so each attempt is retried.
 func TestClassify_RealBrokenPipe_AC35(t *testing.T) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -260,22 +268,30 @@ func TestClassify_RealBrokenPipe_AC35(t *testing.T) {
 	}
 	defer l.Close()
 	go func() {
-		c, err := l.Accept()
-		if err != nil {
-			return
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
 		}
-		c.Close()
 	}()
-	conn, err := net.Dial("tcp", l.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
 	var werr error
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && werr == nil {
-		_, werr = conn.Write([]byte("synthetic"))
-		time.Sleep(20 * time.Millisecond)
+	for attempt := 0; attempt < 20; attempt++ {
+		conn, err := net.Dial("tcp", l.Addr().String())
+		if err != nil {
+			continue // reset raced the connect; try again
+		}
+		werr = nil
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) && werr == nil {
+			_, werr = conn.Write([]byte("synthetic"))
+			time.Sleep(20 * time.Millisecond)
+		}
+		conn.Close()
+		if errors.Is(werr, syscall.EPIPE) {
+			break
+		}
 	}
 	if !errors.Is(werr, syscall.EPIPE) {
 		t.Skipf("platform did not surface EPIPE (%v)", werr)
