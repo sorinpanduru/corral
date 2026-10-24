@@ -1,9 +1,10 @@
 # ADR-0014: `corraltest` build tag for binary-level configuration tests
 
-- Status: Proposed (planner, 2026-10-24, for SPEC-003). Open for the Owner as
-  P1 in `plans/SPEC-003.md`. Tasks T12 and T13 are planned on this basis.
-- Related: SPEC-003 AC-6, AC-9, AC-10; ADR-0001, ADR-0005; SPEC-001 T21
-  (`importcheck.ForbiddenDeps`)
+- Status: Accepted (Owner, 2026-10-24; P1 in `plans/SPEC-003.md` approved).
+  Updated the same day for SPEC-003 Amendment 1 (AC-19 check-config hold
+  point).
+- Related: SPEC-003 AC-6, AC-9, AC-10, AC-19; ADR-0001, ADR-0005; SPEC-001
+  T21 (`importcheck.ForbiddenDeps`)
 
 ## Context
 
@@ -16,6 +17,8 @@ not have:
   reference. No approved spec declares a secret setting yet (SPEC-002 will).
 - AC-10: SIGHUP sent "while startup is held by a test hook before the
   configured logger exists".
+- AC-19 (Amendment 1): in check-config mode, SIGHUP sent while a test hook
+  holds the process "after the configured logger is built and before exit".
 
 ## Decision
 
@@ -30,12 +33,17 @@ not have:
       and an optional secret `t.secret` of type `text`; `required` adds a
       required `t.required` of type `string`. Unset: production registry
       only.
-    - `CORRALTEST_HOLD_DIR`: if set, `Hooks.BeforeLogger` creates
-      `<dir>/held` and then waits (bounded, 30 s) until `<dir>/release`
-      exists.
+    - `CORRALTEST_HOLD_DIR` and `CORRALTEST_HOLD_AT`: if both are set, the
+      selected hook creates `<dir>/held` and then waits (bounded, 30 s)
+      until `<dir>/release` exists. `CORRALTEST_HOLD_AT=logger` selects
+      `Hooks.BeforeLogger`, which runs before the configured logger exists
+      (AC-10). `CORRALTEST_HOLD_AT=checkconfig` selects
+      `Hooks.BeforeCheckConfigExit`, which runs in check-config mode after
+      the FR-20 record and before exit (AC-19). Any other value of
+      `CORRALTEST_HOLD_AT` holds nothing.
 - The functional `TestMain` builds both binaries: the default one (used by
-  every existing test) and `-tags corraltest` (used only by AC-6 required,
-  AC-9 and AC-10 hold cases).
+  every existing test) and `-tags corraltest` (used only by the AC-6
+  required case, AC-9, the AC-10 hold case and AC-19).
 - The `t` namespace exists only in the test build. It is not owned by any
   spec and must never appear in `settings.Groups()`.
 - A lint test (T14) asserts that the default build's dependency closure and
@@ -45,10 +53,8 @@ not have:
 ## Consequences
 
 - The production binary is unchanged by the hooks. The test binary differs
-  only in the two `CORRALTEST_*` behaviours above.
+  only in the `CORRALTEST_*` behaviours above.
 - When SPEC-002 declares real secret settings, AC-9 can move to the
   production binary, and the `secret` registry option can be removed.
-- If the Owner rejects a test build, the alternative is to cover AC-6
-  (required part), AC-9 and AC-10 (hold part) in-process through
-  `runtime.Run` with an injected registry and hook, and to state that those
-  parts are not binary-level.
+- The verifier's scenarios that need a test registry or a hold point use
+  the `corraltest` binary; all other scenarios use the default build.

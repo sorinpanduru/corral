@@ -2,7 +2,10 @@
 
 - Status: Accepted (planner, 2026-10-24, for SPEC-003). Amends ADR-0006:
   its steps 0 to 4 are replaced by the sequence below; steps 5 to 9,
-  readiness and shutdown are unchanged.
+  readiness and shutdown are unchanged. Updated 2026-10-24 for SPEC-003
+  Amendment 1 (FR-18, AC-19). The SIGHUP watcher now gets a logger only in
+  a normal run. The check-config mode has a test hold point. The pre-`main`
+  window is out of scope.
 - Related: SPEC-003 FR-10, FR-17, FR-18, FR-19, FR-20 to FR-24, FR-27,
   FR-29; SPEC-001 FR-27, FR-41; ADR-0006, ADR-0008, ADR-0009
 
@@ -21,9 +24,9 @@
    `make build` with `-ldflags "-X main.version=$(VERSION)"`, `VERSION ?=
    devel` (FR-22).
 
-Residual risk: SIGHUP during Go runtime start-up and package `init` (before
-`main`) still has the default action. This window is a few milliseconds and
-contains no argument parsing.
+SIGHUP during Go runtime start-up and package `init` (before `main`) still
+has the default action. SPEC-003 Amendment 1 (FR-18, Non-goals) places this
+window out of scope.
 
 ### `runtime.Run`
 
@@ -48,14 +51,19 @@ contains no argument parsing.
   2. `logbridge.Install` (ADR-0006 step 2). It may replay early `thirdparty`
      counts (ADR-0008); such records can precede the records below. They are
      not configuration records and FR-29 does not order them.
-  3. `sighup` watcher gets the `config` logger (from here, FR-18 warn
-     records, rate-limited 1 per 30 s with `suppressed_count` only when
-     non-zero).
-  4. FR-8 warn record, SPEC-001 FR-41 warn record (if applicable), FR-20
+  3. FR-8 warn record, SPEC-001 FR-41 warn record (if applicable), FR-20
      info record, each through the configured `config` logger and level.
-  5. Check-config mode: return 0 here. Nothing binds, connects or exports;
-     `tracing.Start` is not called.
-  6. Normal mode: lifecycle `starting`, then ADR-0006 steps 5 to 9.
+  4. Check-config mode: run `Hooks.BeforeCheckConfigExit` (tests only),
+     then return 0. Nothing binds, connects or exports; `tracing.Start` is
+     not called. The `sighup` watcher never receives a logger in this mode,
+     so a SIGHUP produces no record (SPEC-003 Amendment 1, FR-18, AC-19).
+  5. Normal mode only: the `sighup` watcher gets the `config` logger. From
+     here, each SIGHUP produces an FR-18 warn record, rate-limited to one
+     per 30 s, with `suppressed_count` only when it is non-zero. Then the
+     lifecycle `starting` record, then ADR-0006 steps 5 to 9.
+
+  The watcher never receives a logger in help, version or check-config mode
+  (SPEC-003 Amendment 1, FR-18, AC-19).
 
 ### Exit codes (FR-24)
 
