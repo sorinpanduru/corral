@@ -164,6 +164,16 @@ func TestAC30_AddressInUse(t *testing.T) {
 	if len(cfg) != 1 || str(cfg[0], "setting") != "admin.listen" {
 		t.Fatalf("want exactly one component=config ERROR record with setting=admin.listen, got %d", len(cfg))
 	}
+	// FR-24: a bind failure is not a configuration error. Its record has a
+	// distinct constant message, and no "invalid configuration" record exists.
+	if got := str(cfg[0], "msg"); got != "admin listener bind failed" {
+		t.Errorf("msg = %q, want %q", got, "admin listener bind failed")
+	}
+	for _, r := range p.records() {
+		if str(r, "msg") == "invalid configuration" {
+			t.Errorf("an \"invalid configuration\" record on a bind failure")
+		}
+	}
 	if got := str(cfg[0], "corral.error.detail"); got != "EADDRINUSE" {
 		t.Errorf("corral.error.detail = %q, want EADDRINUSE", got)
 	}

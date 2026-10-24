@@ -325,7 +325,10 @@ func TestExitCodes(t *testing.T) {
 	recs := out.records(t)
 	last := recs[len(recs)-1]
 	if str(last, "setting") != "admin.listen" || str(last, "level") != "ERROR" || str(last, "component") != "config" {
-		t.Errorf("last record = %v, want the admin.listen config error", last)
+		t.Errorf("last record = %v, want the admin.listen bind-failure error", last)
+	}
+	if str(last, "msg") == "invalid configuration" {
+		t.Error("a bind failure is logged as an invalid configuration (exit 2 records)")
 	}
 	if indexOfMsg(recs, msgLoaded) < 0 {
 		t.Error("the FR-20 record is missing before the bind failure (configuration was valid)")

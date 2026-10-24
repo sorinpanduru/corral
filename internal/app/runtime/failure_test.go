@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/sorinpanduru/corral/internal/infra/config"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logging"
 	"github.com/sorinpanduru/corral/internal/testkit/markerscan"
 )
@@ -188,6 +189,17 @@ func TestBindFailureEADDRINUSE(t *testing.T) { // AC-30, FR-35
 		t.Fatalf("exit code = %d, want 1 (FR-24: bind failure stays exit 1)", code)
 	}
 	r := configRecord(t, h, "admin.listen")
+	// A bind failure is not a configuration error (FR-24): its record has a
+	// distinct constant message, and no "invalid configuration" record exists
+	// at all (those identify exit-2 failures).
+	if got := str(r, "msg"); got != config.MsgAdminBindFailed || got == config.MsgInvalid {
+		t.Errorf("bind failure message = %q, want %q (not %q)", got, config.MsgAdminBindFailed, config.MsgInvalid)
+	}
+	for _, rec := range h.out.records(t) {
+		if str(rec, "msg") == config.MsgInvalid {
+			t.Errorf("an %q record on a bind failure", config.MsgInvalid)
+		}
+	}
 	out := string(h.out.bytes())
 	for _, bad := range []string{addr, ":" + port, "127.0.0.1"} {
 		if strings.Contains(out, bad) {

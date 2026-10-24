@@ -95,6 +95,7 @@ func recKeys(rec map[string]any) []string {
 func TestMessageConstants(t *testing.T) {
 	cases := []struct{ name, got, want string }{
 		{"MsgInvalid", config.MsgInvalid, "invalid configuration"},                                                    // FR-11
+		{"MsgAdminBindFailed", config.MsgAdminBindFailed, "admin listener bind failed"},                               // FR-24: not a config error
 		{"MsgUnknownEnv", config.MsgUnknownEnv, "unknown CORRAL_ environment variables ignored"},                      // FR-8
 		{"MsgLoaded", config.MsgLoaded, "configuration loaded"},                                                       // FR-20
 		{"MsgReloadUnsupported", config.MsgReloadUnsupported, "configuration reload not supported; restart required"}, // FR-18
