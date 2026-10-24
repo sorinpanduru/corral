@@ -20,7 +20,11 @@ broken by import path; `github.com/sorinpanduru/...` sorts before
 runs first. cmd/corral blank-imports it and logbridge imports it, so it is
 always linked. `logbridge.Install` drains the counters and replays at most one
 record per level through the thirdparty default-slog handler (fixed message,
-rate limited). Raw values are never retained or output.
+rate limited). Std `log` writes made during init are counted separately and replayed
+through the std-log writer (own message and limiter). Every early record goes
+through the limiter, so extra records land in suppressed_count. Records that
+reach the early handler after Install (captured loggers) are forwarded to the
+bridge handler. Raw values are never retained or output.
 
 ## Consequences
 
@@ -28,3 +32,9 @@ Correctness relies on init ordering; this is pinned by the T22 functional
 test (the binary must have empty stderr). A future dependency whose import
 path sorts before `github.com/sorinpanduru` and logs at init would not be
 covered. Rejected: removing auto/sdk (unavoidable transitive dependency).
+
+Residual risk: a package that imports only `log` (not `log/slog`) can be
+initialised before `log/slog` and therefore before earlyslog, regardless of
+import path (for example otel/internal/errorhandler). If such a package writes
+to the log package during init, that output goes to stderr unneutralised.
+Today none of the linked dependencies do so for the covered inputs.

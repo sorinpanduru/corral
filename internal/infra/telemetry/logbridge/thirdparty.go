@@ -125,20 +125,26 @@ func Install(f *logging.Factory, level slog.Leveler, now func() time.Time) {
 	installGRPC(f, level, now)
 	dh := NewSlogDefaultHandler(f, level, now)
 	slog.SetDefault(slog.New(dh))
-	replayEarly(dh, earlyslog.Drain())
-	log.SetOutput(NewStdLogWriter(f, level, now))
+	early := earlyslog.Handoff(dh)
+	replayEarly(dh, early)
+	w := NewStdLogWriter(f, level, now)
+	log.SetOutput(w)
+	for i := uint64(0); i < early.StdLog; i++ {
+		_, _ = w.Write(nil)
+	}
 }
 
-// replayEarly reports records that third-party package initialisers logged
-// before Install (see package earlyslog). Only the per-level occurrence is
-// replayed, once per level, through the rate-limited fixed-message handler.
+// replayEarly reports slog records that third-party package initialisers
+// logged before Install (see package earlyslog). Every early record goes
+// through the rate-limited fixed-message handler, so the first per level is
+// emitted and the rest are counted in suppressed_count (FR-28, FR-33).
 func replayEarly(h slog.Handler, c earlyslog.Counts) {
 	ctx := context.Background()
 	for _, e := range []struct {
 		n   uint64
 		lvl slog.Level
 	}{{c.Debug, slog.LevelDebug}, {c.Info, slog.LevelInfo}, {c.Warn, slog.LevelWarn}, {c.Error, slog.LevelError}} {
-		if e.n > 0 {
+		for i := uint64(0); i < e.n; i++ {
 			_ = h.Handle(ctx, slog.NewRecord(time.Time{}, e.lvl, "", 0))
 		}
 	}
