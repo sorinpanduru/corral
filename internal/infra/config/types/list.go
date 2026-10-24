@@ -12,6 +12,8 @@ func (s Spec) parseList(raw string) (any, error) {
 			return nil, ErrEmpty
 		}
 	} else {
+		// Intentional order: emptiness of all elements is checked before any
+		// element is parsed.
 		parts = strings.Split(raw, ",")
 		for i, p := range parts {
 			p = strings.Trim(p, " \t")

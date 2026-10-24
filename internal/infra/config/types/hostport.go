@@ -6,8 +6,8 @@ import (
 )
 
 // parseHostPort validates "host:port" (ADR-0011: returned as the validated
-// text). Hosts are an IPv4 literal, a bracketed IPv6 literal (a zone is
-// accepted, plan P2) or a DNS hostname (a trailing dot is accepted, plan P2).
+// text). Hosts are an IPv4 literal, a bracketed IPv6 literal without a zone,
+// or a DNS hostname without a trailing dot (SPEC-003 Amendment 1).
 func parseHostPort(raw string) (any, error) {
 	if raw == "" {
 		return nil, ErrEmpty
@@ -24,7 +24,7 @@ func parseHostPort(raw string) (any, error) {
 			return nil, ErrSyntax
 		}
 		host, port = raw[1:end], raw[end+2:]
-		if a, err := netip.ParseAddr(host); err != nil || !a.Is6() {
+		if a, err := netip.ParseAddr(host); err != nil || !a.Is6() || a.Zone() != "" {
 			return nil, ErrSyntax
 		}
 	} else {
@@ -74,7 +74,6 @@ func validHost(h string) bool {
 }
 
 func validHostname(h string) bool {
-	h = strings.TrimSuffix(h, ".")
 	if h == "" || len(h) > 253 {
 		return false
 	}

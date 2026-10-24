@@ -1,8 +1,10 @@
 // Package symcheck reports references to forbidden package-level symbols
-// (SPEC-003 AC-15, FR-25). References are found by resolved object
-// (types.Info.Uses), so import aliases, dot-imports and method values are
-// caught and look-alike names from other packages are not. It is test
-// infrastructure and must not be imported by production code.
+// (SPEC-003 AC-15, FR-25), found by resolved object (types.Info.Uses), so
+// import aliases, dot-imports and method values are caught and look-alike
+// names from other packages are not. Only the default build is analysed (host
+// GOOS/GOARCH, no extra build tags, cgo off): files excluded by build
+// constraints, such as other-OS or corraltest-tagged files, are not. It is
+// test infrastructure and must not be imported by production code.
 package symcheck
 
 import (
@@ -109,7 +111,7 @@ func load(dir, pattern string) ([]*packages.Package, error) {
 		// Later entries win: the caller's go environment cannot change
 		// what is analysed.
 		Env: append(os.Environ(), "GOFLAGS=", "GOTOOLCHAIN=local", "GOPROXY=off",
-			"GOWORK=off", "GOENV=off", "GOPACKAGESDRIVER=off"),
+			"GOWORK=off", "GOENV=off", "GOPACKAGESDRIVER=off", "CGO_ENABLED=0"),
 	}
 	pkgs, err := packages.Load(cfg, pattern)
 	if err != nil {

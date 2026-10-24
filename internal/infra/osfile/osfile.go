@@ -10,7 +10,6 @@ import (
 	"io"
 	"math"
 	"os"
-	"syscall"
 
 	"github.com/sorinpanduru/corral/internal/infra/config/source"
 )
@@ -27,7 +26,7 @@ func Read(path string, maxBytes int64) ([]byte, error) {
 	if !fi.Mode().IsRegular() {
 		return nil, source.ErrNotRegular
 	}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	f, err := os.OpenFile(path, os.O_RDONLY|openFlags, 0)
 	if err != nil {
 		return nil, source.ErrUnreadable
 	}
