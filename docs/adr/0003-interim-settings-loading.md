@@ -1,9 +1,9 @@
 # ADR-0003: Interim loading of SPEC-001 logical settings
 
-- Status: Accepted (2026-10-24). Decided by Orchestrator under Owner's
-  standing instruction, 2026-10-24, Owner may override (former question Q1,
-  decision D1 in `plans/SPEC-001.md`). To be superseded by the future
-  configuration spec.
+- Status: Superseded by SPEC-003 and ADR-0010 (2026-10-24). Originally
+  Accepted (2026-10-24), decided by Orchestrator under Owner's standing
+  instruction, 2026-10-24 (former question Q1, decision D1 in
+  `plans/SPEC-001.md`).
 - Related: SPEC-001 Non-goals (configuration loading), Interfaces (logical
   settings), FR-27, AC-3, AC-11, AC-21, AC-30
 

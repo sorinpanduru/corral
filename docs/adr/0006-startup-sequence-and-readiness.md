@@ -4,6 +4,10 @@
   were decided by Orchestrator under Owner's standing instruction,
   2026-10-24, Owner may override (former question Q6, decision D6 in
   `plans/SPEC-001.md`).
+- Amended by ADR-0013 (SPEC-003): steps 0 to 4 are replaced by the
+  ADR-0013 sequence (mode selection, configuration load including `OTEL_*`
+  validation, failure and success output paths). Steps 5 to 9, readiness
+  and shutdown are unchanged.
 - Related: SPEC-001 FR-7 (lifecycle), FR-18, FR-27, FR-28, FR-34, FR-35,
   AC-3, AC-21, AC-30, AC-31
 
