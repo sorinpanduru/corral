@@ -114,7 +114,7 @@ func Run(ctx context.Context, args []string, env tracing.LookupEnv, stdout io.Wr
 	// Step 4: lifecycle starting record.
 	life.Info(msgStarting)
 
-	// Steps 5-6: metrics registry and factory.
+	// Step 5: metrics registry, factory and catalog registration.
 	reg := metrics.NewRegistry()
 	catalog, err := metrics.LoadCatalog()
 	var mf *metrics.Factory
@@ -129,7 +129,7 @@ func Run(ctx context.Context, args []string, env tracing.LookupEnv, stdout io.Wr
 		return exitFailure
 	}
 
-	// Step 7: admin listener, bound and serving (not yet ready).
+	// Step 6: admin listener (Listen + Serve), not yet ready.
 	admin := adminhttp.New(adminhttp.Options{
 		Addr:     settings.AdminListen,
 		Gatherer: reg,
@@ -143,19 +143,27 @@ func Run(ctx context.Context, args []string, env tracing.LookupEnv, stdout io.Wr
 	}
 	serveErr := make(chan error, 1)
 	go func() {
+		returned := false
+		defer func() {
+			if !returned { // panicked: recoverPanic (below) already logged it
+				serveErr <- errServePanic
+			}
+		}()
 		defer recoverPanic(life)
 		if err := admin.Serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- err
 		}
+		returned = true
 	}()
 
-	// Step 8: hold point for tests, then tracing as the last step.
+	// Step 7: BeforeLastStep hold point.
 	if hooks.BeforeLastStep != nil {
 		hooks.BeforeLastStep(ctx)
 	}
 	var tr *tracing.Tracing
 	code := exitOK
 	if ctx.Err() == nil {
+		// Step 8: tracing.Start (last step).
 		tr, err = tracing.Start(ctx, tracing.Options{
 			Settings: settings,
 			Env:      env,
@@ -164,24 +172,26 @@ func Run(ctx context.Context, args []string, env tracing.LookupEnv, stdout io.Wr
 			Metrics:  mf,
 			Logger:   mustLogger(factory, logging.Tracing),
 		})
-		if err != nil {
+		switch {
+		case err != nil && ctx.Err() != nil:
+			tr = nil // cancelled during startup: graceful path, no failure record
+		case err != nil:
 			logFailure(life, err)
 			shutdownAdmin(life, admin)
 			return exitFailure
-		}
-
-		// Step 9: ready.
-		admin.MarkStarted()
-		life.Info(msgStartupComplete)
-		if hooks.Started != nil {
-			hooks.Started(Handles{AdminAddr: admin.Addr(), TracerProvider: tr.TracerProvider(), Gatherer: reg})
-		}
-
-		select {
-		case <-ctx.Done():
-		case err := <-serveErr:
-			logServe(life, err)
-			code = exitFailure
+		default:
+			// Step 9: ready.
+			admin.MarkStarted()
+			life.Info(msgStartupComplete)
+			if hooks.Started != nil {
+				hooks.Started(Handles{AdminAddr: admin.Addr(), TracerProvider: tr.TracerProvider(), Gatherer: reg})
+			}
+			select {
+			case <-ctx.Done():
+			case err := <-serveErr:
+				logServe(life, err)
+				code = exitFailure
+			}
 		}
 	}
 
@@ -197,6 +207,9 @@ func Run(ctx context.Context, args []string, env tracing.LookupEnv, stdout io.Wr
 	}
 	return code
 }
+
+// errServePanic is the constant failure delivered when the Serve goroutine panics.
+var errServePanic = errors.New("admin serve goroutine panicked")
 
 func shutdownAdmin(l *slog.Logger, admin *adminhttp.Server) {
 	ctx, cancel := context.WithTimeout(context.Background(), adminShutdownTimeout)
