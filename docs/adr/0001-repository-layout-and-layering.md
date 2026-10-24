@@ -46,7 +46,8 @@ Ownership:
   `LICENSE`, `docs/operations/`, and any embedded data files (for example the
   metric catalog).
 - Test writers own every `*_test.go` file anywhere, every `testdata/`
-  directory, and everything under `tests/`.
+  directory, and everything under `tests/`. They may also add `go.mod` /
+  `go.sum` requirements when a self-test needs them (ADR-0002).
 - Unit tests are co-located `_test.go` files. They should use external test
   packages (`package foo_test`) so they can import `internal/testkit/...`
   without import cycles.
@@ -61,8 +62,9 @@ only by `make test-functional`. Everything else, including
   `go list ./internal/domain/...` matches nothing. SPEC-001 introduces
   `internal/domain/health` (readiness port) for this reason and because the
   readiness port is a domain concept implemented by the future pool.
-- Production code must not import `internal/testkit`. Reviewers check this;
-  a later lint can enforce it.
+- Production code must not import `internal/testkit` or
+  `golang.org/x/tools`. Reviewers check this, and SPEC-001 task T21 adds a
+  lint test enforcing it.
 - The `tests/` ownership rule in CLAUDE.md is preserved: harness code that
   needs an independent self-test sits in `internal/testkit/` (implementer) and
   its self-tests sit in `_test.go` files or `tests/` (test writer).

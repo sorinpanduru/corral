@@ -21,7 +21,15 @@ responding, recording transport headers and content encoding.
   accept, reject (HTTP 4xx/5xx, gRPC non-OK status), unresponsive (hold the
   request until the test closes the collector). It records decoded span
   payloads, resource attributes, transport headers / metadata, content
-  encoding, and the number of accepted TCP connections.
+  encoding, and the number of accepted TCP connections. Decided by
+  Orchestrator under Owner's standing instruction, 2026-10-24: request
+  bodies are bounded by `MaxBodyBytes` (4 MiB): over OTLP/HTTP it caps both
+  the raw body (`http.MaxBytesReader`) and the decompressed gzip stream, and
+  an oversized body gets 413 with no spans recorded; over OTLP/gRPC the
+  grpc-go default 4 MiB receive limit applies, after decompression; recorded bytes attributes
+  are rendered as padded standard base64 and arrays/kvlists as sorted
+  compact JSON (the marker scanner works on this rendering); `ConnCount()`
+  is read while the collector is open, before `Close()`.
 - An "unreachable collector" in tests is a loopback address whose port was
   reserved and then closed by the test, not a remote host.
 - `internal/testkit/markerscan` implements the AC-33 harness. It captures

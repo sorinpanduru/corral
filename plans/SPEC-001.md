@@ -4,13 +4,13 @@
 - Planner date: 2026-10-24
 - Scope: everything needed for the Part A ACs (AC-1, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 21, 24, 25, 26, 27, 28, 29, 30, 31, 33, 35, 36, 37, 38), the repository bootstrap, and the FR-36 operator documentation (verified by review).
 - Out of scope: Part B ACs (AC-2, 9, 10, 17, 18, 19, 22, 23, 34, 39). The FR-40 collection extractor (only exercised by Part B AC-39) is not built here; the first spec that records collection names builds it. FR-22/FR-32 span shapes are not built (no proxy path yet). `Enabled()` from T15 is the hook later specs use for FR-19/AC-22.
-- Go version assumed: Go 1.26 (`go 1.26` in go.mod). See ADR-0002 for the rule if OTel v1.47.0 requires newer.
+- Go version: `go 1.26.0` in go.mod, because OTel v1.47.0 requires it (ADR-0002; decided by Orchestrator under Owner's standing instruction, 2026-10-24).
 - Docker: no Part A task needs Docker. All collectors are in-process fakes (ADR-0005). **No twin is needed.**
 
 ## ADRs written for this plan
 
 - `docs/adr/0001-repository-layout-and-layering.md`: layout, layering, file ownership, build tags.
-- `docs/adr/0002-go-version-and-dependency-pins.md`: Go 1.26, OTel v1.47.0 set, semconv v1.33.0, other deps.
+- `docs/adr/0002-go-version-and-dependency-pins.md`: `go 1.26.0`, OTel v1.47.0 set, semconv v1.33.0, x/net security bump, other deps, test-writer go.mod rule.
 - `docs/adr/0003-interim-settings-loading.md`: (Accepted, D1) flags named like logical settings.
 - `docs/adr/0004-metric-catalog.md`: embedded JSON catalog, lint, catalog-backed factory; error labels `error_class` / `error_detail` (Accepted, D4).
 - `docs/adr/0005-telemetry-test-infrastructure.md`: in-process fake OTLP collector, marker scanner, fake clock, no Docker, runtime-generated certificates.
@@ -25,8 +25,12 @@
 | `go.opentelemetry.io/otel/exporters/otlp/otlptrace`, `/otlptracehttp`, `/otlptracegrpc` | v1.47.0 |
 | `go.opentelemetry.io/otel/semconv/v1.33.0` | package inside otel v1.47.0; only semconv version allowed |
 | `google.golang.org/grpc`, `go.opentelemetry.io/proto/otlp`, `github.com/go-logr/logr`, `google.golang.org/protobuf` | as selected by OTel v1.47.0 (no independent bump) |
+| `golang.org/x/net` | v0.61.0 (security bump for GO-2026-6617/6612/6611/6603; deviates from OTel's selection) |
+| `golang.org/x/sys`, `golang.org/x/text` | v0.49.0, v0.43.0 (followed the x/net bump) |
 | `github.com/prometheus/client_golang` | latest stable v1.x at T7; record in ADR-0002 |
-| `golang.org/x/tools` | latest stable at T4; test-only use |
+| `golang.org/x/tools` | v0.52.0 (T4); `internal/testkit` and test-only use (T21 enforces) |
+
+Test writers may add `go.mod`/`go.sum` requirements when a self-test needs them; the planner records any new module in ADR-0002 (decided by Orchestrator under Owner's standing instruction, 2026-10-24).
 
 ## Rules for every task
 
@@ -35,7 +39,9 @@
 - Synthetic data only. Markers are random synthetic strings generated per test.
 - Unit tests prefer external test packages (`package x_test`) to avoid cycles with `internal/testkit`.
 - Tests that set `OTEL_*` use `t.Setenv` and do not run in parallel.
-- No production package imports `internal/testkit/...`.
+- No production package imports `internal/testkit/...` or `golang.org/x/tools/...` (lint test from T21).
+- Residual risk (FR-24): `logcheck` and `constmsg` check keys, components and message constness, not the values of allowed keys. FR-24 therefore relies on the source sanitisers (T5 `errclass`, T6 `sanitize`) and on the marker scans (T14, T19). Every new call site that emits `error`, `stack`, or db/address keys must take the value from an `errclass`/`sanitize` helper, never from raw input or `err.Error()`. Reviewers check this.
+- Control characters: the sanitisers pass control characters through by design (T5/T6). Such values may only be rendered by slog's escaping handlers (JSON/text from `logging.NewHandler`); never concatenate them into strings, messages, headers or response bodies (applies especially to T8 bridges and T17 responses).
 - `make test` runs with `-race`.
 - Test fixtures must not commit `*.pem`, `*.key` or `*.p12` files (they are gitignored in `/.gitignore`). Tests that need certificates or keys generate them at runtime (for example `crypto/x509` + `crypto/ecdsa` into `t.TempDir()`); only synthetic, non-secret material is generated.
 - `make test-functional` is not a gate until T18 creates `tests/functional`. Before then, reviewers and the Orchestrator gate on `make build` and `make test` only.
@@ -57,7 +63,7 @@
 | `internal/infra/telemetry/tracing` | T10, T11, T15, T16 |
 | `internal/infra/telemetry/tracing/spanqueue` | T12 |
 | `internal/infra/adminhttp` | T17 |
-| `internal/testkit/importcheck`, `constmsg`, `logcheck`, `fakeclock`, `otlpcollector`, `markerscan` | T2, T4, T8, T13, T14 |
+| `internal/testkit/importcheck`, `constmsg`, `logcheck`, `fakeclock`, `otlpcollector`, `markerscan` | T2 (+T21), T4, T8, T13, T14 |
 
 ---
 
@@ -66,7 +72,7 @@
 ### T1: Repository bootstrap
 
 - Goal: buildable empty module and factory tooling.
-  - `go.mod`: `module github.com/sorinpanduru/corral`, `go 1.26`. No requires yet (later tasks add pinned deps).
+  - `go.mod`: `module github.com/sorinpanduru/corral`, `go 1.26.0` (raised from `go 1.26` per ADR-0002). No requires yet (later tasks add pinned deps).
   - `Makefile` targets: `build` (builds `./cmd/corral` into `bin/corral`), `test` (`go vet ./...` then `go test -race -count=1 ./...`; the `functional` build tag is not set so functional tests are excluded), `test-functional` (`go test -race -count=1 -tags functional ./tests/functional/...`; depends on `build`; does not require Docker for SPEC-001, see ADR-0005; not a gate until T18 creates `tests/functional`). Optional `tidy` target.
   - `LICENSE`: full Apache License 2.0 text, unmodified.
   - Skeleton: `cmd/corral/main.go` (stub `main` that exits 0), `internal/domain/doc.go` (package doc stating the FR-1 rule), `.gitignore` (`bin/`, coverage files, `*.pem`, `*.key`, `*.p12`; already present, keep these entries).
@@ -90,7 +96,8 @@
   - `health.Reason` (string type); `health.ReasonStarting = "starting"`, `health.ReasonShuttingDown = "shutting_down"`, `health.ReasonUnknown = "unknown"` (D6; the spec writer is adding `unknown` and `shutting_down` to the spec's reason set); `health.Reasons() []Reason` (the full defined set).
   - `health.Status{Ready bool; Reason Reason}`.
   - `health.Readiness` interface: `Readiness(ctx context.Context) Status`.
-  - `importcheck.Check(dir, pattern, domainPrefix string, allow []string) ([]Violation, error)`; `importcheck.DomainAllowlist` (empty).
+  - `importcheck.Check(dir, pattern, domainPrefix string, allow []string) ([]Violation, error)`; `importcheck.Scan(dir, pattern, domainPrefix string) ([]string, error)` (returns the matched package import paths under the prefix); `importcheck.DomainAllowlist` (empty).
+  - `Check` and `Scan` reject a `pattern` with a leading `-` (no flag injection into `go list`) and return an error when the pattern matches no package under the prefix (an empty match never passes silently). They run `go list` with a hermetic environment (T21 adds `GOENV=off` and `GOPACKAGESDRIVER=off`; T21 also adds `importcheck.Forbidden`). Decided by Orchestrator under Owner's standing instruction, 2026-10-24.
 - Docker: no.
 - Depends on: T1.
 
@@ -98,7 +105,7 @@
 
 - Goal: the only way to obtain a logger, with FR-5/6/7/8/39 behaviour.
   - `internal/infra/telemetry/attr`: string constants for every allowed log key and every FR-23 span attribute key, and for `error`, `corral.error.detail`, `setting`, `stack`, `trace_id`, `span_id`, `suppressed_count`. Used by logging, errclass, tracing and logcheck so the allowlist exists once.
-  - `logging`: component enum and validation; key allowlist predicate (fixed keys, FR-23 keys, and the numeric `_seconds`/`_bytes`/`_count` snake_case rule); `ParseFormat`/`ParseLevel` (case-insensitive, rejects offsets like `debug-4`, `info+2`); `NewHandler` writing synchronously to a given writer (FR-38) in JSON or slog text; `WithTraceCorrelation` wrapper adding `trace_id`/`span_id` (lowercase hex 32/16) when the record's context has a valid span context, sampled or not (installed whenever tracing is enabled, including `OTEL_TRACES_EXPORTER=none`, D9); `Factory` that returns loggers with a bound `component` and rejects unknown components; `BootstrapLogger` (JSON to a writer, `component=config`) for errors before configuration (FR-27).
+  - `logging`: component enum and validation; key allowlist predicate (fixed keys, FR-23 keys, and the numeric `_seconds`/`_bytes`/`_count` snake_case rule); `ParseFormat`/`ParseLevel` (both case-insensitive; `ParseLevel` rejects offsets like `debug-4`, `info+2`); `NewHandler` writing synchronously to a given writer (FR-38) in JSON or slog text; `WithTraceCorrelation` wrapper adding `trace_id`/`span_id` (lowercase hex 32/16) when the record's context has a valid span context, sampled or not (installed whenever tracing is enabled, including `OTEL_TRACES_EXPORTER=none`, D9); `Factory` that returns loggers with a bound `component` and rejects unknown components; `BootstrapLogger` (JSON to a writer, `component=config`) for errors before configuration (FR-27).
   - No `slog` groups are used anywhere in this package's output.
 - FRs/ACs: FR-4, FR-5, FR-6, FR-7, FR-8 (handler part), FR-38, FR-39; AC-3 (unit part), AC-4, AC-5 (factory part), AC-6 (unit part of the correlation wrapper).
 - Implementer owns: `internal/infra/telemetry/attr/*.go`, `internal/infra/telemetry/logging/*.go` (non-test).
@@ -106,7 +113,8 @@
 - Interfaces defined:
   - `logging.Component` with constants `Config, Lifecycle, AdminHTTP, Tracing, OTel, GRPC, ThirdParty` (`ThirdParty = "thirdparty"`, D5; the spec writer is amending FR-7/FR-28); `logging.Components() []Component`; `logging.ValidComponent(Component) bool`.
   - `logging.AllowedKey(key string) bool`; `logging.NumericKey(key string) bool`.
-  - `logging.Format` (`FormatJSON`, `FormatText`); `logging.ParseFormat(string) (Format, error)`; `logging.ParseLevel(string) (slog.Level, error)`.
+  - `logging.Format` (`FormatJSON`, `FormatText`); `logging.ParseFormat(string) (Format, error)`; `logging.ParseLevel(string) (slog.Level, error)`. Both parsers are case-insensitive (decided by Orchestrator under Owner's standing instruction, 2026-10-24).
+  - Sentinel errors (match with `errors.Is`): `logging.ErrInvalidFormat`, `logging.ErrInvalidLevel`, `logging.ErrUnknownComponent` (returned by `(*Factory).Logger` for an unknown component).
   - `logging.NewHandler(w io.Writer, f Format, level slog.Leveler) slog.Handler`.
   - `logging.WithTraceCorrelation(h slog.Handler) slog.Handler`.
   - `logging.NewFactory(h slog.Handler) *Factory`; `(*Factory).Logger(c Component) (*slog.Logger, error)`; `(*Factory).Handler() slog.Handler`.
@@ -117,21 +125,33 @@
 ### T4: Log-check test handler and constant-message static check
 
 - Goal: the AC-5 enforcement tools every later suite uses.
-  - `internal/testkit/logcheck`: a `slog.Handler` bound to a `testing.TB` that fails the test on a record with no `component`, a component outside `logging.Components()`, a key that `logging.AllowedKey` rejects, any group (including `WithGroup` and `slog.Group` values), or a numeric-suffix key with a non-numeric value. It also records records (level, msg, attrs) for assertions and can tee to a writer (to also produce real JSON/text output).
+  - `internal/testkit/logcheck`: a `slog.Handler` bound to a `testing.TB` that fails the test on a record with no `component`, a component outside `logging.Components()`, a key that `logging.AllowedKey` rejects, any group (including `WithGroup` and `slog.Group` values), a numeric-suffix key with a non-numeric value, a caller-set `msg`, `level` or `time` attribute key, or a duplicate `component` (for example `With("component", ...)` on an already bound logger). It also records records (level, msg, attrs) for assertions and can tee to a writer (to also produce real JSON/text output).
   - `internal/testkit/constmsg`: loads packages with `golang.org/x/tools/go/packages`, finds every call to the `log/slog` package-level functions and `*slog.Logger` methods that take a message (`Debug/Info/Warn/Error`, their `Context` variants, `Log`, `LogAttrs`) and reports each call whose message argument is not a compile-time constant (`types.TypeAndValue.Value == nil`).
+    - Loading: `-tags=functional` (so functional tests are covered), environment `GOPACKAGESDRIVER=off` and `CGO_ENABLED=0`.
+    - Also flagged: those slog functions/methods used as values (not called directly), method expressions (for example `(*slog.Logger).Info`), `slog.NewRecord` with a non-constant message, and multi-value spreads into a message-taking call (`l.Info(f())`).
+    - Accepted limitations (not flagged): calls through user-defined interfaces, and `slog.NewLogLogger(...).Printf` and similar `*log.Logger` output. Revisit `NewLogLogger` at T8 (the `thirdparty` bridge and admin HTTP `ErrorLog`), where the bridges replace the message with a constant anyway.
+    - Decided by Orchestrator under Owner's standing instruction, 2026-10-24.
 - FRs/ACs: FR-7, FR-39; AC-5 (test-handler and static-check parts).
 - Implementer owns: `internal/testkit/logcheck/*.go`, `internal/testkit/constmsg/*.go` (non-test).
 - Test writer owns: self-tests `internal/testkit/logcheck/*_test.go`, `internal/testkit/constmsg/*_test.go` with `testdata/` fixtures (one constant and one non-constant message); `tests/lint/constmsg_test.go` running the check over `./...` (excluding testdata); retrofit T3 suites to use logcheck.
 - Interfaces defined: `logcheck.New(tb testing.TB, opts ...Option) *Handler`; `(*Handler).Records() []Record`; option `Tee(io.Writer, logging.Format)`. `constmsg.Check(dir string, patterns ...string) ([]Finding, error)`.
 - Docker: no.
-- Depends on: T3. Adds `golang.org/x/tools`.
+- Depends on: T3. Adds `golang.org/x/tools` v0.52.0.
 
 ### T5: Error classification and sanitisation
 
 - Goal: FR-29 class and detail enums, the classifier, and the only helpers that put errors into logs and spans.
   - Class enum: `timeout, network, protocol, server, config, internal`. Detail enum: the 14 FR-29 values.
   - Classifier walks the error chain (`errors.Is`/`errors.As`): `context.DeadlineExceeded`, `context.Canceled`, `os.ErrDeadlineExceeded`/`net.Error.Timeout()`, `syscall.Errno` values (ECONNREFUSED, ECONNRESET, ECONNABORTED, ETIMEDOUT, EPIPE, EHOSTUNREACH, ENETUNREACH, EADDRINUSE), `io.EOF`/`io.ErrUnexpectedEOF`, `*net.DNSError`, TLS handshake errors (`tls.RecordHeaderError`, `*tls.CertificateVerificationError`, `x509` errors, alert errors), server-reply errors, config errors, recovered panics. Class mapping per D3.
-  - Duck-typed contracts so no concrete domain/config types are needed: a server-reply error exposes `ServerCode() int32` and `ServerCodeName() string`; a config error exposes `ConfigSetting() string`.
+  - Duck-typed contracts so no concrete domain/config types are needed: a server-reply error exposes `ServerCode() int32` and `ServerCodeName() string`; a config error exposes `ConfigSetting() string`; a protocol error exposes `ProtocolError()` (marker method, class `protocol`).
+  - Review decisions (decided by Orchestrator under Owner's standing instruction, 2026-10-24):
+    - Precedence when a chain matches several kinds: panic > config > server > protocol > errno (then the remaining D3 rules).
+    - A raw `EADDRINUSE` (not wrapped in a config error) is `network`/`EADDRINUSE`. The admin bind failure is `config`/`EADDRINUSE` only because T17 wraps it in `config.Error` and config outranks errno.
+    - `LogAttrs(nil)` returns nil; `RecordSpan(span, nil)` is a no-op.
+    - `ServerCodeName()` is emitted only if it matches `^[A-Za-z0-9_]{1,64}$`; otherwise `corral.db.response.code_name` is omitted (the numeric code is still emitted).
+    - Stacks kept by `FromPanic` are capped at 32 KiB, cut at a line boundary.
+    - The chain walk (`Unwrap() error` and `Unwrap() []error`) is bounded (fixed maximum depth/node count) so cyclic or very deep chains terminate.
+    - T15 must wrap OTLP collector rejections in a type implementing `ProtocolError()` so they classify as `protocol`/`other` (D3).
   - `FromPanic` converts a recovered value into an `internal` error that keeps an optional stack and discards the value (its `Error()` returns a constant).
   - Log helper returns `error=<class>`, `corral.error.detail=<detail>`, and for server errors `db.response.status_code` (string) and `corral.db.response.code_name`. Never `err.Error()`.
   - Span helper sets status Error with empty description, `error.type`, `corral.error.detail`, and server attributes. Never calls `RecordError`, never adds events.
@@ -141,7 +161,7 @@
 - Interfaces defined:
   - `errclass.Class`, `errclass.Detail`, `errclass.Classes() []Class`, `errclass.Details() []Detail`.
   - `errclass.Classify(err error) (Class, Detail)`.
-  - `errclass.ServerError` and `errclass.ConfigError` interfaces as above.
+  - `errclass.ServerError`, `errclass.ConfigError` and `errclass.ProtocolError{ ProtocolError() }` interfaces as above.
   - `errclass.FromPanic(recovered any, stack []byte) error`; `errclass.Stack(err error) ([]byte, bool)`.
   - `errclass.LogAttrs(err error) []slog.Attr`.
   - `errclass.RecordSpan(span trace.Span, err error)`.
@@ -199,6 +219,8 @@
       - Both follow the configured level (level filtering, then the bridge's per-level limiter). They are not subject to the warn-and-above rule that applies to `grpc`/`otel`/`admin_http`.
       - corral's own code never logs through `slog.Default()` or `log`; it always uses the factory.
   - All fixed messages are exported constants.
+  - Control characters (Rules for every task): bridged values (error class/detail attrs) are only rendered through slog's escaping handlers; never concatenated.
+  - Revisit the T4 `constmsg` limitation for `slog.NewLogLogger(...).Printf` here: the admin HTTP `ErrorLog` and std `log` bridge must replace the message with a constant regardless of what is printed.
 - FRs/ACs: FR-28, FR-33; AC-26, AC-29.
 - Implementer owns: `internal/infra/telemetry/ratelimit/*.go`, `internal/infra/telemetry/logbridge/*.go`, `internal/testkit/fakeclock/*.go` (non-test).
 - Test writer owns: `internal/infra/telemetry/ratelimit/*_test.go`, `internal/infra/telemetry/logbridge/*_test.go` (fresh limiter per case, fake clock, marker-seeded third-party text, stderr captured via fd redirection to prove nothing is written there; the fatal path tested in a subprocess; std `log` and `slog.Default()` bridges limited independently, so a burst on one does not suppress the other; `thirdparty` records at debug/info emitted when the configured level allows them).
@@ -281,6 +303,10 @@
   - Modes: accept, reject (configurable HTTP status / gRPC code), unresponsive (blocks until `Close`).
   - Records: decoded `ResourceSpans` (span names, attributes, events, status, resource attributes), per-request transport headers / metadata, content encoding, accepted TCP connection count (via a counting `net.Listener`).
   - Helper to reserve an unreachable loopback endpoint (bind, read port, close).
+  - Review decisions (decided by Orchestrator under Owner's standing instruction, 2026-10-24):
+    - `const MaxBodyBytes = 4 << 20` (4 MiB). OTLP/HTTP: caps both the raw request body (`http.MaxBytesReader`) and the decompressed gzip stream; an oversized body gets 413 and no spans are recorded. OTLP/gRPC: relies on grpc-go's default 4 MiB receive limit, which applies after decompression.
+    - Attribute rendering in recorded spans/resources: bytes values as padded standard base64; arrays and kvlists as compact JSON with sorted keys. T14 builds its `spans` scan text from this rendering, so marker encodings must account for it.
+    - `ConnCount()` is read while the collector is open, before `Close()`.
 - FRs/ACs: supports AC-3 (integration), AC-14, AC-15, AC-24, AC-27, AC-28, AC-33, AC-38.
 - Implementer owns: `internal/testkit/otlpcollector/*.go` (non-test).
 - Test writer owns: `internal/testkit/otlpcollector/*_test.go` (self-test using the real OTel exporters).
@@ -291,7 +317,7 @@
 ### T14: Marker-scan harness (AC-33)
 
 - Goal: reusable leak scanner for AC-38 now and AC-18 in feature specs.
-  - Sources: `stdout`, `stderr`, `metrics`, `readyz`, `spans` (collector payload text built from span names, attribute keys and values, event names and attributes, status descriptions, resource attributes; transport headers excluded).
+  - Sources: `stdout`, `stderr`, `metrics`, `readyz`, `spans` (collector payload text built from span names, attribute keys and values, event names and attributes, status descriptions, resource attributes; transport headers excluded). Attribute values use T13's rendering (bytes as padded standard base64, arrays/kvlists as sorted compact JSON); the raw-marker pattern must still match inside JSON-rendered arrays, and a marker carried in a bytes attribute is found via its base64 patterns.
   - Capture helpers: in-process stdout/stderr fd redirection; child-process pipes; HTTP body fetch for `/metrics` and `/readyz`; collector payload extraction from T13.
   - Encodings per marker: raw; hex lower and upper; base64 standard and URL-safe, each with 0, 1 and 2 prefix bytes, dropping unstable edge characters.
   - Per-marker source selection (all or subset).
@@ -310,6 +336,7 @@
   - `otlp`: `otlptracehttp` or `otlptracegrpc` per protocol, process environment pass-through, wrapped in the T12 processor with the T7 counter; sampler and resource from T11; sets the global provider and `propagation` is not configured (no incoming context).
   - Returns whether the logging layer must use `logging.WithTraceCorrelation` (whenever tracing is enabled, including `OTEL_TRACES_EXPORTER=none`; D9).
   - Test-only exporter override option.
+  - OTLP collector rejections (HTTP non-2xx, gRPC non-transport status) are wrapped in a corral type implementing `errclass.ProtocolError` before they reach `otel.Handle`/logs, so they classify as `protocol`/`other` (D3, T5 review decision).
 - FRs/ACs: FR-8, FR-19, FR-20, FR-21, FR-30, FR-37 wiring; AC-3 (integration: unreachable collector, all captured stdout lines JSON, no stderr), AC-6 (integration: sampled and unsampled spans give `trace_id`/`span_id`, also with `OTEL_TRACES_EXPORTER=none` per D9; disabled gives neither), AC-14 (integration: three setups, provider records no spans except `none`, zero TCP connections), AC-15 (HTTP default, grpc, TRACES_ precedence, `otlp` same as unset, endpoint honoured, gzip), AC-24 (header received, resource values, `service.name=corral` default), AC-27 (integration).
 - Implementer owns: `internal/infra/telemetry/tracing/tracing.go` and `internal/infra/telemetry/tracing/start*.go`.
 - Test writer owns: `tests/integration/tracing/*_test.go` (bootstrap + logging factory with logcheck tee + T13 collector + `markerscan.CaptureStdio`).
@@ -337,6 +364,7 @@
   - `/healthz`: 200, `ok\n`, `text/plain; charset=utf-8`.
   - `/readyz` (ADR-0006, D6): all responses `Content-Type: text/plain; charset=utf-8`. 200 body `ok\n`; 503 body `<reason>\n`. 503 `starting` until `MarkStarted`, and the registered `health.Readiness` is not consulted before then. After `MarkStarted`, delegates to the registered `health.Readiness` (if any) or returns 200. A reason outside `health.Reasons()` is returned as 503 `unknown` (the original reason is never echoed). From the `MarkStopping` call onward (graceful shutdown), 503 `shutting_down` regardless of the registered check. `MarkStopping` takes effect synchronously before it returns, so any `/readyz` request served after it returns gets `shutting_down`.
   - `Listen` binds `admin.listen`; on failure returns `config.NewError("admin.listen", cause)` (detail e.g. `EADDRINUSE`), never the address in any text. `http.Server.ErrorLog` from `logbridge.NewHTTPErrorLog`. Sensible server timeouts (read header timeout) to avoid slowloris on an unauthenticated listener.
+  - Control characters (Rules for every task): response bodies contain only fixed strings (`ok`, reasons from `health.Reasons()`); nothing from requests or sanitiser output is concatenated into responses or headers.
 - FRs/ACs: FR-9, FR-14 (exposure), FR-15, FR-16 (bind), FR-17, FR-18, FR-28 (ErrorLog wiring), FR-35; AC-7 (handler-level), AC-11 (unit: default bind `127.0.0.1:9187`, configured address, `0.0.0.0:<port>`), AC-12, AC-13, AC-30 (unit: in-use address gives `config.Error` with `admin.listen`, no address text).
 - Implementer owns: `internal/infra/adminhttp/*.go` (non-test).
 - Test writer owns: `internal/infra/adminhttp/*_test.go`.
@@ -382,6 +410,21 @@
 - Docker: no.
 - Depends on: T9, T17 (facts stable). Documents the interim flag syntax (D1) as temporary until the configuration spec, and the `/readyz` reasons (`starting`, `shutting_down`, `unknown`, plus any other defined reasons).
 
+### T21: Production import lint and hermetic importcheck environment
+
+Added after the T2–T6/T13 reviews (decided by Orchestrator under Owner's standing instruction, 2026-10-24).
+
+- Goal:
+  - (a) A lint test proving that no non-test package in the module, outside `internal/testkit/...`, imports `github.com/sorinpanduru/corral/internal/testkit/...` or `golang.org/x/tools/...`. Reuses `importcheck` (same `go list -deps -json` machinery; non-test `Imports` only).
+  - (b) `importcheck`'s `go list` environment adds `GOENV=off` and `GOPACKAGESDRIVER=off` to the existing hermetic environment.
+  - The new check keeps T2's guards: leading `-` in a pattern rejected, empty match is an error.
+- FRs/ACs: supports AC-1 (same import-boundary tooling); enforces the ADR-0001/ADR-0002 rule that production code does not import test infrastructure (FR-24 hygiene, review item).
+- Implementer owns: `internal/testkit/importcheck/*.go` (non-test).
+- Test writer owns: `tests/lint/testkit_imports_test.go` (runs the check over `./...` from the repo root; a violating fixture under `tests/lint/testdata/**` proves it fails); updates to importcheck self-tests for the env change.
+- Interfaces defined: `importcheck.Forbidden(dir, pattern string, exclude []string, forbidden []string) ([]Violation, error)`: reports every non-test import, by a matched package whose import path is not under any `exclude` prefix, of a path under any `forbidden` prefix. `Check` and `Scan` are unchanged apart from the environment.
+- Docker: no.
+- Depends on: T4 (needs `golang.org/x/tools` present so the rule is meaningful; `constmsg` is the expected only importer). Independent of T5–T20; can run in any wave after T4.
+
 ---
 
 ## Ordering and parallelism
@@ -389,7 +432,7 @@
 - Wave 1: T1.
 - Wave 2: T2, T3, T6, T13 (parallel).
 - Wave 3: T4, T5, T14 (T4 and T5 need T3; T14 needs T13).
-- Wave 4: T7, T8, T9 (need T5; T8 and T9 also need T3).
+- Wave 4: T7, T8, T9 (need T5; T8 and T9 also need T3); T21 (needs only T4; may also run in any later wave).
 - Wave 5: T10, T12, T17 (T10 needs T9; T12 needs T7; T17 needs T2, T7, T8, T9).
 - Wave 6: T11 (needs T10).
 - Wave 7: T15 (needs T8, T10, T11, T12, T13).
@@ -401,7 +444,7 @@
 
 | AC | Task(s) |
 |---|---|
-| AC-1 | T2 |
+| AC-1 | T2, T21 (hermetic env, production import lint) |
 | AC-3 | T3 (unit), T15 (integration), T18 (functional) |
 | AC-4 | T3 |
 | AC-5 | T3 (factory rejects unknown components), T4 (test handler, constant-message check; applied by all later suites) |
@@ -439,7 +482,7 @@ No open questions remain.
 
 - **D1 (Q1; T9, T18, T20; ADR-0003 Accepted).** Interim loader: command-line flags named exactly like the logical settings (for example `-log.level=debug`), per ADR-0003, to be replaced by the configuration spec.
 - **D2 (Q2; T6).** The initial central command-name allowlist is exactly `find` and `hello`.
-- **D3 (Q3; T5, T17).** FR-29 error class mapping, as proposed by the planner: `deadline_exceeded` -> `timeout`; OS/net timeouts (`ETIMEDOUT`, `net.Error.Timeout()`) -> `timeout`; `canceled` -> `internal`; `ECONNREFUSED`/`ECONNRESET`/`ECONNABORTED`/`EPIPE`/`EHOSTUNREACH`/`ENETUNREACH`/`eof`/`dns_resolution`/`tls_handshake` -> `network`; MongoDB server reply -> `server`/`other`; wire-protocol parse errors -> `protocol`/`other`; any error wrapped as a config error (including the admin bind failure, detail `EADDRINUSE`) -> `config`; recovered panic -> `internal`/`other`; OTLP collector rejections (HTTP non-2xx, gRPC non-transport status) -> `protocol`/`other`; anything else -> `internal`/`other`. In particular: `canceled` -> `internal`; collector rejections -> `protocol`/`other`; admin bind failure -> `config` with detail `EADDRINUSE`.
+- **D3 (Q3; T5, T17).** FR-29 error class mapping, as proposed by the planner: `deadline_exceeded` -> `timeout`; OS/net timeouts (`ETIMEDOUT`, `net.Error.Timeout()`) -> `timeout`; `canceled` -> `internal`; `ECONNREFUSED`/`ECONNRESET`/`ECONNABORTED`/`EPIPE`/`EHOSTUNREACH`/`ENETUNREACH`/`eof`/`dns_resolution`/`tls_handshake` -> `network`; MongoDB server reply -> `server`/`other`; wire-protocol parse errors -> `protocol`/`other`; any error wrapped as a config error (including the admin bind failure, detail `EADDRINUSE`) -> `config`; recovered panic -> `internal`/`other`; OTLP collector rejections (HTTP non-2xx, gRPC non-transport status) -> `protocol`/`other`; anything else -> `internal`/`other`. In particular: `canceled` -> `internal`; collector rejections -> `protocol`/`other`; admin bind failure -> `config` with detail `EADDRINUSE`. Refined after T5 review (decided by Orchestrator under Owner's standing instruction, 2026-10-24): precedence panic > config > server > protocol > errno; a raw `EADDRINUSE` is `network`/`EADDRINUSE`; protocol errors (including T15's collector-rejection wrapper) are recognised via the `ProtocolError()` marker method.
 - **D4 (Q4; T7; ADR-0004 Accepted).** Metric label names for the FR-29 error class and detail are `error_class` and `error_detail`. The spec writer is amending AC-8's wording (which referred to a `corral.error.detail` label) to match.
 - **D5 (Q5; T3, T4, T8).** A new component `thirdparty` is added to the fixed set. Records from Go's standard `log` package and third-party `slog.Default()` calls are emitted with `component=thirdparty` and a fixed message; their original text is never forwarded. Per spec Amendment 1, these are two bridges with separate limiters; std `log` records arrive at info, `slog.Default()` records keep their caller's level, and both follow the configured level (not the warn-and-above rule for `grpc`/`otel`/`admin_http`). The spec writer is amending FR-7/FR-28. T3 adds `logging.ThirdParty`; T4's logcheck accepts it through `logging.Components()`.
 - **D6 (Q6; T2, T17, T18, T20; ADR-0006 Accepted).** `/readyz`: (a) 200 body `ok\n` with `Content-Type: text/plain; charset=utf-8`; (b) 503 body `<reason>\n`, same Content-Type; (c) 503 `starting` until startup completes, registered checks not consulted before then; (d) a reason outside the defined set returns 503 `unknown`; (e) during graceful shutdown, 503 `shutting_down`, from the moment the lifecycle shutting-down record is emitted (spec Amendment 1). The spec writer is adding `unknown` and `shutting_down` to the reason set.

@@ -12,9 +12,11 @@ version set, and its exporters pull in gRPC and the OTLP protobuf module.
 
 ## Decision
 
-- Go: `go 1.26` in `go.mod` (assumed toolchain: Go 1.26.x). If the go.mod of
-  any pinned OTel v1.47.0 module requires a newer `go` line, raise ours to
-  match and record it here; do not downgrade OTel instead.
+- Go: `go 1.26.0` in `go.mod` (toolchain: Go 1.26.x). OTel v1.47.0 requires
+  `go 1.26.0`, so the line was raised from `go 1.26` to match (decided by
+  Orchestrator under Owner's standing instruction, 2026-10-24). If a pinned
+  module later requires a newer `go` line, raise ours to match and record it
+  here; do not downgrade OTel instead.
 - OpenTelemetry stable set, all exactly `v1.47.0`:
   `go.opentelemetry.io/otel`, `.../otel/trace`, `.../otel/sdk`,
   `.../otel/exporters/otlp/otlptrace`,
@@ -28,14 +30,27 @@ version set, and its exporters pull in gRPC and the OTLP protobuf module.
   `github.com/go-logr/logr`, `google.golang.org/protobuf`.
   The fake OTLP collector (`internal/testkit/otlpcollector`) uses the same
   `go.opentelemetry.io/proto/otlp` collector types.
+- Security exception to the rule above (decided by Orchestrator under Owner's
+  standing instruction, 2026-10-24): `golang.org/x/net` is bumped to
+  `v0.61.0` for GO-2026-6617, GO-2026-6612, GO-2026-6611 and GO-2026-6603.
+  `golang.org/x/sys` `v0.49.0` and `golang.org/x/text` `v0.43.0` followed as
+  required by that bump. This deviates from "versions chosen by OTel" for
+  security reasons only. The bump is re-checked (and dropped if OTel's own
+  selection reaches or exceeds it) when OTel is upgraded.
 - `github.com/prometheus/client_golang`: latest stable v1.x release available
   when the dependency is first added (T7), with `collectors`, `promhttp` and
   `testutil/promlint` packages. Record the exact version in this ADR when
   added. No pre-releases.
-- `golang.org/x/tools` (for `go/packages` in the constant-message check,
-  `internal/testkit/constmsg`): latest stable at first use; test-only usage.
+- `golang.org/x/tools` `v0.52.0` (added by T4, for `go/packages` in the
+  constant-message check, `internal/testkit/constmsg`); test-only usage. No
+  non-test package outside `internal/testkit` may import it (enforced by
+  T21).
 - No YAML library: the metric catalog is JSON (ADR-0004).
 - No other third-party dependency may be added for SPEC-001 without a new ADR.
+- Test writers may add `go.mod`/`go.sum` requirements when a self-test needs
+  them (decided by Orchestrator under Owner's standing instruction,
+  2026-10-24), despite ADR-0001 giving `go.mod` to implementers. Any module
+  not already listed here is recorded in this ADR by the planner afterwards.
 
 ## Consequences
 
