@@ -36,7 +36,7 @@ func TestAllowedKeyRejects(t *testing.T) {
 		"error_class", "error_detail", "db.query.text", "db.query.summary",
 		"client_address", "request", "duration_ms", "retry_count_total",
 		"Retry_Count", "retryCount", "wait-seconds", "waitSeconds",
-		"seconds", "count", "bytes",
+		"seconds", "count", "bytes", "1_count",
 	}
 	for _, k := range keys {
 		if logging.AllowedKey(k) {
@@ -51,7 +51,7 @@ func TestNumericKey(t *testing.T) {
 	no := []string{
 		"", "time", "msg", "component", "seconds", "count",
 		"Timeout_seconds", "timeoutSeconds", "timeout-seconds", "timeout_ms",
-		"retry_count_total", "retry count", "retry_COUNT", "corral.error.detail",
+		"retry_count_total", "retry count", "retry_COUNT", "corral.error.detail", "1_count",
 	}
 	for _, k := range yes {
 		if !logging.NumericKey(k) {

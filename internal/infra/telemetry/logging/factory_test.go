@@ -1,6 +1,8 @@
 package logging_test
 
 import (
+	"errors"
+	"strings"
 	"log/slog"
 	"testing"
 
@@ -42,7 +44,7 @@ func TestFactoryComponentTopLevelOnce(t *testing.T) {
 	if len(lines) != 1 {
 		t.Fatalf("lines = %d", len(lines))
 	}
-	if n := countOccurrences(lines[0], `"component"`); n != 1 {
+	if n := strings.Count(lines[0], `"component"`); n != 1 {
 		t.Errorf(`"component" appears %d times in %s`, n, lines[0])
 	}
 	r := jsonLines(t, buf)[0]
@@ -53,24 +55,21 @@ func TestFactoryComponentTopLevelOnce(t *testing.T) {
 	}
 }
 
-func countOccurrences(s, sub string) int {
-	n := 0
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			n++
-		}
-	}
-	return n
-}
-
 // FR-7, AC-5 (factory part): components outside the fixed set are rejected.
 func TestFactoryRejectsUnknownComponent(t *testing.T) {
 	var buf syncBuffer
 	fac := logging.NewFactory(logging.NewHandler(&buf, logging.FormatJSON, slog.LevelInfo))
-	for _, bad := range []string{"", "proxy", "CONFIG", "third_party", "admin-http", "unknown"} {
+	for _, bad := range []string{"", "proxy", "CONFIG", "third_party", "admin-http", "unknown", marker(t, "cmp-")} {
 		l, err := fac.Logger(logging.Component(bad))
 		if err == nil {
 			t.Errorf("Logger(%q) succeeded, want error", bad)
+		} else {
+			if !errors.Is(err, logging.ErrUnknownComponent) {
+				t.Errorf("Logger(%q) error %v is not ErrUnknownComponent", bad, err)
+			}
+			if bad != "" && strings.Contains(err.Error(), bad) {
+				t.Errorf("Logger error echoes input %q: %v", bad, err)
+			}
 		}
 		if l != nil {
 			t.Errorf("Logger(%q) returned a non-nil logger with an error", bad)
@@ -110,5 +109,14 @@ func TestBootstrapLogger(t *testing.T) {
 	}
 	if r["setting"] != "log.level" || r["error"] != "config" {
 		t.Errorf("attributes lost: %v", r)
+	}
+}
+
+// FR-27: the bootstrap logger suppresses debug output.
+func TestBootstrapLoggerSuppressesDebug(t *testing.T) {
+	var buf syncBuffer
+	logging.BootstrapLogger(&buf).Debug("synthetic debug")
+	if buf.String() != "" {
+		t.Errorf("debug produced output: %q", buf.String())
 	}
 }

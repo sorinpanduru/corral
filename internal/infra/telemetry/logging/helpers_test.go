@@ -2,6 +2,8 @@ package logging_test
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"sync"
@@ -47,4 +49,15 @@ func jsonLines(t *testing.T, b *syncBuffer) []map[string]any {
 		out = append(out, m)
 	}
 	return out
+}
+
+// marker returns a random synthetic marker used to prove rejected input is
+// never echoed in an error message (FR-27).
+func marker(t *testing.T, prefix string) string {
+	t.Helper()
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		t.Fatal(err)
+	}
+	return prefix + hex.EncodeToString(b)
 }
