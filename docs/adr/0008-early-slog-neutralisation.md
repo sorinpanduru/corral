@@ -18,13 +18,16 @@ message and attributes. Go initialises packages in dependency order, ties
 broken by import path; `github.com/sorinpanduru/...` sorts before
 `go.opentelemetry.io/...` and earlyslog has no non-stdlib dependencies, so it
 runs first. cmd/corral blank-imports it and logbridge imports it, so it is
-always linked. `logbridge.Install` drains the counters and replays at most one
-record per level through the thirdparty default-slog handler (fixed message,
-rate limited). Std `log` writes made during init are counted separately and replayed
-through the std-log writer (own message and limiter). Every early record goes
-through the limiter, so extra records land in suppressed_count. Records that
-reach the early handler after Install (captured loggers) are forwarded to the
-bridge handler. Raw values are never retained or output.
+always linked. `logbridge.Install` calls `earlyslog.Handoff`, which returns the counts and makes
+later records of handlers captured during init forward to the bridge handler.
+Every early slog record is then replayed through the rate-limited,
+fixed-message thirdparty default-slog handler (first per level emitted, the rest
+counted in suppressed_count). Std `log` writes made during init are counted
+separately and replayed through the std-log writer (own message and limiter).
+Install has a tiny window between `slog.SetDefault(dh)` and `log.SetOutput(w)`
+in which std log writes carry the slog-default source label; nothing leaks. A
+`*log.Logger` that captured `log.Writer()` at init stays counted, not replayed.
+Raw values are never retained or output.
 
 ## Consequences
 

@@ -62,3 +62,15 @@ func TestHandoffForwardsCapturedLogger(t *testing.T) {
 		t.Fatalf("counts = %+v", got)
 	}
 }
+
+func TestHandoffToSelfIsNoOp(t *testing.T) {
+	Drain()
+	slog.Warn("x")
+	if got := Handoff(handler{}); got.Warn != 1 {
+		t.Fatalf("counts = %+v", got)
+	}
+	slog.Warn("y") // must not recurse; still counted
+	if got := Drain(); got.Warn != 1 {
+		t.Fatalf("counts = %+v", got)
+	}
+}

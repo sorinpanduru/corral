@@ -89,16 +89,21 @@ func take() Counts {
 
 // Handoff makes records that still reach the early handler (for example a
 // *slog.Logger captured during init) flow to h, and returns and resets the
-// counts collected so far.
+// counts collected so far. h must be a fixed-message bridge handler that never
+// forwards record text. Handing off to the early handler itself would recurse
+// forever, so that case is a no-op that only returns the counts.
 func Handoff(h slog.Handler) Counts {
 	mu.Lock()
 	defer mu.Unlock()
-	target = h
+	if _, self := h.(handler); !self {
+		target = h
+	}
 	return take()
 }
 
 // Drain returns and resets the counts and returns the early handler to
-// counting mode.
+// counting mode. It is a test-only reset: it clears the forward target, so it
+// must not be called after Install in production.
 func Drain() Counts {
 	mu.Lock()
 	defer mu.Unlock()
