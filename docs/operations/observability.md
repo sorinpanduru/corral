@@ -1,14 +1,55 @@
 # Observability and operations
 
-This guide covers corral's logging, metrics, tracing and admin listener. It
-describes what the code in `internal/infra/` does today. The configuration
-mechanism below is temporary (see "Settings").
+This guide covers corral's logging, metrics, tracing and admin listener, as
+implemented in `cmd/corral` and `internal/`. The configuration mechanism below
+is temporary (see "Settings"). The proxy itself is not yet built: today the
+binary starts the admin listener and tracing, and serves until it is signalled.
 
-> **Temporary status note (remove when T18 merges):** `cmd/corral` is a stub;
-> the tracing bootstrap and shutdown (T15, T16) and the runtime wiring (T18) are
-> not merged yet. Sections on startup, exit codes, stderr, tracing bootstrap,
-> log correlation and shutdown describe the specified behaviour (SPEC-001,
-> ADR-0006, ADR-0007).
+## Running
+
+```
+make build
+./bin/corral -log.level=info -admin.listen=127.0.0.1:9187
+```
+
+Send `SIGINT` or `SIGTERM` for a graceful shutdown (see "Startup and
+shutdown").
+
+## Startup and shutdown
+
+Startup order:
+
+1. Parse and validate settings. A failure is written to stdout as JSON with
+   `component=config`.
+2. Build the logger from the settings and install the third-party log bridges
+   (`otel`, `grpc`, `slog.Default()`, standard `log`).
+3. Resolve whether tracing is on and validate the `OTEL_*` variables (only when
+   tracing is on). A failure is logged with `component=config`.
+4. Emit the `lifecycle` record `corral starting`.
+5. Register metrics.
+6. Bind the admin listener and start serving. `/healthz` is live and `/readyz`
+   answers `503 starting`.
+7. Start tracing (the last startup step today).
+8. Mark startup complete (`/readyz` becomes `200 ok`), then emit the
+   `lifecycle` record `corral startup complete`.
+
+Any startup failure writes an error record to stdout and exits with status 1.
+
+Shutdown starts on `SIGINT`, `SIGTERM` or an admin listener serve failure.
+`/readyz` switches to `503 shutting_down` immediately before the `lifecycle`
+record `corral shutting down` is emitted. Then the admin server is shut down
+(bounded to 5 seconds) and tracing is shut down (bounded to 5 seconds), so a
+shutdown takes about 10 seconds at worst.
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| 0 | Graceful shutdown, including a signal received during startup (no failure record; `corral shutting down` is still emitted, `corral startup complete` is not if startup had not finished) |
+| 1 | Startup failure, or the admin listener failed while running (`admin listener serve failed` record, then the normal shutdown) |
+
+A step that fails during shutdown is logged at warn level
+(`corral shutdown step failed`) and does not change the exit code.
 
 ## Security and operational warnings
 
@@ -183,10 +224,12 @@ At any level, in logs, metrics, spans, resource attributes or HTTP bodies:
 - recovered panic values;
 - free text from third-party log sources.
 
-What may appear in logs and spans (FR-25 allowlist): client IP and port,
-upstream host and port, database and collection names, connection, request,
-session (UUID only) and cursor IDs, client `appName`, driver name and version,
-and `host.name` as a resource attribute on spans.
+What may appear in logs and spans includes (FR-25 allowlist): client IP and
+port, upstream host and port, database and collection names, the command name,
+connection, request, session (UUID only) and cursor IDs, client `appName`,
+driver name and version, the MongoDB error code and `codeName`, and durations,
+byte sizes and counts. `host.name` may also appear as a resource attribute on
+spans (FR-30).
 
 Errors are reported through a classification (the `error.type` and
 `corral.error.detail` keys) rather than their text. The client `appName` (truncated to 128 bytes) and
@@ -279,8 +322,8 @@ and end never block on the exporter.
 | `OTEL_BSP_SCHEDULE_DELAY` | Maximum time between export attempts while spans are queued, ms | 5000 | positive integer |
 | `OTEL_BSP_EXPORT_TIMEOUT` | Maximum duration of one export call, ms | 30000 | positive integer |
 
-On graceful shutdown, pending spans are flushed for at most 5 seconds; spans
-not exported by then are dropped.
+On graceful shutdown, pending spans are flushed for at most 5 seconds (after
+the admin server's own 5 second bound); spans not exported by then are dropped.
 
 ### Resource attributes
 

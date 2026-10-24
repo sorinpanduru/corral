@@ -6,9 +6,9 @@ MongoDB PHP driver under PHP-FPM, where every worker holds its own persistent
 connection. corral accepts many client connections and multiplexes them over a
 small, bounded pool of upstream connections.
 
-Status: early development. The observability foundation (logging, metrics,
-tracing, admin listener) is implemented as internal packages; the proxy itself
-is not yet built.
+Status: early development. The `corral` binary runs the observability
+foundation (logging, metrics, tracing, admin listener); the proxy itself is not
+yet built.
 
 License: Apache-2.0 (see `LICENSE`).
 
@@ -19,6 +19,16 @@ Requires Go (see `go.mod`).
 - `make build` builds `bin/corral`.
 - `make test` runs `go vet` and the unit and integration tests.
 - `make test-functional` runs the binary-level tests (builds first); available once the functional suite lands (T18).
+
+## Running
+
+```
+make build
+./bin/corral -log.level=info -admin.listen=127.0.0.1:9187
+```
+
+`SIGINT` or `SIGTERM` triggers a graceful shutdown. See the operations guide
+below for settings and exit codes.
 
 ## Documentation
 
