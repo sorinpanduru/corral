@@ -21,18 +21,36 @@ package markerscan_test
 //   TestCaptureStdio                           fd redirection of stdout and stderr.
 //   TestPatterns                               pattern set is non-trivial.
 //
-// Assumed (not fixed by the plan) identifiers, to be matched by T14:
-//   type Source, constants SourceStdout, SourceStderr, SourceMetrics,
-//     SourceReadyz, SourceSpans (all distinct);
-//   type Finding struct { Marker string; Source Source; ... } (Marker is the
-//     marker as given to AddMarker);
-//   type Pattern (opaque here); Patterns returns at least one entry per marker;
-//   AddMarker with no sources means all sources; Findings is computed from
-//     everything added so far, in either call order;
-//   AddCollector scans the collector's recorded spans and resources as source
-//     SourceSpans, rendered per the T13 collector (bytes attributes as padded
-//     standard base64) and never its request headers;
-//   CaptureStdio replaces os.Stdout/os.Stderr and the stop func restores them.
+// Round 2 additions: safe marker alphabet, Encoding names, raw-partial and
+// raw-casefold, truncation caps, AssertClean, split-across-Add, JSON leaves,
+// RunCapture; fd-level capture lives in capture_unix_test.go.
+//
+// API expected from T14 (identifiers not fixed by the plan are marked *):
+//   New() *Scanner
+//   (*Scanner).AddMarker(m string, sources ...Source) error   -- error when m is
+//     shorter than 16 bytes or has a byte outside [A-Za-z0-9_-]; no sources = all
+//   (*Scanner).Add(src Source, data []byte)   -- may be called repeatedly; data
+//     of one source is concatenated, so a marker split across calls is found
+//   (*Scanner).AddCollector(c *otlpcollector.Collector)   -- spans, resources;
+//     JSON array/kvlist renderings are parsed to leaves; headers never scanned
+//   (*Scanner).Findings() []Finding
+//   (*Scanner).Truncated(src Source) bool   *  -- source exceeded the cap
+//   AssertClean(tb testing.TB) on *Scanner: (*Scanner).AssertClean(tb)   *
+//     -- fails tb on any finding or any truncated source
+//   type Source; SourceStdout, SourceStderr, SourceMetrics, SourceReadyz, SourceSpans
+//   type Finding struct { Marker string; Source Source; Encoding string }
+//     Encoding is one of: "raw", "raw-partial" (any 12-byte window of the
+//     marker), "raw-casefold", "hex-lower", "hex-upper", "base64-std/N",
+//     "base64-url/N" (N = alignment 0, 1 or 2 = number of prefix bytes)
+//   Patterns(marker string) []Pattern
+//   CaptureStdio(tb testing.TB) (stop func() (stdout, stderr []byte))
+//     -- fd-level (dup2 of fds 1 and 2); NOT parallel-safe; when a stream
+//     exceeds the cap, stop reports it through tb (Error/Fatal) and the
+//     returned slice is at most the cap; the writer is never blocked for long
+//   RunCapture(tb testing.TB, cmd *exec.Cmd) (stdout, stderr []byte, truncated bool) *
+//     -- runs cmd with pipes, drains beyond the cap, fails tb on start error
+//   SetMaxSourceBytesForTest(n int) (restore func())   *
+//     -- lowers the per-source cap (also the rendered collector text cap)
 
 import (
 	"bytes"
@@ -40,10 +58,13 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"math/big"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	collectorpb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
@@ -65,16 +86,62 @@ var textSources = []markerscan.Source{
 
 func srcName(s markerscan.Source) string { return fmt.Sprintf("source#%v", s) }
 
-// newMarker returns a random synthetic marker. The ">?>?" run makes the
-// standard and URL-safe base64 alphabets differ at every alignment.
+const safeAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+
+// stableMiddleHasSixtyTwoOrThree reports whether, for every alignment 0..2,
+// the base64 of prefix+marker has '+' or '/' away from both edges (4 chars
+// dropped each side, stricter than any sane edge rule). Then the standard and
+// URL-safe patterns differ at every alignment.
+func stableMiddleHasSixtyTwoOrThree(m string) bool {
+	for k := range fillers {
+		e := base64.StdEncoding.EncodeToString([]byte(fillers[k] + m))
+		if len(e) < 9 || !strings.ContainsAny(e[4:len(e)-4], "+/") {
+			return false
+		}
+	}
+	return true
+}
+
+// newMarker returns a random synthetic marker in the safe alphabet, 24 bytes,
+// chosen so both base64 alphabets are exercised at every alignment.
 func newMarker(t testing.TB) string {
 	t.Helper()
-	b := make([]byte, 6)
-	if _, err := rand.Read(b); err != nil {
-		t.Fatal(err)
+	for try := 0; try < 100000; try++ {
+		b := make([]byte, 24)
+		for i := range b {
+			n, err := rand.Int(rand.Reader, big.NewInt(int64(len(safeAlphabet))))
+			if err != nil {
+				t.Fatal(err)
+			}
+			b[i] = safeAlphabet[n.Int64()]
+		}
+		if m := string(b); stableMiddleHasSixtyTwoOrThree(m) {
+			return m
+		}
 	}
-	return "mk-" + hex.EncodeToString(b) + ">?>?>?~~"
+	t.Fatal("could not generate a marker")
+	return ""
 }
+
+func mustAdd(t testing.TB, s *markerscan.Scanner, m string, src ...markerscan.Source) {
+	t.Helper()
+	if err := s.AddMarker(m, src...); err != nil {
+		t.Fatalf("AddMarker(%q): %v", m, err)
+	}
+}
+
+// fakeTB records failures without stopping the test.
+type fakeTB struct {
+	testing.TB
+	failed bool
+}
+
+func (f *fakeTB) Errorf(string, ...any) { f.failed = true }
+func (f *fakeTB) Error(...any)          { f.failed = true }
+func (f *fakeTB) Fatalf(string, ...any) { f.failed = true }
+func (f *fakeTB) Fatal(...any)          { f.failed = true }
+func (f *fakeTB) Fail()                 { f.failed = true }
+func (f *fakeTB) FailNow()              { f.failed = true }
 
 var fillers = []string{"", "Q", "\xfe\x7f"}  // 0, 1, 2 prefix bytes
 var trailers = []string{"", "Z", "\x00\xff"} // 0, 1, 2 following bytes
@@ -82,6 +149,7 @@ var trailers = []string{"", "Z", "\x00\xff"} // 0, 1, 2 following bytes
 type plant struct {
 	name string
 	text string
+	enc  string // expected Finding.Encoding
 }
 
 // encodings returns the planted texts for marker m with k prefix bytes and
@@ -91,14 +159,23 @@ func encodings(m string, k int, trail string) []plant {
 	std := base64.StdEncoding.EncodeToString(raw)
 	url := base64.URLEncoding.EncodeToString(raw)
 	return []plant{
-		{"raw", fillers[k] + m + trail},
-		{"hex-lower", hex.EncodeToString(raw)},
-		{"hex-upper", strings.ToUpper(hex.EncodeToString(raw))},
-		{"b64-std", std},
-		{"b64-std-unpadded", strings.TrimRight(std, "=")},
-		{"b64-url", url},
-		{"b64-url-unpadded", strings.TrimRight(url, "=")},
+		{"raw", fillers[k] + m + trail, "raw"},
+		{"hex-lower", hex.EncodeToString(raw), "hex-lower"},
+		{"hex-upper", strings.ToUpper(hex.EncodeToString(raw)), "hex-upper"},
+		{"b64-std", std, fmt.Sprintf("base64-std/%d", k)},
+		{"b64-std-unpadded", strings.TrimRight(std, "="), fmt.Sprintf("base64-std/%d", k)},
+		{"b64-url", url, fmt.Sprintf("base64-url/%d", k)},
+		{"b64-url-unpadded", strings.TrimRight(url, "="), fmt.Sprintf("base64-url/%d", k)},
 	}
+}
+
+func foundEnc(fs []markerscan.Finding, m string, src markerscan.Source, enc string) bool {
+	for _, f := range fs {
+		if f.Marker == m && f.Source == src && f.Encoding == enc {
+			return true
+		}
+	}
+	return false
 }
 
 func found(fs []markerscan.Finding, m string, src markerscan.Source) bool {
@@ -115,9 +192,24 @@ func TestEncodingFixtureIsMeaningful(t *testing.T) {
 	for k := range fillers {
 		e := encodings(m, k, "")
 		std, url := e[3].text, e[5].text
-		if !strings.ContainsAny(std, "+/") || !strings.ContainsAny(url, "-_") {
+		if std == url || !strings.ContainsAny(std[4:len(std)-4], "+/") || !strings.ContainsAny(url[4:len(url)-4], "-_") {
 			t.Fatalf("offset %d: fixture does not exercise both base64 alphabets", k)
 		}
+	}
+}
+
+func TestAddMarkerValidation(t *testing.T) { // AC-33, D4
+	s := markerscan.New()
+	for _, bad := range []string{"", "short_marker", "0123456789abcde", "has space 0123456789abc", "plus+0123456789abcdef", "slash/0123456789abcdef", "angle<0123456789abcdef", "nl0123456789abcdef\n", "uni\u00e9_0123456789abcdef"} {
+		if err := s.AddMarker(bad); err == nil {
+			t.Errorf("AddMarker(%q) accepted an unsafe marker", bad)
+		}
+	}
+	if err := s.AddMarker("Abc_def-0123456789"); err != nil {
+		t.Errorf("safe marker rejected: %v", err)
+	}
+	if err := s.AddMarker("0123456789abcdef"); err != nil {
+		t.Errorf("16-byte marker rejected: %v", err)
 	}
 }
 
@@ -130,10 +222,14 @@ func TestPlantedEncodingsDetectedInEverySource(t *testing.T) { // AC-33
 					name := fmt.Sprintf("%s/offset%d/trail%d/%s", srcName(src), k, ti, p.name)
 					t.Run(name, func(t *testing.T) {
 						s := markerscan.New()
-						s.AddMarker(m)
+						mustAdd(t, s, m)
 						s.Add(src, []byte("ts=1 noise "+p.text+" tail\n"))
-						if !found(s.Findings(), m, src) {
-							t.Fatalf("marker not detected in %s; findings=%v", p.name, s.Findings())
+						fs := s.Findings()
+						if !foundEnc(fs, m, src, p.enc) {
+							t.Fatalf("marker not detected as %q in %s; findings=%v", p.enc, p.name, fs)
+						}
+						if strings.HasPrefix(p.enc, "base64-url/") && foundEnc(fs, m, src, strings.Replace(p.enc, "url", "std", 1)) {
+							t.Fatalf("URL-safe plant matched the standard pattern: %v", fs)
 						}
 					})
 				}
@@ -147,7 +243,7 @@ func TestRawAtTextOffsets0To2(t *testing.T) { // AC-33
 		for k := 0; k <= 2; k++ {
 			m := newMarker(t)
 			s := markerscan.New()
-			s.AddMarker(m)
+			mustAdd(t, s, m)
 			s.Add(src, []byte(strings.Repeat("-", k)+m))
 			if !found(s.Findings(), m, src) {
 				t.Errorf("%s offset %d: raw marker at end of data not detected", srcName(src), k)
@@ -160,7 +256,7 @@ func TestAddOrderIndependent(t *testing.T) { // AC-33
 	m := newMarker(t)
 	s := markerscan.New()
 	s.Add(markerscan.SourceStdout, []byte("x "+m))
-	s.AddMarker(m)
+	mustAdd(t, s, m)
 	if !found(s.Findings(), m, markerscan.SourceStdout) {
 		t.Fatal("marker added after data not detected")
 	}
@@ -169,7 +265,7 @@ func TestAddOrderIndependent(t *testing.T) { // AC-33
 func TestSourceSubsetSelection(t *testing.T) { // AC-33
 	m := newMarker(t)
 	s := markerscan.New()
-	s.AddMarker(m, markerscan.SourceStdout, markerscan.SourceMetrics)
+	mustAdd(t, s, m, markerscan.SourceStdout, markerscan.SourceMetrics)
 	for _, src := range textSources {
 		s.Add(src, []byte("v "+m))
 	}
@@ -184,7 +280,7 @@ func TestSourceSubsetSelection(t *testing.T) { // AC-33
 	// A marker with no sources is scanned in all of them.
 	all := newMarker(t)
 	s2 := markerscan.New()
-	s2.AddMarker(all)
+	mustAdd(t, s2, all)
 	for _, src := range textSources {
 		s2.Add(src, []byte("v "+all))
 	}
@@ -197,7 +293,7 @@ func TestSourceSubsetSelection(t *testing.T) { // AC-33
 	// Subset also applies to encodings and to the collector.
 	m3 := newMarker(t)
 	s3 := markerscan.New()
-	s3.AddMarker(m3, markerscan.SourceStdout)
+	mustAdd(t, s3, m3, markerscan.SourceStdout)
 	s3.Add(markerscan.SourceStderr, []byte(base64.StdEncoding.EncodeToString([]byte("Q"+m3))))
 	s3.Add(markerscan.SourceStderr, []byte(hex.EncodeToString([]byte(m3))))
 	c := otlpcollector.Start(t)
@@ -212,12 +308,12 @@ func TestNegativeControl(t *testing.T) { // AC-33
 	m := newMarker(t)
 	other := newMarker(t)
 	s := markerscan.New()
-	s.AddMarker(m)
+	mustAdd(t, s, m)
 	for _, src := range textSources {
 		s.Add(src, []byte("level=info msg=started\n# TYPE corral_up gauge\nok\n"))
 		s.Add(src, []byte(other))                             // a different marker
-		s.Add(src, []byte(m[:len(m)-3]))                      // truncated marker
-		s.Add(src, []byte(strings.ToUpper(m)))                // case-changed raw
+		s.Add(src, []byte(m[:11]))                            // shorter than a 12-byte window
+		s.Add(src, []byte(m[13:]))                            // 11 bytes
 		s.Add(src, []byte(hex.EncodeToString([]byte(other)))) // other marker, hex
 		s.Add(src, []byte(base64.StdEncoding.EncodeToString([]byte("Q"+other))))
 		s.Add(src, nil)
@@ -225,9 +321,114 @@ func TestNegativeControl(t *testing.T) { // AC-33
 	if fs := s.Findings(); len(fs) != 0 {
 		t.Fatalf("false positives: %v", fs)
 	}
+	s.AssertClean(t)
 	if fs := markerscan.New().Findings(); len(fs) != 0 {
 		t.Fatalf("empty scanner has findings: %v", fs)
 	}
+}
+
+func TestRawPartialAndCasefold(t *testing.T) { // AC-33, D5
+	m := newMarker(t)
+	for _, src := range textSources {
+		s := markerscan.New()
+		mustAdd(t, s, m)
+		s.Add(src, []byte("x "+m[6:18]+" y")) // 12-byte window
+		if !foundEnc(s.Findings(), m, src, "raw-partial") {
+			t.Errorf("%s: 12-byte window not reported as raw-partial: %v", srcName(src), s.Findings())
+		}
+		s2 := markerscan.New()
+		mustAdd(t, s2, m)
+		s2.Add(src, []byte("x "+strings.ToUpper(m)+" y"))
+		s2.Add(src, []byte("x "+strings.ToLower(m)+" y"))
+		if !foundEnc(s2.Findings(), m, src, "raw-casefold") {
+			t.Errorf("%s: case-folded marker not reported as raw-casefold: %v", srcName(src), s2.Findings())
+		}
+	}
+}
+
+func TestSplitAcrossAddCalls(t *testing.T) { // AC-33, D8
+	m := newMarker(t)
+	cases := []struct {
+		name, enc string
+		text      string
+	}{
+		{"raw", "raw", m},
+		{"base64-std", "base64-std/1", base64.StdEncoding.EncodeToString([]byte("Q" + m))},
+		{"base64-url", "base64-url/1", base64.URLEncoding.EncodeToString([]byte("Q" + m))},
+		{"hex", "hex-lower", hex.EncodeToString([]byte(m))},
+	}
+	for _, c := range cases {
+		for cut := 1; cut < len(c.text); cut += 3 {
+			s := markerscan.New()
+			mustAdd(t, s, m)
+			s.Add(markerscan.SourceStdout, []byte("pre "+c.text[:cut]))
+			s.Add(markerscan.SourceStdout, []byte(c.text[cut:]+" post"))
+			if !foundEnc(s.Findings(), m, markerscan.SourceStdout, c.enc) {
+				t.Fatalf("%s cut at %d: split marker not detected: %v", c.name, cut, s.Findings())
+			}
+		}
+	}
+}
+
+func TestTruncationAndAssertClean(t *testing.T) { // AC-33, D2, D6, D7
+	t.Run("assert clean passes", func(t *testing.T) {
+		s := markerscan.New()
+		mustAdd(t, s, newMarker(t))
+		s.Add(markerscan.SourceStdout, []byte("nothing here"))
+		f := &fakeTB{TB: t}
+		s.AssertClean(f)
+		if f.failed {
+			t.Error("AssertClean failed a clean, untruncated scanner")
+		}
+		if s.Truncated(markerscan.SourceStdout) {
+			t.Error("small source reported truncated")
+		}
+	})
+	t.Run("assert clean fails on finding", func(t *testing.T) {
+		m := newMarker(t)
+		s := markerscan.New()
+		mustAdd(t, s, m)
+		s.Add(markerscan.SourceMetrics, []byte(m))
+		f := &fakeTB{TB: t}
+		s.AssertClean(f)
+		if !f.failed {
+			t.Error("AssertClean passed despite a finding")
+		}
+	})
+	t.Run("add over cap", func(t *testing.T) {
+		defer markerscan.SetMaxSourceBytesForTest(64)()
+		s := markerscan.New()
+		mustAdd(t, s, newMarker(t))
+		s.Add(markerscan.SourceStderr, bytes.Repeat([]byte("a"), 1000))
+		s.Add(markerscan.SourceStdout, []byte("ok"))
+		if !s.Truncated(markerscan.SourceStderr) {
+			t.Error("over-cap source not reported truncated")
+		}
+		if s.Truncated(markerscan.SourceStdout) {
+			t.Error("under-cap source reported truncated")
+		}
+		f := &fakeTB{TB: t}
+		s.AssertClean(f)
+		if !f.failed {
+			t.Error("AssertClean passed despite a truncated source")
+		}
+	})
+	t.Run("collector text over cap", func(t *testing.T) {
+		defer markerscan.SetMaxSourceBytesForTest(256)()
+		c := otlpcollector.Start(t)
+		postSpan(t, c, spanSpec{name: strings.Repeat("a", 4096)}, nil)
+		s := markerscan.New()
+		mustAdd(t, s, newMarker(t))
+		s.AddCollector(c)
+		if !s.Truncated(markerscan.SourceSpans) {
+			t.Error("oversized collector text not reported truncated")
+		}
+		f := &fakeTB{TB: t}
+		s.AssertClean(f)
+		if !f.failed {
+			t.Error("AssertClean passed despite truncated spans")
+		}
+	})
 }
 
 func TestPatterns(t *testing.T) { // AC-33
@@ -248,6 +449,8 @@ type spanSpec struct {
 	attrKey     string
 	attrVal     string
 	attrBytes   []byte
+	attrArray   []string
+	attrKV      map[string]string
 	eventName   string
 	eventKey    string
 	eventVal    string
@@ -282,6 +485,22 @@ func postSpan(t *testing.T, c *otlpcollector.Collector, sp spanSpec, hdr map[str
 	if sp.attrBytes != nil {
 		span.Attributes = append(span.Attributes, &commonpb.KeyValue{Key: "b",
 			Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_BytesValue{BytesValue: sp.attrBytes}}})
+	}
+	if sp.attrArray != nil {
+		var vals []*commonpb.AnyValue
+		for _, v := range sp.attrArray {
+			vals = append(vals, &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: v}})
+		}
+		span.Attributes = append(span.Attributes, &commonpb.KeyValue{Key: "arr",
+			Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_ArrayValue{ArrayValue: &commonpb.ArrayValue{Values: vals}}}})
+	}
+	if sp.attrKV != nil {
+		var kvs []*commonpb.KeyValue
+		for k, v := range sp.attrKV {
+			kvs = append(kvs, str(k, v))
+		}
+		span.Attributes = append(span.Attributes, &commonpb.KeyValue{Key: "kv",
+			Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_KvlistValue{KvlistValue: &commonpb.KeyValueList{Values: kvs}}}})
 	}
 	if sp.eventName != "" || sp.eventKey != "" || sp.eventVal != "" {
 		ev := &tracev1.Span_Event{Name: sp.eventName}
@@ -363,7 +582,7 @@ func TestSpanPayloadFieldsScanned(t *testing.T) { // AC-33
 					c := otlpcollector.Start(t)
 					postSpan(t, c, f.spec(p.text), nil)
 					s := markerscan.New()
-					s.AddMarker(m)
+					mustAdd(t, s, m)
 					s.AddCollector(c)
 					if !found(s.Findings(), m, markerscan.SourceSpans) {
 						t.Fatalf("not detected in %s", f.name)
@@ -376,6 +595,40 @@ func TestSpanPayloadFieldsScanned(t *testing.T) { // AC-33
 
 func isUTF8Safe(s string) bool { return strings.ToValidUTF8(s, "") == s }
 
+func TestJSONRenderedValuesScanned(t *testing.T) { // AC-33, D3
+	// Arrays and kvlists are rendered by the collector as compact JSON; the
+	// scanner must see the decoded leaves, including JSON-escaped ones.
+	m := newMarker(t)
+	std := base64.StdEncoding.EncodeToString([]byte("Q" + m))
+	leaves := []string{
+		m,
+		"a<b>&" + m + "\"q\\", // json escapes < > & " \ in this leaf
+		"<" + std + ">",       // base64 with escaped neighbours
+		"<" + hex.EncodeToString([]byte(m)) + ">",
+	}
+	for i, leaf := range leaves {
+		for _, kind := range []string{"array", "kvlist-value", "kvlist-key"} {
+			c := otlpcollector.Start(t)
+			var sp spanSpec
+			switch kind {
+			case "array":
+				sp.attrArray = []string{"x", leaf}
+			case "kvlist-value":
+				sp.attrKV = map[string]string{"k": leaf}
+			case "kvlist-key":
+				sp.attrKV = map[string]string{leaf: "v"}
+			}
+			postSpan(t, c, sp, nil)
+			s := markerscan.New()
+			mustAdd(t, s, m)
+			s.AddCollector(c)
+			if !found(s.Findings(), m, markerscan.SourceSpans) {
+				t.Errorf("leaf %d in %s not detected", i, kind)
+			}
+		}
+	}
+}
+
 func TestBytesAttributeScanned(t *testing.T) { // AC-33
 	// The collector renders bytes attributes as padded standard base64, so a
 	// marker inside bytes at offsets 0..2 must be found via base64 scanning.
@@ -385,7 +638,7 @@ func TestBytesAttributeScanned(t *testing.T) { // AC-33
 			c := otlpcollector.Start(t)
 			postSpan(t, c, spanSpec{attrBytes: []byte(fillers[k] + m + trail)}, nil)
 			s := markerscan.New()
-			s.AddMarker(m)
+			mustAdd(t, s, m)
 			s.AddCollector(c)
 			if !found(s.Findings(), m, markerscan.SourceSpans) {
 				t.Errorf("offset %d trail %q: marker in bytes attribute not detected", k, trail)
@@ -399,7 +652,7 @@ func TestTransportHeadersNotScanned(t *testing.T) { // AC-33
 	c := otlpcollector.Start(t)
 	postSpan(t, c, spanSpec{name: "clean"}, map[string]string{"Authorization": m, "X-Marker": m})
 	s := markerscan.New()
-	s.AddMarker(m)
+	mustAdd(t, s, m)
 	s.AddCollector(c)
 	if fs := s.Findings(); len(fs) != 0 {
 		t.Fatalf("transport headers were scanned: %v", fs)
@@ -410,16 +663,13 @@ func TestTransportHeadersNotScanned(t *testing.T) { // AC-33
 
 func TestCaptureStdio(t *testing.T) { // AC-33
 	m := newMarker(t)
-	origOut, origErr := os.Stdout, os.Stderr
+	defer markerscan.SetMaxSourceBytesForTest(8 << 20)()
 	stop := markerscan.CaptureStdio(t)
 	fmt.Fprintln(os.Stdout, "out line "+m)
 	fmt.Fprintln(os.Stderr, "err line "+hex.EncodeToString([]byte(m)))
 	big := strings.Repeat("0123456789abcdef", 16<<10) // 256 KiB, beyond a pipe buffer
 	fmt.Fprint(os.Stdout, big)
 	out, errb := stop()
-	if os.Stdout != origOut || os.Stderr != origErr {
-		t.Error("stop did not restore os.Stdout / os.Stderr")
-	}
 	if !bytes.Contains(out, []byte("out line "+m)) || !bytes.Contains(out, []byte(big)) {
 		t.Errorf("stdout not captured fully (%d bytes)", len(out))
 	}
@@ -428,11 +678,110 @@ func TestCaptureStdio(t *testing.T) { // AC-33
 	}
 
 	s := markerscan.New()
-	s.AddMarker(m)
+	mustAdd(t, s, m)
 	s.Add(markerscan.SourceStdout, out)
 	s.Add(markerscan.SourceStderr, errb)
 	fs := s.Findings()
 	if !found(fs, m, markerscan.SourceStdout) || !found(fs, m, markerscan.SourceStderr) {
 		t.Errorf("captured output not detected: %v", fs)
+	}
+}
+
+// ---- capture caps: must fail, not hang ----
+
+func within(t *testing.T, d time.Duration, what string, f func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { defer close(done); f() }()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatalf("%s did not complete within %v (hang)", what, d)
+	}
+}
+
+func TestCaptureStdioOverCapReportsAndCompletes(t *testing.T) { // AC-33, D2
+	const limit = 4096
+	defer markerscan.SetMaxSourceBytesForTest(limit)()
+	f := &fakeTB{TB: t}
+	var out, errb []byte
+	within(t, 20*time.Second, "in-process capture over cap", func() {
+		stop := markerscan.CaptureStdio(f)
+		chunk := strings.Repeat("x", 1024)
+		for i := 0; i < 1024; i++ { // 1 MiB per stream
+			fmt.Fprint(os.Stdout, chunk)
+			fmt.Fprint(os.Stderr, chunk)
+		}
+		out, errb = stop()
+	})
+	if !f.failed {
+		t.Error("truncation of captured stdio was not reported through tb")
+	}
+	if len(out) > limit || len(errb) > limit {
+		t.Errorf("capture exceeded cap: %d / %d", len(out), len(errb))
+	}
+}
+
+// TestChildHelper is the child process body for RunCapture tests.
+func TestChildHelper(t *testing.T) {
+	if os.Getenv("CORRAL_MARKERSCAN_CHILD") != "1" {
+		t.Skip("child process helper")
+	}
+	fmt.Fprintln(os.Stdout, "child-out "+os.Getenv("CORRAL_MARKERSCAN_MARKER"))
+	fmt.Fprintln(os.Stderr, "child-err")
+	if os.Getenv("CORRAL_MARKERSCAN_FLOOD") == "1" {
+		chunk := strings.Repeat("y", 1024)
+		for i := 0; i < 2048; i++ {
+			fmt.Fprint(os.Stdout, chunk)
+			fmt.Fprint(os.Stderr, chunk)
+		}
+	}
+}
+
+func childCmd(m string, flood bool) *exec.Cmd {
+	cmd := exec.Command(os.Args[0], "-test.run=^TestChildHelper$", "-test.v")
+	fl := "0"
+	if flood {
+		fl = "1"
+	}
+	cmd.Env = append(os.Environ(), "CORRAL_MARKERSCAN_CHILD=1", "CORRAL_MARKERSCAN_FLOOD="+fl, "CORRAL_MARKERSCAN_MARKER="+m)
+	return cmd
+}
+
+func TestRunCapture(t *testing.T) { // AC-33
+	m := newMarker(t)
+	out, errb, trunc := markerscan.RunCapture(t, childCmd(m, false))
+	if trunc {
+		t.Error("small child output reported truncated")
+	}
+	if !bytes.Contains(out, []byte("child-out "+m)) || !bytes.Contains(errb, []byte("child-err")) {
+		t.Fatalf("child output not captured: %q / %q", out, errb)
+	}
+	s := markerscan.New()
+	mustAdd(t, s, m)
+	s.Add(markerscan.SourceStdout, out)
+	s.Add(markerscan.SourceStderr, errb)
+	if !found(s.Findings(), m, markerscan.SourceStdout) {
+		t.Error("marker in child stdout not detected")
+	}
+}
+
+func TestRunCaptureOverCapReportsAndCompletes(t *testing.T) { // AC-33, D2
+	const limit = 4096
+	defer markerscan.SetMaxSourceBytesForTest(limit)()
+	m := newMarker(t)
+	var out, errb []byte
+	var trunc bool
+	within(t, 30*time.Second, "child capture over cap", func() {
+		out, errb, trunc = markerscan.RunCapture(t, childCmd(m, true))
+	})
+	if !trunc {
+		t.Error("truncation of child output was not reported")
+	}
+	if len(out) > limit || len(errb) > limit {
+		t.Errorf("capture exceeded cap: %d / %d", len(out), len(errb))
+	}
+	if !bytes.Contains(out, []byte("child-out "+m)) {
+		t.Error("data within the cap (the head of the stream) was lost")
 	}
 }
