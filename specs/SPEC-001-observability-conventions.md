@@ -1,8 +1,8 @@
 # SPEC-001: Observability conventions (logging, metrics, tracing)
 
-Status: approved (Owner, 2026-10-24)
+Status: approved (Owner, 2026-10-24); Amendment 1 approved (Owner, 2026-10-24)
 Owner: Sorin Panduru
-Last updated: 2026-10-24
+Last updated: 2026-10-24 (Amendment 1)
 
 ## Goal
 
@@ -89,10 +89,12 @@ at the end of the list.
   - Format and level are read once at startup.
 - **FR-7:** Every log record carries a `component` attribute. Its value comes
   from a fixed set:
-  - this spec defines `config`, `lifecycle`, `admin_http`, `tracing`, `otel`
-    and `grpc`;
+  - this spec defines `config`, `lifecycle`, `admin_http`, `tracing`, `otel`,
+    `grpc` and `thirdparty`;
   - `lifecycle` is used for the starting, startup-complete and shutting-down
     records;
+  - `thirdparty` is used for records routed from Go's standard `log` package
+    and from third-party `slog.Default()` calls (FR-28);
   - each feature spec declares the components it adds.
 
   Loggers are obtained only through a factory that requires a component from
@@ -123,7 +125,8 @@ at the end of the list.
   Label names are snake_case.
 - **FR-11:** Labels. Every label has a fixed, enumerated set of values
   declared in the metric catalog (FR-31).
-  - Errors are labelled only by error class, using the FR-29 enum values.
+  - Errors are labelled only by error class, using the FR-29 class enum
+    values, under the label name `error_class`.
   - These must never be used as metric labels:
     - client network address or port;
     - upstream host or port;
@@ -137,8 +140,10 @@ at the end of the list.
     - any value in FR-24.
   - Exemplars are not used in v1. No corral metric attaches exemplars.
   - The error detail value (FR-29) is not used as a metric label unless the
-    metric's catalog entry (FR-31) declares that label with its bounded set
-    of values.
+    metric's catalog entry (FR-31) declares that label, under the label name
+    `error_detail`, with its bounded set of values. The span and log
+    attribute key stays `corral.error.detail` (FR-29); `error_class` and
+    `error_detail` are metric label names only.
 - **FR-12:** Command names. This spec owns one central command-name allowlist.
   Feature specs extend it by amending this spec, so the series cap (FR-13) is
   checked in one place.
@@ -176,12 +181,28 @@ at the end of the list.
   `Content-Type` is `text/plain; charset=utf-8`.
 - **FR-18:** `GET /readyz` (readiness) returns 200 when corral reports ready
   and 503 when it does not.
-  - A 503 body contains only a short, fixed reason string from a defined set,
-    with no FR-24 data and no client addresses.
+  - **Response format:** `Content-Type` is `text/plain; charset=utf-8`. The
+    200 body is `ok\n`. A 503 body is `<reason>\n`, where `<reason>` is a
+    short, fixed reason string from the defined set, with no FR-24 data and no
+    client addresses.
+  - **Reason set:** this spec defines `starting`, `shutting_down` and
+    `unknown`. Feature specs add readiness reasons by amending this spec, the
+    same way as FR-12 and FR-40.
   - Readiness is supplied to the admin listener through a readiness port; its
     meaning is defined by the pooling spec.
-  - When no readiness check is registered, `/readyz` returns 200 once startup
-    has completed and 503 with reason `starting` before that.
+  - **Before startup has completed:** `/readyz` returns 503 with reason
+    `starting`, without consulting any registered readiness check.
+  - **From the start of graceful shutdown:** `/readyz` returns 503 with reason
+    `shutting_down`, without consulting any registered readiness check. The
+    start of graceful shutdown is the moment corral begins shutdown, when it
+    emits the `lifecycle` shutting-down record.
+  - **After startup has completed and before graceful shutdown starts:**
+    - when no readiness check is registered, `/readyz` returns 200;
+    - when a registered readiness check reports ready, `/readyz` returns 200;
+    - when it reports not ready with a reason from the defined set, `/readyz`
+      returns 503 with that reason;
+    - when it reports a reason outside the defined set, `/readyz` returns 503
+      with reason `unknown`.
   - *Startup completed* is the moment after every startup step has finished.
     The last step is binding the MongoDB wire listener. Until the wire
     listener exists in the codebase, the last step is binding the admin
@@ -410,6 +431,10 @@ at the end of the list.
   stdout, so that corral writes no log output to stderr.
   - **Routing:**
     - `slog.SetDefault` is set to the configured handler;
+    - records from Go's standard `log` package and from third-party
+      `slog.Default()` calls are routed to a logger with
+      `component=thirdparty`. Each such record carries a fixed, constant
+      message and never the third-party text;
     - `otel.SetErrorHandler` and `otel.SetLogger` route to a logger with
       `component=otel`;
     - `grpclog.SetLoggerV2` routes to a logger with `component=grpc`;
@@ -426,17 +451,25 @@ at the end of the list.
       below applies to fatal records only;
     - the otel logger's verbosity levels map to debug;
     - the otel error handler maps to warn;
-    - the admin `http.Server` error log maps to warn.
+    - the admin `http.Server` error log maps to warn;
+    - `thirdparty` records from `slog.Default()` calls keep the level the
+      caller gave; records from Go's standard `log` package, which has no
+      levels, are info.
 
-    At the default `info` level, only warn and above from these sources are
-    emitted.
+    At the default `info` level, only warn and above from the grpc, otel and
+    admin_http sources are emitted; `thirdparty` records follow the
+    configured level.
   - **Bounding:**
     - all records from the otel error handler and the otel logger go through
       the FR-33 limiter;
     - grpclog records are limited the same way: at most one record per 30
       seconds per level, with a `suppressed_count` of records dropped since the
       last one;
-    - admin `http.Server` error-log records are limited the same way.
+    - admin `http.Server` error-log records are limited the same way;
+    - `thirdparty` records are limited the same way, with one limiter per
+      source (the standard `log` bridge and the `slog.Default()` bridge) and
+      level: at most one record per 30 seconds per source and level, with a
+      `suppressed_count` of records dropped since the last one.
   - Crash output from the Go runtime (unrecovered panics, fatal errors) is
     exempt.
 - **FR-29:** Error classification and sanitisation.
@@ -476,8 +509,9 @@ at the end of the list.
     Every error record also carries `corral.error.detail`. Server errors may
     also carry `db.response.status_code` and
     `corral.db.response.code_name`.
-  - **Metrics:** errors are labelled by class. The detail may be used as a
-    label only when the catalog declares it (FR-11).
+  - **Metrics:** errors are labelled by class, under the label name
+    `error_class`. The detail may be used as a label, under the label name
+    `error_detail`, only when the catalog declares it (FR-11).
   - **Recovered panics:** the record is logged at error level and may include
     the goroutine stack trace in a `stack` attribute. The panic value is never
     emitted.
@@ -553,6 +587,8 @@ at the end of the list.
     allowlist by amending this spec, the same way as FR-12 and FR-40.
   - `msg` is a compile-time constant string. No runtime value is ever
     formatted into it; runtime values go only in allowed attributes.
+  - The `component` key's allowed values are the FR-7 component set,
+    including `thirdparty`.
 - **FR-40:** Collection-name extraction.
   - The collection name is taken only from a closed list of commands, and only
     when the value is a BSON string:
@@ -597,7 +633,7 @@ when tracing is enabled (FR-27).
 |---|---|---|---|
 | `/metrics` | 200, Prometheus text by default (FR-9) | n/a | metrics |
 | `/healthz` | 200, `text/plain; charset=utf-8` | n/a (no response if the process is down) | `ok\n` |
-| `/readyz` | 200 | 503 | fixed reason string (FR-18) |
+| `/readyz` | 200, `text/plain; charset=utf-8` | 503, `text/plain; charset=utf-8` | `ok\n` on 200; `<reason>\n` on 503, reason from the FR-18 set (`starting`, `shutting_down`, `unknown`, plus reasons added by amending this spec) |
 | any other path, including trailing-slash variants | n/a | 404 | n/a |
 
 ### Observer and readiness ports
@@ -608,13 +644,19 @@ when tracing is enabled (FR-27).
   them.
 - Readiness port: answers "ready / not ready + fixed reason". It is implemented
   by the component the pooling spec makes responsible, and consumed by the
-  admin listener.
+  admin listener. A reason outside the FR-18 set is reported on `/readyz` as
+  `unknown`. The port is not consulted before startup has completed or after
+  graceful shutdown has started (FR-18).
 
 ### Metrics defined by this spec
 
 | Name | Type | Labels | Help |
 |---|---|---|---|
 | `corral_tracing_spans_dropped_total` | counter | none | Spans dropped because the trace export queue was full. |
+
+Metric label names reserved by this spec for errors: `error_class` (FR-29
+class enum) and `error_detail` (FR-29 detail enum, only where the catalog
+declares it).
 
 ### Project artifacts owned by this spec
 
@@ -624,6 +666,7 @@ when tracing is enabled (FR-27).
 - Central command-name allowlist and alias table (FR-12).
 - Collection-name command list (FR-40).
 - Error-class enum (FR-29).
+- `/readyz` reason set (FR-18).
 - Metric catalog format, file and catalog-backed constructor (FR-31).
 - Bounded-queue span processor (FR-37).
 - Marker-scan test harness (AC-33).
@@ -640,7 +683,13 @@ when tracing is enabled (FR-27).
   Proxied operations are not blocked by span export (FR-37). Failures are
   logged at most once per 30 seconds with a suppressed count (FR-33).
 - **Noisy third-party logging (gRPC connectivity, OTel internals, HTTP server
-  errors):** fixed messages, level-mapped and rate-limited (FR-28).
+  errors, Go `log` package and third-party `slog.Default()` output):** fixed
+  messages, never the third-party text; level-mapped and rate-limited where
+  FR-28 says so (FR-28).
+- **Readiness check reports an undefined reason:** `/readyz` returns 503
+  `unknown` (FR-18).
+- **Graceful shutdown started:** `/readyz` returns 503 `shutting_down`
+  (FR-18).
 - **Blocked stdout:** logging calls block, and proxied operations can stall.
   This is accepted for v1 (FR-38).
 - **Graceful shutdown with tracing on:** pending spans are flushed for at most
@@ -740,8 +789,9 @@ attribute rules but are subject to FR-24.
 - **AC-4** (FR-6): Unit: at each level, records below it are not emitted and
   records at or above it are. The default is `info`.
 - **AC-5** (FR-7, FR-39):
-  - Loggers can be built only through the factory, which rejects components
-    outside the fixed set (unit).
+  - Loggers can be built only through the factory, which accepts every
+    component in the FR-7 set (including `thirdparty`) and rejects components
+    outside it (unit).
   - Every test suite wires in a test slog handler that fails the test on any
     record that:
     - has no `component`, or a `component` outside the set;
@@ -761,17 +811,19 @@ attribute rules but are subject to FR-24.
   - `/metrics/`, `/debug/pprof/`, `/debug/vars` and an unknown path return
     404;
   - `/healthz?x=1` behaves like `/healthz`.
-- **AC-8** (FR-10, FR-11, FR-25, FR-31; includes former AC-20): A unit lint
-  test fails when:
+- **AC-8** (FR-10, FR-11, FR-25, FR-29, FR-31; includes former AC-20): A unit
+  lint test fails when:
   - a catalog entry breaks the naming rules (including non-base unit suffixes
     and `_total` on non-counters), lacks help text, or has a non-snake_case
     label name;
   - a catalog entry uses a forbidden label: addresses, IDs, `appName`, driver
     fields, usernames, database or collection names, error `code` or
     `codeName`;
-  - an error label has values outside the FR-29 class enum;
-  - a declared `corral.error.detail` label has values outside the FR-29 detail
-    enum.
+  - an `error_class` label has values outside the FR-29 class enum;
+  - a declared `error_detail` label has values outside the FR-29 detail enum;
+  - a catalog entry labels errors under any label name other than
+    `error_class` (class) or `error_detail` (detail), including
+    `corral.error.detail`.
 
   A unit test shows that the catalog-backed constructor refuses a metric name
   that is not in the catalog. The live registry contains no `corral_` family
@@ -785,9 +837,15 @@ attribute rules but are subject to FR-24.
   - `0.0.0.0:<port>` binds all IPv4 interfaces.
 - **AC-12** (FR-17): Functional: `GET /healthz` returns 200, body `ok\n`,
   `Content-Type: text/plain; charset=utf-8`.
-- **AC-13** (FR-18): Unit: with a readiness-port fake reporting ready,
-  `/readyz` returns 200. Reporting not ready, it returns 503 with a reason from
-  the defined set.
+- **AC-13** (FR-18): Unit, after startup has completed, with a readiness-port
+  fake:
+  - reporting ready, `/readyz` returns 200 with body `ok\n`;
+  - reporting not ready with a reason from the defined set, it returns 503
+    with body `<reason>\n`;
+  - reporting a reason outside the defined set (seeded with a marker), it
+    returns 503 with body `unknown\n`, and the marker does not appear in the
+    body;
+  - every response has `Content-Type: text/plain; charset=utf-8`.
 - **AC-14** (FR-19, FR-20): Integration: in each of these setups, test spans
   are created, a flush and shutdown are forced, the provider records no spans
   (except in the `none` case), and a test collector listener pointed to by
@@ -842,20 +900,32 @@ attribute rules but are subject to FR-24.
 - **AC-25** (FR-21): Unit: children created under a sampled parent are sampled
   and children under an unsampled parent are not, whatever the configured
   ratio.
-- **AC-26** (FR-28, FR-33): Unit, with a fresh rate limiter per case:
+- **AC-26** (FR-7, FR-28, FR-33): Unit, with a fresh rate limiter per case:
   - an error passed to the OTel global error handler, a message logged via
     `grpclog` at warning, and an admin `http.Server` error-log message each
     produce one slog record with `component` `otel`, `grpc` and `admin_http`
     respectively;
+  - a message logged through Go's standard `log` package, and a record logged
+    by a third-party caller through `slog.Default()`, each produce one slog
+    record with `component` `thirdparty`;
   - each record has that source's fixed message, and the third-party text
-    (seeded with a marker) appears nowhere in it;
+    (seeded with a marker, including in the `slog.Default()` record's
+    key/value arguments) appears nowhere in it;
   - nothing is written to stderr.
 
   Also:
   - a `grpclog` info message is emitted at debug, and is not emitted at the
     default `info` level;
   - 10 `grpclog` warnings within 30 seconds (fake clock) produce one record,
-    and the next record reports a `suppressed_count` of 9.
+    and the next record reports a `suppressed_count` of 9;
+  - a standard `log` message produces a record at info; a `slog.Default()`
+    record at warn produces a `thirdparty` record at warn;
+  - 10 standard `log` messages within 30 seconds (fake clock) produce one
+    record, and the next record reports a `suppressed_count` of 9; the same
+    holds for 10 `slog.Default()` warn records;
+  - limiters are separate per source and level: within the same 30 seconds,
+    a `slog.Default()` warn record, a `slog.Default()` error record and a
+    standard `log` message each still produce their own record.
 - **AC-27** (FR-30): Integration: exported resource attributes all fall within
   the FR-30 allowlist. None of `process.command_args`, `process.command_line`
   or `process.owner` is present, including when they are supplied in
@@ -872,9 +942,18 @@ attribute rules but are subject to FR-24.
   already in use, startup exits non-zero with an error record carrying
   `setting=admin.listen` and no address value.
 - **AC-31** (FR-18): Unit/functional, using a test hook that holds startup
-  before its last step: `/readyz` returns 503 `starting` while startup is held,
-  and 200 after it completes. The `lifecycle` startup-complete record is
-  emitted at that moment.
+  before its last step:
+  - while startup is held, `/readyz` returns 503 with body `starting\n`, and
+    this holds even when a registered readiness-check fake reports ready; the
+    fake records that it was not consulted;
+  - after startup completes, with no readiness check registered, `/readyz`
+    returns 200 with body `ok\n`;
+  - the `lifecycle` startup-complete record is emitted at that moment;
+  - once the `lifecycle` shutting-down record has been emitted (shutdown held
+    open by a test hook), `/readyz` returns 503 with body `shutting_down\n`,
+    including when a registered readiness-check fake reports ready; the fake
+    records that it was not consulted;
+  - every response has `Content-Type: text/plain; charset=utf-8`.
 - **AC-33** (harness for AC-18 and AC-38): The marker-scan harness captures
   stdout, stderr, `/metrics` output, `/readyz` bodies, and the span payloads a
   test collector receives (span names, attributes, events, status
@@ -1097,3 +1176,4 @@ None.
 | 2026-10-24 | Errors carry a second, fixed-enum detail attribute (`corral.error.detail`) alongside the 6-value class, with `other` for unmapped errors; it is never a metric label unless declared with bounded values in the catalog (OD-3). | Owner decision. |
 | 2026-10-24 | Exemplars are not used in v1 (OD-4). | Owner decision. |
 | 2026-10-24 | Auth-success records are logged at debug only, the same as handshake and hello records (OD-5). | Owner decision. |
+| 2026-10-24 | Amendment 1: (1) metric label names for errors are `error_class` and `error_detail` (snake_case per FR-10); the span/log attribute stays `corral.error.detail` (FR-11, FR-29, AC-8). (2) Component `thirdparty` added to the FR-7 set; Go standard `log` package records and third-party `slog.Default()` calls are routed with component `thirdparty` and a fixed constant message, never the third-party text (FR-7, FR-28, FR-39, AC-5, AC-26). (3) `/readyz` adds reasons `unknown` (503, a check reported a reason outside the defined set) and `shutting_down` (503, from the start of graceful shutdown); bodies are `<reason>\n` / `ok\n` with `Content-Type: text/plain; charset=utf-8`; before startup completes it returns 503 `starting` without consulting registered checks (FR-18, AC-13, AC-31). (4) `thirdparty` records keep the source's level (std `log` records are info) and are rate-limited per source (std `log` bridge, `slog.Default()` bridge) and level, at most 1 per 30s with `suppressed_count` (FR-28, AC-26). (5) Graceful shutdown starts when corral emits the `lifecycle` shutting-down record; `/readyz` returns 503 `shutting_down` from then (FR-18, AC-31). (6) Feature specs add readiness reasons by amending this spec, as for FR-12 and FR-40 (FR-18). Points 4 to 6 close gaps found while drafting and were relayed by the Orchestrator. | Amendment 1, 2026-10-24, requested by the Orchestrator under the Owner's standing instruction (2026-10-24). Drafted in `specs/drafts/` by the spec-writer, which may not edit approved specs. Approved and promoted to `specs/` by the Owner, 2026-10-24. |
