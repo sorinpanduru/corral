@@ -2,15 +2,18 @@
 // FR-30, FR-33, FR-34, FR-37; ADR-0007).
 //
 // Compliance (GDPR data minimisation, FR-24): nothing here logs err.Error() or
-// the collector endpoint. Errors reach logs only through errclass.LogAttrs and
-// constant messages; collector rejections are wrapped in a type whose Error()
-// text is constant, so no response body or URL can leak through otel.Handle.
+// the collector endpoint. Errors returned by Start and Shutdown, and collector
+// rejections, carry constant text. Other exporter errors are passed unchanged
+// to otel.Handle and may contain endpoint text; their safety depends on the
+// logbridge handler, which logs only errclass attributes (ADR-0007 c).
 package tracing
 
 import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
+	"net/url"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -33,6 +36,8 @@ const shutdownCap = 5 * time.Second
 
 // Options configures Start.
 type Options struct {
+	// Settings are the validated settings that Config was resolved from. Start
+	// does not read them; they are kept so callers pass one coherent bundle.
 	Settings config.Settings
 	Env      LookupEnv
 	Config   EnvConfig
@@ -40,8 +45,9 @@ type Options struct {
 	Enabled bool
 	Metrics *metrics.Factory
 	Logger  *slog.Logger
-	// Exporter replaces the OTLP exporter. Tests only; ignored when disabled.
-	// It is still wrapped by FilterResource (ADR-0007 f).
+	// Exporter replaces the OTLP exporter. Tests only; used only when tracing
+	// is enabled and the exporter is otlp, ignored otherwise. It is still
+	// wrapped by FilterResource (ADR-0007 f).
 	Exporter sdktrace.SpanExporter
 }
 
@@ -60,16 +66,21 @@ func Start(ctx context.Context, o Options) (*Tracing, error) {
 	}
 	res, err := NewResource(ctx, o.Env)
 	if err != nil {
-		return nil, err
+		return nil, errStartResource
 	}
 	cfg := o.Config
 	sampler := NewSampler(cfg, cfg.SampleRatio)
 
-	exp := o.Exporter
-	if exp == nil && cfg.Exporter == ExporterOTLP {
-		exp, err = newOTLP(ctx, cfg.Protocol)
-		if err != nil {
-			return nil, err
+	var exp sdktrace.SpanExporter
+	if cfg.Exporter == ExporterOTLP {
+		if exp = o.Exporter; exp == nil {
+			if o.Metrics == nil {
+				return nil, errNoMetrics
+			}
+			exp, err = newOTLP(ctx, cfg.Protocol)
+			if err != nil {
+				return nil, errStartExporter
+			}
 		}
 	}
 
@@ -78,22 +89,27 @@ func Start(ctx context.Context, o Options) (*Tracing, error) {
 		sdktrace.WithSampler(sampler),
 	}
 	if exp != nil {
-		var dropped spanqueue.DropCounter = discardCounter{}
-		if o.Metrics != nil {
-			c, cerr := o.Metrics.Counter(metrics.NameTracingSpansDropped)
-			if cerr != nil {
-				_ = exp.Shutdown(ctx)
-				return nil, cerr
-			}
-			dropped = c
+		if o.Metrics == nil {
+			_ = exp.Shutdown(ctx)
+			return nil, errNoMetrics
 		}
-		q := spanqueue.New(FilterResource(classifyExporter{exp}, res), spanqueue.Config{
+		dropped, cerr := o.Metrics.Counter(metrics.NameTracingSpansDropped)
+		if cerr != nil {
+			_ = exp.Shutdown(ctx)
+			return nil, errStartMetrics
+		}
+		fexp := FilterResource(newClassifyExporter(exp), res)
+		q := spanqueue.New(fexp, spanqueue.Config{
 			MaxQueueSize:       cfg.Queue.MaxQueueSize,
 			MaxExportBatchSize: cfg.Queue.MaxExportBatchSize,
 			ScheduleDelay:      cfg.Queue.ScheduleDelay,
 			ExportTimeout:      cfg.Queue.ExportTimeout,
 		}, dropped)
-		provOpts = append(provOpts, sdktrace.WithSpanProcessor(q))
+		var sp sdktrace.SpanProcessor = q
+		if f, ok := fexp.(interface{ ForceFlush(context.Context) error }); ok {
+			sp = flushProcessor{SpanProcessor: q, exp: f}
+		}
+		provOpts = append(provOpts, sdktrace.WithSpanProcessor(sp))
 	}
 	tp := sdktrace.NewTracerProvider(provOpts...)
 	if exp != nil {
@@ -110,9 +126,25 @@ func newOTLP(ctx context.Context, p Protocol) (sdktrace.SpanExporter, error) {
 	return otlptracehttp.New(ctx)
 }
 
-type discardCounter struct{}
+// constError has constant text; cause is kept only for errors.Is on context
+// errors, never for rendering.
+type constError struct {
+	msg   string
+	cause error
+}
 
-func (discardCounter) Add(float64) {}
+func (e *constError) Error() string { return e.msg }
+func (e *constError) Is(target error) bool {
+	return e.cause != nil && (target == context.Canceled || target == context.DeadlineExceeded) &&
+		errors.Is(e.cause, target)
+}
+
+var (
+	errStartResource = &constError{msg: "tracing: resource construction failed"}
+	errStartExporter = &constError{msg: "tracing: exporter construction failed"}
+	errStartMetrics  = &constError{msg: "tracing: dropped-spans counter unavailable"}
+	errNoMetrics     = &constError{msg: "tracing: metrics factory required when exporting"}
+)
 
 // Enabled reports whether tracing is on (hook for FR-19).
 func (t *Tracing) Enabled() bool { return t.enabled }
@@ -125,7 +157,10 @@ func (t *Tracing) ForceFlush(ctx context.Context) error {
 	if t.sdk == nil {
 		return nil
 	}
-	return t.sdk.ForceFlush(ctx)
+	if err := t.sdk.ForceFlush(ctx); err != nil {
+		return &constError{msg: "tracing: flush failed", cause: err}
+	}
+	return nil
 }
 
 // Shutdown stops the provider, bounded by ctx and by 5 s (FR-34).
@@ -139,10 +174,13 @@ func (t *Tracing) Shutdown(ctx context.Context) error {
 		defer cancel()
 	}
 	err := t.sdk.Shutdown(ctx)
-	if err != nil && t.logger != nil {
+	if err == nil {
+		return nil
+	}
+	if t.logger != nil {
 		t.logger.LogAttrs(ctx, slog.LevelWarn, "tracing shutdown failed", errclass.LogAttrs(err)...)
 	}
-	return err
+	return &constError{msg: "tracing: shutdown failed", cause: err}
 }
 
 // rejectionError marks an OTLP collector rejection. Its text is constant so the
@@ -154,22 +192,34 @@ func (rejectionError) ProtocolError() {}
 
 var _ errclass.ProtocolError = rejectionError{}
 
-// classifyRejection wraps collector rejections (HTTP non-2xx, gRPC
-// non-transport status) and returns other errors unchanged.
-func classifyRejection(err error) error {
+// ClassifyExportError wraps collector rejections (gRPC status other than
+// Unavailable/DeadlineExceeded/Canceled; plain non-transport errors such as the
+// otlptracehttp non-2xx form) in a ProtocolError with constant text. Transport
+// errors (*url.Error, net.Error) and everything else are returned unchanged.
+func ClassifyExportError(err error) error {
 	if err == nil {
 		return nil
 	}
-	var s interface{ GRPCStatus() *status.Status }
-	if errors.As(err, &s) {
-		switch s.GRPCStatus().Code() {
+	var ue *url.Error
+	var ne net.Error
+	if errors.As(err, &ue) || errors.As(err, &ne) {
+		return err
+	}
+	if st, ok := status.FromError(err); ok {
+		switch st.Code() {
 		case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
 			return err
 		}
 		return rejectionError{}
 	}
-	// HTTP rejections carry no typed error; they are the errors that no
-	// transport classification (network, timeout, TLS, canceled) explains.
+	var gs interface{ GRPCStatus() *status.Status }
+	if errors.As(err, &gs) {
+		switch gs.GRPCStatus().Code() {
+		case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
+			return err
+		}
+		return rejectionError{}
+	}
 	if c, d := errclass.Classify(err); c == errclass.ClassInternal && d == errclass.DetailOther {
 		return rejectionError{}
 	}
@@ -179,5 +229,34 @@ func classifyRejection(err error) error {
 type classifyExporter struct{ sdktrace.SpanExporter }
 
 func (c classifyExporter) ExportSpans(ctx context.Context, spans []sdktrace.ReadOnlySpan) error {
-	return classifyRejection(c.SpanExporter.ExportSpans(ctx, spans))
+	return ClassifyExportError(c.SpanExporter.ExportSpans(ctx, spans))
+}
+
+type flushClassifyExporter struct{ classifyExporter }
+
+func (f flushClassifyExporter) ForceFlush(ctx context.Context) error {
+	return f.SpanExporter.(interface{ ForceFlush(context.Context) error }).ForceFlush(ctx)
+}
+
+func newClassifyExporter(exp sdktrace.SpanExporter) sdktrace.SpanExporter {
+	c := classifyExporter{exp}
+	if _, ok := exp.(interface{ ForceFlush(context.Context) error }); ok {
+		return flushClassifyExporter{c}
+	}
+	return c
+}
+
+// flushProcessor forwards ForceFlush to a flush-capable exporter after the
+// queue has been drained (spanqueue itself only exports the queued batch).
+type flushProcessor struct {
+	sdktrace.SpanProcessor
+	exp interface{ ForceFlush(context.Context) error }
+}
+
+func (f flushProcessor) ForceFlush(ctx context.Context) error {
+	err := f.SpanProcessor.ForceFlush(ctx)
+	if ferr := f.exp.ForceFlush(ctx); err == nil {
+		err = ferr
+	}
+	return err
 }
