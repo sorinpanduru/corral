@@ -349,9 +349,6 @@ func (r *Registry) Settings() []Setting {
 // cloned too.
 func cloneSetting(s Setting) Setting {
 	s.Type.EnumValues = append([]string(nil), s.Type.EnumValues...)
-	if s.Type.EnumValues != nil && len(s.Type.EnumValues) == 0 {
-		s.Type.EnumValues = nil
-	}
 	switch v := s.DefaultValue.(type) {
 	case []string:
 		s.DefaultValue = append([]string{}, v...)

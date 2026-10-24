@@ -56,6 +56,9 @@ func writeSetting(b *bytes.Buffer, s registry.Setting) {
 // printable returns the declared default verbatim, quoted only when it holds
 // a control character that would break the layout.
 func printable(s string) string {
+	if s == "" {
+		return `""`
+	}
 	for _, r := range s {
 		if r <= 0x1f || r >= 0x7f && r <= 0x9f {
 			return strconv.Quote(s)
