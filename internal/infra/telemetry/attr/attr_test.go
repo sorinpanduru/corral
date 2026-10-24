@@ -21,7 +21,7 @@ var requiredKeys = []string{
 	"time", "level", "msg", "component", "error", "trace_id", "span_id",
 	"stack", "setting",
 	// plan T3 named extras
-	"corral.error.detail", "suppressed_count",
+	"corral.error.detail", "suppressed_count", "reason",
 	// FR-23 required attributes
 	"db.system.name", "db.operation.name", "db.namespace", "db.collection.name",
 	"client.address", "client.port", "error.type",

@@ -10,7 +10,7 @@ import (
 func TestAllowedKeyAccepts(t *testing.T) {
 	keys := []string{
 		"time", "level", "msg", "component", "error", "trace_id", "span_id",
-		"stack", "setting", "corral.error.detail", "suppressed_count",
+		"stack", "setting", "corral.error.detail", "suppressed_count", "reason",
 		"db.system.name", "db.operation.name", "db.namespace", "db.collection.name",
 		"client.address", "client.port", "error.type", "db.response.status_code",
 		"corral.db.response.code_name", "server.address", "server.port",

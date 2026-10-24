@@ -41,20 +41,25 @@ func equalSets(a, b []string) bool {
 	return true
 }
 
-// FR-29: the class enum is exactly the six values.
+// FR-29 (Amendment 3, AC-41): the class enum is exactly the seven values.
 func TestClassesEnum_FR29(t *testing.T) {
-	want := []string{"timeout", "network", "protocol", "server", "config", "internal"}
+	want := []string{"timeout", "network", "protocol", "server", "config", "internal", "rejected"}
 	if got := strs(errclass.Classes()); !equalSets(got, want) {
 		t.Fatalf("Classes() = %v, want %v", got, want)
 	}
 }
 
-// FR-29: the detail enum is exactly the 14 values.
+// FR-29 (Amendment 3, AC-41): the detail enum is exactly the 28 values.
 func TestDetailsEnum_FR29(t *testing.T) {
 	want := []string{
 		"ECONNREFUSED", "ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "EPIPE",
 		"EHOSTUNREACH", "ENETUNREACH", "EADDRINUSE", "deadline_exceeded",
 		"canceled", "eof", "tls_handshake", "dns_resolution", "other",
+		"pool_wait_timeout", "pool_queue_full", "upstream_unavailable",
+		"upstream_auth_failed", "upstream_incompatible", "shutting_down",
+		"client_auth_unsupported", "command_blocked", "handshake_rejected",
+		"unsupported_opcode", "message_too_large", "malformed_message",
+		"checksum_mismatch", "unexpected_response",
 	}
 	if got := strs(errclass.Details()); !equalSets(got, want) {
 		t.Fatalf("Details() = %v, want %v", got, want)

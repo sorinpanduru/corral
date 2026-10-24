@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel/trace"
 
@@ -459,5 +460,51 @@ func TestFailureMessagesIncludeRecordMessageAndLevel(t *testing.T) {
 		if !strings.Contains(all, "synthetic-marker-nocomp") || !strings.Contains(strings.ToUpper(all), "INFO") {
 			t.Errorf("failure text = %q", all)
 		}
+	})
+}
+
+// SPEC-001 FR-39 (Amendment 3), AC-41: a reason attribute must be a string.
+func TestReasonKeyKindCheck_AC41(t *testing.T) {
+	log := func(a slog.Attr) func(h *logcheck.Handler) {
+		return func(h *logcheck.Handler) {
+			lg(h, "pool").LogAttrs(context.Background(), slog.LevelInfo, "synthetic", a)
+		}
+	}
+	wantPass(t, "string reason", log(slog.String("reason", "pool_queue_full")))
+	wantFail(t, "int reason", log(slog.Int("reason", 3)))
+	wantFail(t, "int64 reason", log(slog.Int64("reason", 3)))
+	wantFail(t, "uint64 reason", log(slog.Uint64("reason", 3)))
+	wantFail(t, "float reason", log(slog.Float64("reason", 1.5)))
+	wantFail(t, "bool reason", log(slog.Bool("reason", true)))
+	wantFail(t, "any reason", log(slog.Any("reason", struct{ A int }{1})))
+	wantFail(t, "group reason", log(slog.Group("reason", slog.String("a", "b"))))
+	wantFail(t, "duration reason", log(slog.Duration("reason", 1)))
+	wantFail(t, "time reason", log(slog.Time("reason", time.Unix(0, 0))))
+}
+
+// A reason attribute bound with With is checked too.
+func TestReasonKeyBoundWith_AC41(t *testing.T) {
+	wantFail(t, "bound int reason", func(h *logcheck.Handler) {
+		l := lg(h, "upstream").With("reason", 7)
+		l.Info("synthetic")
+	})
+	wantPass(t, "bound string reason", func(h *logcheck.Handler) {
+		lg(h, "upstream").With("reason", "eof").Info("synthetic")
+	})
+}
+
+// Amendment 3 components are accepted by logcheck, and the key set is still
+// closed.
+func TestNewComponentsAndUnknownKey_AC41(t *testing.T) {
+	for _, c := range []string{"proxy", "pool", "upstream"} {
+		wantPass(t, "component "+c, func(h *logcheck.Handler) {
+			lg(h, c).Info("synthetic", "reason", "x")
+		})
+	}
+	wantFail(t, "unknown key still rejected", func(h *logcheck.Handler) {
+		lg(h, "proxy").Info("synthetic", "reasons", "x")
+	})
+	wantFail(t, "unknown component still rejected", func(h *logcheck.Handler) {
+		lg(h, "proxies").Info("synthetic")
 	})
 }

@@ -7,9 +7,9 @@ import (
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logging"
 )
 
-// FR-7 (as amended, D5): the fixed component set is exactly these seven.
+// FR-7 (as amended, D5): the fixed component set is exactly these ten (Amendment 3 adds proxy, pool, upstream).
 func TestComponentsFixedSet(t *testing.T) {
-	want := []string{"admin_http", "config", "grpc", "lifecycle", "otel", "thirdparty", "tracing"}
+	want := []string{"admin_http", "config", "grpc", "lifecycle", "otel", "pool", "proxy", "thirdparty", "tracing", "upstream"}
 	var got []string
 	for _, c := range logging.Components() {
 		got = append(got, string(c))
@@ -35,6 +35,9 @@ func TestComponentConstantValues(t *testing.T) {
 		logging.OTel:       "otel",
 		logging.GRPC:       "grpc",
 		logging.ThirdParty: "thirdparty",
+		logging.Proxy:      "proxy",
+		logging.Pool:       "pool",
+		logging.Upstream:   "upstream",
 	}
 	for c, v := range cases {
 		if string(c) != v {
@@ -50,7 +53,7 @@ func TestValidComponent(t *testing.T) {
 			t.Errorf("ValidComponent(%q) = false", c)
 		}
 	}
-	for _, bad := range []string{"", "CONFIG", "Config", "unknown", "proxy", "admin-http", " config", "config ", "third_party"} {
+	for _, bad := range []string{"", "CONFIG", "Config", "unknown", "Proxy", "POOL", "upstreams", "proxy ", "admin-http", " config", "config ", "third_party"} {
 		if logging.ValidComponent(logging.Component(bad)) {
 			t.Errorf("ValidComponent(%q) = true, want false", bad)
 		}
