@@ -5,6 +5,7 @@ package logcheck
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -61,7 +62,9 @@ type Handler struct {
 	tee   slog.Handler
 }
 
-// New returns a Handler reporting violations through tb.
+// New returns a Handler reporting violations through tb. Callers must stop
+// every goroutine that logs through the handler before the test ends: a
+// violation reported after the test finished makes tb panic.
 func New(tb testing.TB, opts ...Option) *Handler {
 	s := &shared{tb: tb}
 	for _, o := range opts {
@@ -84,16 +87,28 @@ func (h *Handler) Records() []Record {
 	return out
 }
 
-func (h *Handler) fail(format string, args ...any) {
+// ctxInfo identifies the record being checked in failure text. It never holds
+// attribute values.
+type ctxInfo struct {
+	msg   string
+	level slog.Level
+	set   bool
+}
+
+func (h *Handler) fail(c ctxInfo, format string, args ...any) {
 	h.s.tb.Helper()
+	text := fmt.Sprintf(format, args...)
+	if c.set {
+		text += fmt.Sprintf(" (record: level=%s msg=%q)", c.level, c.msg)
+	}
 	// Errorf, not Fatalf: Handle may run on a goroutine other than the test's.
-	h.s.tb.Errorf("logcheck: "+format, args...)
+	h.s.tb.Errorf("logcheck: %s", text)
 }
 
 // WithAttrs binds attrs; they are checked when bound and again per record.
 func (h *Handler) WithAttrs(as []slog.Attr) slog.Handler {
 	for _, a := range as {
-		h.checkAttr(a, false)
+		h.checkAttr(ctxInfo{}, a, false)
 	}
 	c := *h
 	c.attrs = append(append([]slog.Attr(nil), h.attrs...), as...)
@@ -105,7 +120,7 @@ func (h *Handler) WithAttrs(as []slog.Attr) slog.Handler {
 
 // WithGroup always fails: groups are not allowed (FR-39).
 func (h *Handler) WithGroup(name string) slog.Handler {
-	h.fail("slog group %q is not allowed (FR-39)", name)
+	h.fail(ctxInfo{}, "slog group %q is not allowed (FR-39)", name)
 	c := *h
 	if h.tee != nil {
 		c.tee = h.tee.WithGroup(name)
@@ -114,26 +129,31 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 }
 
 // checkAttr validates one attribute. Trace keys are validated in Handle.
-func (h *Handler) checkAttr(a slog.Attr, inRecord bool) {
+func (h *Handler) checkAttr(c ctxInfo, a slog.Attr, inRecord bool) {
 	h.s.tb.Helper()
 	v := a.Value.Resolve()
 	if v.Kind() == slog.KindGroup {
-		h.fail("slog group value %q is not allowed (FR-39)", a.Key)
+		h.fail(c, "slog group value %q is not allowed (FR-39)", a.Key)
+		return
+	}
+	switch a.Key {
+	case attr.Msg, attr.Level, attr.Time:
+		h.fail(c, "key %q is produced by the handler; callers must not set it (FR-39)", a.Key)
 		return
 	}
 	if !logging.AllowedKey(a.Key) {
-		h.fail("key %q is outside the FR-39 allowlist", a.Key)
+		h.fail(c, "key %q is outside the FR-39 allowlist", a.Key)
 		return
 	}
 	if (a.Key == attr.TraceID || a.Key == attr.SpanID) && (!inRecord || !h.s.behindCorrelation) {
-		h.fail("callers must not set %q (FR-8, FR-39)", a.Key)
+		h.fail(c, "callers must not set %q (FR-8, FR-39)", a.Key)
 		return
 	}
 	if logging.NumericKey(a.Key) {
 		switch v.Kind() {
 		case slog.KindInt64, slog.KindUint64, slog.KindFloat64:
 		default:
-			h.fail("key %q needs a numeric value, got kind %v (FR-39)", a.Key, v.Kind())
+			h.fail(c, "key %q needs a numeric value, got kind %v (FR-39)", a.Key, v.Kind())
 		}
 	}
 }
@@ -141,9 +161,10 @@ func (h *Handler) checkAttr(a slog.Attr, inRecord bool) {
 // Handle checks and records r.
 func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 	h.s.tb.Helper()
+	ci := ctxInfo{msg: r.Message, level: r.Level, set: true}
 	all := append([]slog.Attr(nil), h.attrs...)
 	r.Attrs(func(a slog.Attr) bool {
-		h.checkAttr(a, true)
+		h.checkAttr(ci, a, true)
 		all = append(all, slog.Attr{Key: a.Key, Value: a.Value.Resolve()})
 		return true
 	})
@@ -151,9 +172,9 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 	for i := range h.attrs {
 		all[i].Value = all[i].Value.Resolve()
 	}
-	h.checkComponent(all)
+	h.checkComponent(ci, all)
 	if h.s.behindCorrelation {
-		h.checkTraceIDs(ctx, all)
+		h.checkTraceIDs(ci, ctx, all)
 	}
 
 	h.s.mu.Lock()
@@ -166,27 +187,30 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 	return nil
 }
 
-func (h *Handler) checkComponent(all []slog.Attr) {
+func (h *Handler) checkComponent(ci ctxInfo, all []slog.Attr) {
 	h.s.tb.Helper()
-	found := false
+	n := 0
 	for _, a := range all {
 		if a.Key != attr.Component {
 			continue
 		}
-		found = true
+		n++
 		if a.Value.Kind() != slog.KindString || !logging.ValidComponent(logging.Component(a.Value.String())) {
-			h.fail("component %v is outside the FR-7 set", a.Value)
+			h.fail(ci, "component %v is outside the FR-7 set", a.Value)
 		}
 	}
-	if !found {
-		h.fail("record has no component (FR-7)")
+	if n == 0 {
+		h.fail(ci, "record has no component (FR-7)")
+	}
+	if n > 1 {
+		h.fail(ci, "record has %d component attributes; exactly one is allowed (FR-7)", n)
 	}
 }
 
 // checkTraceIDs enforces that, behind the correlation wrapper, each id
 // appears exactly when the context has a valid span context, once, with the
 // matching value. Caller-set ids make a key appear twice or without context.
-func (h *Handler) checkTraceIDs(ctx context.Context, all []slog.Attr) {
+func (h *Handler) checkTraceIDs(ci ctxInfo, ctx context.Context, all []slog.Attr) {
 	h.s.tb.Helper()
 	sc := trace.SpanContextFromContext(ctx)
 	for _, key := range []string{attr.TraceID, attr.SpanID} {
@@ -210,11 +234,11 @@ func (h *Handler) checkTraceIDs(ctx context.Context, all []slog.Attr) {
 		}
 		switch {
 		case n > 1:
-			h.fail("%s appears %d times; only the correlation wrapper may add it", key, n)
+			h.fail(ci, "%s appears %d times; only the correlation wrapper may add it", key, n)
 		case !sc.IsValid():
-			h.fail("%s present but the record context has no valid span context", key)
+			h.fail(ci, "%s present but the record context has no valid span context", key)
 		case val.Kind() != slog.KindString || val.String() != want:
-			h.fail("%s does not match the record context's span context", key)
+			h.fail(ci, "%s does not match the record context's span context", key)
 		}
 	}
 }
