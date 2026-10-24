@@ -39,9 +39,9 @@ func expectedSanitised(in string, limit int) string {
 }
 
 type sanitiser struct {
-	name string
-	limit  int
-	fn   func(string) string
+	name  string
+	limit int
+	fn    func(string) string
 }
 
 // checkInvariants asserts, for one input: valid UTF-8, within the limit,
