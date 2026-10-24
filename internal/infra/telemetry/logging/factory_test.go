@@ -2,8 +2,8 @@ package logging_test
 
 import (
 	"errors"
-	"strings"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logging"
