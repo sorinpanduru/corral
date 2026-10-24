@@ -25,7 +25,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/sorinpanduru/corral/internal/infra/config"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/errclass"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/metrics"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/tracing/spanqueue"
@@ -36,11 +35,8 @@ const shutdownCap = 5 * time.Second
 
 // Options configures Start.
 type Options struct {
-	// Settings are the validated settings that Config was resolved from. Start
-	// does not read them; they are kept so callers pass one coherent bundle.
-	Settings config.Settings
-	Env      LookupEnv
-	Config   EnvConfig
+	Env    LookupEnv
+	Config EnvConfig
 	// Enabled is the result of Resolve.
 	Enabled bool
 	Metrics *metrics.Factory

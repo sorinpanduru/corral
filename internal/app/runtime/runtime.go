@@ -22,6 +22,7 @@ import (
 
 	"github.com/sorinpanduru/corral/internal/infra/adminhttp"
 	"github.com/sorinpanduru/corral/internal/infra/config"
+	"github.com/sorinpanduru/corral/internal/infra/osfile"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/errclass"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logbridge"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logging"
@@ -93,11 +94,14 @@ func Run(ctx context.Context, args []string, env tracing.LookupEnv, stdout io.Wr
 	// Resolve is pure environment parsing; it runs before the handler is built
 	// so trace correlation is wrapped only when tracing is really on. Its error
 	// is logged after Install (step 3).
-	enabled, tcfg, resolveErr := tracing.Resolve(settings, env)
+	// Interim (until T12): real file reader, every error is logged.
+	enabled, tcfg, resolveErrs := tracing.Resolve(
+		tracing.ResolveInputs{Enabled: settings.TracingEnabled, SampleRatio: settings.SampleRatio},
+		env, osfile.Read)
 
 	// Step 1: logging factory.
 	var h slog.Handler = logging.NewHandler(stdout, settings.LogFormat, settings.LogLevel)
-	if resolveErr == nil && enabled {
+	if len(resolveErrs) == 0 && enabled {
 		h = logging.WithTraceCorrelation(h)
 	}
 	factory := logging.NewFactory(h)
@@ -109,8 +113,8 @@ func Run(ctx context.Context, args []string, env tracing.LookupEnv, stdout io.Wr
 	life := mustLogger(factory, logging.Lifecycle)
 
 	// Step 3: tracing environment validation result.
-	if resolveErr != nil {
-		config.LogError(cfgLog, resolveErr)
+	if len(resolveErrs) > 0 {
+		config.LogErrors(cfgLog, resolveErrs)
 		return exitFailure
 	}
 
@@ -175,12 +179,11 @@ func Run(ctx context.Context, args []string, env tracing.LookupEnv, stdout io.Wr
 	if ctx.Err() == nil {
 		// Step 8: tracing.Start (last step).
 		tr, err = tracing.Start(ctx, tracing.Options{
-			Settings: settings,
-			Env:      env,
-			Config:   tcfg,
-			Enabled:  enabled,
-			Metrics:  mf,
-			Logger:   mustLogger(factory, logging.Tracing),
+			Env:     env,
+			Config:  tcfg,
+			Enabled: enabled,
+			Metrics: mf,
+			Logger:  mustLogger(factory, logging.Tracing),
 		})
 		switch {
 		case err != nil && ctx.Err() != nil:

@@ -4,16 +4,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
-	"io"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
-	"syscall"
 )
-
-// maxPEMFileBytes bounds how much of a certificate or key file is read.
-const maxPEMFileBytes = 4 << 20
 
 // validEndpoint reports whether v is an absolute http/https URL with a host
 // (D8). The value is parsed only; it is never retained or echoed.
@@ -78,37 +72,14 @@ func isToken(s string) bool {
 	return true
 }
 
-// readPEMFile reads a regular file of at most maxPEMFileBytes. FIFOs, devices,
-// directories and oversize files are rejected without blocking. Contents are
-// returned to the caller for parsing only and never retained or logged (FR-24).
-func readPEMFile(path string) ([]byte, bool) {
-	fi, err := os.Stat(path) // follows symlinks
-	if err != nil || !fi.Mode().IsRegular() || fi.Size() > maxPEMFileBytes {
-		return nil, false
-	}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0) // #nosec G304 -- operator path, validated not echoed
-	if err != nil {
-		return nil, false
-	}
-	defer f.Close()
-	if fi2, err := f.Stat(); err != nil || !fi2.Mode().IsRegular() {
-		return nil, false
-	}
-	b, err := io.ReadAll(io.LimitReader(f, maxPEMFileBytes+1))
-	if err != nil || len(b) == 0 || len(b) > maxPEMFileBytes {
-		return nil, false
-	}
-	return b, true
-}
-
 // keyPairOK reports whether the certificate and key files form a key pair.
-// The buffers are discarded on return.
-func keyPairOK(certPath, keyPath string) bool {
-	c, ok := readPEMFile(certPath)
+// The bytes come from the per-call cache and are never retained.
+func (r *resolver) keyPairOK(certPath, keyPath string) bool {
+	c, ok := r.readPEM(certPath)
 	if !ok {
 		return false
 	}
-	k, ok := readPEMFile(keyPath)
+	k, ok := r.readPEM(keyPath)
 	if !ok {
 		return false
 	}
@@ -118,8 +89,8 @@ func keyPairOK(certPath, keyPath string) bool {
 
 // certFileOK reports whether path is readable and holds at least one PEM
 // certificate that parses, and no unparsable certificate block.
-func certFileOK(path string) bool {
-	b, ok := readPEMFile(path)
+func (r *resolver) certFileOK(path string) bool {
+	b, ok := r.readPEM(path)
 	if !ok {
 		return false
 	}
@@ -143,8 +114,8 @@ func certFileOK(path string) bool {
 
 // keyFileOK reports whether path is readable and holds a PEM private key that
 // parses (PKCS#8, PKCS#1 or SEC1).
-func keyFileOK(path string) bool {
-	b, ok := readPEMFile(path)
+func (r *resolver) keyFileOK(path string) bool {
+	b, ok := r.readPEM(path)
 	if !ok {
 		return false
 	}
