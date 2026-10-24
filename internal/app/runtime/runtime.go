@@ -138,7 +138,11 @@ func Run(ctx context.Context, in Inputs, hooks Hooks) int {
 		}
 		return exitOK
 	case loader.ModeVersion:
-		if _, err := fmt.Fprintf(stdout, "corral %s\n", in.Version); err != nil {
+		version := in.Version
+		if version == "" {
+			version = "devel"
+		}
+		if _, err := fmt.Fprintf(stdout, "corral %s\n", version); err != nil {
 			return exitFailure
 		}
 		return exitOK
