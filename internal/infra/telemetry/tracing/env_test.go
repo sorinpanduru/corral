@@ -578,3 +578,28 @@ var envAllVars = []string{
 	"OTEL_BSP_MAX_QUEUE_SIZE", "OTEL_BSP_MAX_EXPORT_BATCH_SIZE",
 	"OTEL_BSP_SCHEDULE_DELAY", "OTEL_BSP_EXPORT_TIMEOUT",
 }
+
+// FR-37 (D, T12 security review): queue and batch sizes are capped at
+// 1<<20 (the span queue preallocates), so a huge value cannot exhaust memory.
+func TestResolve_BSPSizeUpperBound(t *testing.T) {
+	const q, b = "OTEL_BSP_MAX_QUEUE_SIZE", "OTEL_BSP_MAX_EXPORT_BATCH_SIZE"
+	cfg := envMustResolve(t, map[string]string{q: "1048576"})
+	if cfg.Queue.MaxQueueSize != 1<<20 {
+		t.Errorf("MaxQueueSize = %d, want 1048576", cfg.Queue.MaxQueueSize)
+	}
+	cfg = envMustResolve(t, map[string]string{q: "1048576", b: "1048576"})
+	if cfg.Queue.MaxExportBatchSize != 1<<20 {
+		t.Errorf("MaxExportBatchSize = %d, want 1048576", cfg.Queue.MaxExportBatchSize)
+	}
+	for _, v := range []string{"1048577", "4294967295"} {
+		t.Run("queue="+v, func(t *testing.T) {
+			_, _, err := envResolveOn(map[string]string{q: v})
+			envRequireRejected(t, err, q, v)
+		})
+		t.Run("batch="+v, func(t *testing.T) {
+			// The queue is at the cap, so the batch is the only offender.
+			_, _, err := envResolveOn(map[string]string{q: "1048576", b: v})
+			envRequireRejected(t, err, b, v)
+		})
+	}
+}
