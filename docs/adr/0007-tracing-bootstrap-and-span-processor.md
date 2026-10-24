@@ -50,6 +50,29 @@ and flush for at most 5 seconds on shutdown.
   blocking exporter. The override is ignored when tracing is disabled.
 - Exporter and SDK errors reach corral only through the otel error handler /
   logger bridges (FR-28, FR-33), never as raw text.
+- Bootstrap requirements for `Start` (decided by Orchestrator under Owner's
+  standing instruction, 2026-10-24):
+  - (a) The OTLP exporter is wrapped as
+    `spanqueue.New(tracing.FilterResource(otlpExp, res), ...)`, with `res`
+    the resource `NewResource` returned without error. A bootstrap-level
+    AC-27 test uses real `OTEL_RESOURCE_ATTRIBUTES` with banned keys.
+  - (b) The OTLP exporters read `os.Getenv` directly, not corral's
+    `LookupEnv`, so `Resolve` must validate the same real process
+    environment.
+  - (c) Export errors go to `otel.Handle`, so `logbridge.Install` must have
+    run first (ADR-0006 step 2).
+  - (d) `Shutdown` passes a context with a 5-second deadline (FR-34).
+  - (e) Collector rejections are wrapped in an `errclass.ProtocolError`
+    type, so they classify as `protocol`/`other`.
+  - (f) No processor or exporter path, including the test-only exporter
+    override, may bypass `FilterResource`.
+- `NewResource` tolerates `resource.ErrPartialResource`; other detector
+  errors become a constant sentinel. The resource denylist checks raw and
+  percent-decoded keys.
+- spanqueue: injectable ticker (`WithTicker`), `ForceFlush` exports the
+  snapshot queued at call time, a second `Shutdown` returns its own
+  `ctx.Err()`, and `Config` clamping is defence in depth behind T10's
+  validation.
 
 ## Consequences
 

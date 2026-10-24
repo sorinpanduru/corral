@@ -273,6 +273,15 @@ Test writers may add `go.mod`/`go.sum` requirements when a self-test needs them;
   - When enabled, validate: `OTEL_TRACES_EXPORTER` (`otlp` default, `none`); protocol (`OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` over `OTEL_EXPORTER_OTLP_PROTOCOL`; `http/protobuf` default, `grpc`); endpoint (both variants); headers (both variants, W3C baggage-style `key=value` list, percent-decoded); timeout (both variants); certificate / client certificate / client key (readable, PEM-parsable; contents never logged or kept beyond parse); compression (`gzip`/`none`); insecure (`true`/`false`, case-insensitive); `OTEL_TRACES_SAMPLER` (six values); `OTEL_TRACES_SAMPLER_ARG` (number in [0,1] only when the effective sampler uses a ratio, ignored otherwise); `OTEL_BSP_*` (FR-37 mapping, defaults 2048 / 5000 ms / 30000 ms / 512, batch <= queue); `OTEL_RESOURCE_ATTRIBUTES` format; `OTEL_SERVICE_NAME`. Rules not spelled out in the spec follow D8.
   - When disabled, nothing except `OTEL_SDK_DISABLED` is read.
   - Every error is a `config.Error` whose setting is the variable name.
+  - D8 refinements after T10 review (decided by Orchestrator under Owner's standing instruction, 2026-10-24):
+    - `*_HEADERS`: keys must be RFC 7230 tokens and are not percent-decoded; values are percent-decoded.
+    - Client certificate and client key are paired per prefix (generic `OTEL_EXPORTER_OTLP_*` vs `OTEL_EXPORTER_OTLP_TRACES_*`) and must load together with `tls.X509KeyPair`.
+    - Values are `strings.TrimSpace`d before the empty (= unset) check.
+    - An unset `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` defaults to `min(512, queue size)`.
+    - `OTEL_BSP_MAX_QUEUE_SIZE` and `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` must be ≤ `1<<20`.
+    - Exporter, protocol and sampler values are case-insensitive; compression is matched exactly.
+    - PEM files must be regular files of at most 4 MiB, opened with `O_NONBLOCK` (so a FIFO or device cannot block startup).
+    - Private keys in PKCS#8, PKCS#1 or SEC1 form are accepted; encrypted keys are rejected.
 - FRs/ACs: FR-19, FR-20, FR-21 (validation), FR-27, FR-37 (variable mapping); AC-21 (unit part 2, all eight listed values rejected when on and accepted/ignored when off, marker no-echo), AC-14 (unit: `OTEL_SDK_DISABLED=yes` is false and not an error), AC-16 (ratio range rejection).
 - Implementer owns: `internal/infra/telemetry/tracing/env.go` and other non-test files it creates for validation in `internal/infra/telemetry/tracing/` (prefix `env*`).
 - Test writer owns: `internal/infra/telemetry/tracing/env*_test.go`, `internal/infra/telemetry/tracing/testdata/**` (non-PEM and other non-certificate fixtures only). Certificate and key fixtures are synthetic self-signed material generated at test time into `t.TempDir()`; no `*.pem`, `*.key` or `*.p12` file is committed.
@@ -289,10 +298,14 @@ Test writers may add `go.mod`/`go.sum` requirements when a self-test needs them;
 - Goal: FR-21 sampler selection and FR-30 resource allowlist.
   - Default: `ParentBased(TraceIDRatioBased(ratio))` with ratio from `OTEL_TRACES_SAMPLER_ARG` if set, else `tracing.sample_ratio`. `OTEL_TRACES_SAMPLER` replaces it with the named sampler; ratio-based variants use the effective ratio.
   - Resource: `service.name` default `corral` (overridden by `OTEL_SERVICE_NAME`), `telemetry.sdk.*`, `host.name`, and `OTEL_RESOURCE_ATTRIBUTES` contents; no other detectors; then remove `process.command_args`, `process.command_line`, `process.owner` whatever their source. Do not merge with `resource.Default()`.
+  - Review decisions (decided by Orchestrator under Owner's standing instruction, 2026-10-24):
+    - `NewResource` tolerates `resource.ErrPartialResource` (uses the partial resource); any other detector error becomes a constant sentinel error (no detector text).
+    - The denylist checks both the raw key and its percent-decoded form.
+    - `filter.go` defines `tracing.FilterResource(exp, res)`: an exporter wrapper that ensures exported spans carry no denylisted resource attributes (using the filtered `res` from `NewResource`), as the final guard before export (used by T15).
 - FRs/ACs: FR-21, FR-30; AC-16, AC-25, AC-27 (unit part), AC-24 (resource part, unit).
-- Implementer owns: `internal/infra/telemetry/tracing/sampler.go`, `internal/infra/telemetry/tracing/resource.go`.
-- Test writer owns: `internal/infra/telemetry/tracing/sampler_test.go`, `internal/infra/telemetry/tracing/resource_test.go`.
-- Interfaces defined: `tracing.NewSampler(cfg EnvConfig, ratio float64) sdktrace.Sampler`; `tracing.NewResource(ctx context.Context, env LookupEnv) (*resource.Resource, error)`.
+- Implementer owns: `internal/infra/telemetry/tracing/sampler.go`, `internal/infra/telemetry/tracing/resource.go`, `internal/infra/telemetry/tracing/filter.go`.
+- Test writer owns: `internal/infra/telemetry/tracing/sampler_test.go`, `internal/infra/telemetry/tracing/resource_test.go`, `internal/infra/telemetry/tracing/filter_test.go`.
+- Interfaces defined: `tracing.NewSampler(cfg EnvConfig, ratio float64) sdktrace.Sampler`; `tracing.NewResource(ctx context.Context, env LookupEnv) (*resource.Resource, error)`; `tracing.FilterResource(exp sdktrace.SpanExporter, res *resource.Resource) sdktrace.SpanExporter`.
 - Docker: no.
 - Depends on: T10. Uses `go.opentelemetry.io/otel/sdk` and `semconv/v1.33.0`.
 
@@ -301,11 +314,14 @@ Test writers may add `go.mod`/`go.sum` requirements when a self-test needs them;
 - Goal: FR-37 processor (ADR-0007).
   - Implements `sdktrace.SpanProcessor`. `OnStart` no-op. `OnEnd` enqueues sampled spans with a non-blocking send; on full queue drops and increments the dropped counter. One worker exports when batch size is reached or the schedule delay elapses with spans queued; each export call bounded by the export timeout. `ForceFlush(ctx)` drains and exports. `Shutdown(ctx)` stops intake, drains until the context deadline, then drops the rest (not counted as queue-full drops), and shuts the exporter down.
   - Export errors are passed to `otel.Handle` (routed by T8), never logged directly.
-  - Clock injectable for the schedule delay.
+  - Clock injectable for the schedule delay: option `WithTicker(NewTicker)` (decided by Orchestrator under Owner's standing instruction, 2026-10-24, as are the next items).
+  - `ForceFlush` exports only the snapshot of spans queued at call time (spans ended afterwards are not waited for).
+  - A second `Shutdown` returns its own `ctx.Err()`.
+  - `Config` clamping and fallbacks (non-positive or oversized values, batch > queue) are defence in depth; T10 is the validator.
 - FRs/ACs: FR-34 (processor side), FR-37; AC-36 (unit: blocking exporter, start/end non-blocking within a bound, dropped counter equals ended minus exported).
 - Implementer owns: `internal/infra/telemetry/tracing/spanqueue/*.go` (non-test).
 - Test writer owns: `internal/infra/telemetry/tracing/spanqueue/*_test.go`.
-- Interfaces defined: `spanqueue.Config{MaxQueueSize, MaxExportBatchSize int; ScheduleDelay, ExportTimeout time.Duration}`; `spanqueue.DefaultConfig()`; `spanqueue.New(exp sdktrace.SpanExporter, cfg Config, dropped DropCounter, opts ...Option) *Processor`, where spanqueue defines its own minimal `type DropCounter interface{ Add(float64) }` (satisfied by T7's `*metrics.Counter`; easy to fake). spanqueue does not import `metrics` (decided by Orchestrator under Owner's standing instruction, 2026-10-24).
+- Interfaces defined: `spanqueue.Config{MaxQueueSize, MaxExportBatchSize int; ScheduleDelay, ExportTimeout time.Duration}`; `spanqueue.DefaultConfig()`; `spanqueue.WithTicker(NewTicker) Option` (injectable ticker factory for the schedule delay); `spanqueue.New(exp sdktrace.SpanExporter, cfg Config, dropped DropCounter, opts ...Option) *Processor`, where spanqueue defines its own minimal `type DropCounter interface{ Add(float64) }` (satisfied by T7's `*metrics.Counter`; easy to fake). spanqueue does not import `metrics` (decided by Orchestrator under Owner's standing instruction, 2026-10-24).
 - Docker: no.
 - Depends on: none at the code level (own `DropCounter` interface); T7 supplies the real counter at wiring time (T15). Scheduling unchanged.
 
@@ -346,11 +362,18 @@ Test writers may add `go.mod`/`go.sum` requirements when a self-test needs them;
 - Goal: `Start` builds the provider from validated config (ADR-0007) and wires log correlation.
   - Disabled: no-op provider, `Enabled()==false`, no exporter, no goroutines, no sockets.
   - `none`: SDK provider with sampler and resource, no processor.
-  - `otlp`: `otlptracehttp` or `otlptracegrpc` per protocol, process environment pass-through, wrapped in the T12 processor with the T7 counter; sampler and resource from T11; sets the global provider and `propagation` is not configured (no incoming context).
+  - `otlp`: `otlptracehttp` or `otlptracegrpc` per protocol, process environment pass-through, wrapped in `tracing.FilterResource` and then the T12 processor with the T7 counter; sampler and resource from T11; sets the global provider and `propagation` is not configured (no incoming context).
   - Returns whether the logging layer must use `logging.WithTraceCorrelation` (whenever tracing is enabled, including `OTEL_TRACES_EXPORTER=none`; D9).
   - Test-only exporter override option.
   - OTLP collector rejections (HTTP non-2xx, gRPC non-transport status) are wrapped in a corral type implementing `errclass.ProtocolError` before they reach `otel.Handle`/logs, so they classify as `protocol`/`other` (D3, T5 review decision).
-- FRs/ACs: FR-8, FR-19, FR-20, FR-21, FR-30, FR-37 wiring; AC-3 (integration: unreachable collector, all captured stdout lines JSON, no stderr), AC-6 (integration: sampled and unsampled spans give `trace_id`/`span_id`, also with `OTEL_TRACES_EXPORTER=none` per D9; disabled gives neither), AC-14 (integration: three setups, provider records no spans except `none`, zero TCP connections), AC-15 (HTTP default, grpc, TRACES_ precedence, `otlp` same as unset, endpoint honoured, gzip), AC-24 (header received, resource values, `service.name=corral` default), AC-27 (integration).
+  - Requirements (decided by Orchestrator under Owner's standing instruction, 2026-10-24; also in ADR-0007):
+    - (a) The OTLP exporter is wrapped as `spanqueue.New(tracing.FilterResource(otlpExp, res), ...)`, where `res` is the resource returned by `NewResource` without error. Add a bootstrap-level AC-27 integration test that sets real `OTEL_RESOURCE_ATTRIBUTES` with banned keys and asserts they never reach the collector.
+    - (b) The OTLP exporters read `os.Getenv` directly, not `LookupEnv`, so `Resolve` validation must run on the same real process environment (in production `Options.Env` is `os.LookupEnv`; tests use `t.Setenv`, not a fake lookup, when exporters are involved).
+    - (c) Export errors go to `otel.Handle`, so `logbridge.Install` must have run first (ADR-0006 step 2).
+    - (d) `Shutdown` passes a context with a 5 s deadline (shorter if the caller's is shorter) to the provider/processor (FR-34).
+    - (e) Collector rejections are wrapped in an `errclass.ProtocolError` type (above).
+    - (f) No processor or exporter path may bypass `FilterResource`, including the test-only exporter override.
+- FRs/ACs: FR-8, FR-19, FR-20, FR-21, FR-30, FR-37 wiring; AC-3 (integration: unreachable collector, all captured stdout lines JSON, no stderr), AC-6 (integration: sampled and unsampled spans give `trace_id`/`span_id`, also with `OTEL_TRACES_EXPORTER=none` per D9; disabled gives neither), AC-14 (integration: three setups, provider records no spans except `none`, zero TCP connections), AC-15 (HTTP default, grpc, TRACES_ precedence, `otlp` same as unset, endpoint honoured, gzip), AC-24 (header received, resource values, `service.name=corral` default), AC-27 (integration, through the real bootstrap with banned keys in `OTEL_RESOURCE_ATTRIBUTES`).
 - Implementer owns: `internal/infra/telemetry/tracing/tracing.go` and `internal/infra/telemetry/tracing/start*.go`.
 - Test writer owns: `tests/integration/tracing/*_test.go` (bootstrap + logging factory with logcheck tee + T13 collector + `markerscan.CaptureStdio`).
 - Interfaces defined: `tracing.Options{Settings config.Settings; Env LookupEnv; Config EnvConfig; Enabled bool; Metrics *metrics.Factory; Logger *slog.Logger; Exporter sdktrace.SpanExporter /* tests only */}`; `tracing.Start(ctx, Options) (*Tracing, error)`; `(*Tracing).Enabled() bool`; `TracerProvider() trace.TracerProvider`; `ForceFlush(ctx) error`; `Shutdown(ctx) error`.
@@ -374,7 +397,7 @@ Test writers may add `go.mod`/`go.sum` requirements when a self-test needs them;
 
 - Goal: FR-15..FR-18 and FR-35 on a dedicated mux.
   - `http.ServeMux` (never `DefaultServeMux`) with exact `GET` patterns for `/metrics`, `/healthz`, `/readyz` (HEAD served by GET patterns); other methods 405 with `Allow: GET, HEAD`; any other path including `/metrics/`, `/debug/pprof/`, `/debug/vars` 404; query strings ignored.
-  - `/metrics`: `promhttp.HandlerFor` the private registry, default content negotiation, no exemplars. `promhttp` must keep OpenMetrics exemplars off (for example by leaving `HandlerOpts.EnableOpenMetrics` false); a test asserts no exemplar appears for an OpenMetrics `Accept` header (decided by Orchestrator under Owner's standing instruction, 2026-10-24).
+  - `/metrics`: `promhttp.HandlerFor` the private registry, default content negotiation, no exemplars. `promhttp` must keep OpenMetrics exemplars off (for example by leaving `HandlerOpts.EnableOpenMetrics` false); a test asserts no exemplar appears for an OpenMetrics `Accept` header; confirmed again after the T10–T12 reviews. The admin listener only gathers; it never registers metrics (nothing outside the metrics factory and `metrics.NewRegistry` registers collectors) (decided by Orchestrator under Owner's standing instruction, 2026-10-24).
   - `/healthz`: 200, `ok\n`, `text/plain; charset=utf-8`.
   - `/readyz` (ADR-0006, D6): all responses `Content-Type: text/plain; charset=utf-8`. 200 body `ok\n`; 503 body `<reason>\n`. 503 `starting` until `MarkStarted`, and the registered `health.Readiness` is not consulted before then. After `MarkStarted`, delegates to the registered `health.Readiness` (if any) or returns 200. A reason outside `health.Reasons()` is returned as 503 `unknown` (the original reason is never echoed). From the `MarkStopping` call onward (graceful shutdown), 503 `shutting_down` regardless of the registered check. `MarkStopping` takes effect synchronously before it returns, so any `/readyz` request served after it returns gets `shutting_down`.
   - `Listen` binds `admin.listen`; on failure returns `config.NewError("admin.listen", cause)` (detail e.g. `EADDRINUSE`), never the address in any text. `http.Server.ErrorLog` from `logbridge.NewHTTPErrorLog`. Sensible server timeouts (read header timeout) to avoid slowloris on an unauthenticated listener.
@@ -392,6 +415,7 @@ Test writers may add `go.mod`/`go.sum` requirements when a self-test needs them;
   - Startup steps 0–3 (ADR-0006): 0 parse settings, logging errors via `logging.BootstrapLogger` (stdlib only, no third-party code); 1 build the logging factory from the settings; 2 `logbridge.Install(factory, level, now)` before any grpc, otel, tracing or admin-listener code; 3 resolve tracing and validate `OTEL_*`, logging errors via `Factory.Logger(logging.Config)`.
   - `runtime.Run` implements startup steps 0..9, signal-driven graceful shutdown, exit codes (0 on graceful shutdown, non-zero on any startup failure), lifecycle records (`starting`, `startup complete`, `shutting down`, constant messages). On shutdown, calls `MarkStopping` on the admin server immediately before emitting the lifecycle `shutting down` record, so `/readyz` reports 503 `shutting_down` from the moment that record is emitted (D6, spec Amendment 1); only then shuts the admin server down. Recovered panics in runtime goroutines are logged via `errclass.FromPanic` (class `internal`, optional `stack`).
   - `cmd/corral/main.go` calls `runtime.Run` with `os.Args[1:]`, `os.LookupEnv`, `os.Stdout`, signal context.
+  - Metrics are registered only through the metrics factory (`metrics.RegisterAll` and factory constructors) on the registry from `metrics.NewRegistry`; the runtime never calls `Register`/`MustRegister` directly (decided by Orchestrator under Owner's standing instruction, 2026-10-24).
   - Config errors are logged with `config.LogError` using `logging.BootstrapLogger(stdout)` before the configured handler exists, and `Factory.Logger(logging.Config)` afterwards; never a logger without `component=config` (`LogError` adds no component).
   - Functional AC-21 cases include an unknown flag, a malformed flag and a positional argument (expect `setting=unknown` / `setting=argument`, no echo of the given text), and `--name=value` accepted (ADR-0003 amendment).
   - Hooks for in-process tests: `BeforeLastStep` (AC-31) and `Started` (exposes admin address and tracer provider for AC-38 test spans).
@@ -498,7 +522,7 @@ Review-only items: FR-6 read-once (T9/T18), FR-20 pass-through vars (T15), FR-24
 
 All decisions below were decided by Orchestrator under Owner's standing instruction, 2026-10-24, Owner may override. Dn records the answer to former question Qn. If the Owner overrides one, the tasks and ADRs cited in it are re-planned.
 
-No open questions remain.
+No open questions remain from Q1–Q9. Items awaiting the Owner are listed under "Proposed for Owner" below.
 
 - **D1 (Q1; T9, T18, T20; ADR-0003 Accepted).** Interim loader: command-line flags named exactly like the logical settings (for example `-log.level=debug`), per ADR-0003, to be replaced by the configuration spec. Amended after T9 review (ADR-0003 Amendment 1): `--name=value` accepted, `--` not an end-of-flags marker, unknown/malformed flags and unknown `Parse` keys report `setting=unknown`, positional args `setting=argument`, stricter `admin.listen` host rules.
 - **D2 (Q2; T6).** The initial central command-name allowlist is exactly `find` and `hello`.
@@ -507,5 +531,12 @@ No open questions remain.
 - **D5 (Q5; T3, T4, T8).** A new component `thirdparty` is added to the fixed set. Records from Go's standard `log` package and third-party `slog.Default()` calls are emitted with `component=thirdparty` and a fixed message; their original text is never forwarded. Per spec Amendment 1, these are two bridges with separate limiters; std `log` records arrive at info, `slog.Default()` records keep their caller's level, and both follow the configured level (not the warn-and-above rule for `grpc`/`otel`/`admin_http`). The spec writer is amending FR-7/FR-28. T3 adds `logging.ThirdParty`; T4's logcheck accepts it through `logging.Components()`.
 - **D6 (Q6; T2, T17, T18, T20; ADR-0006 Accepted).** `/readyz`: (a) 200 body `ok\n` with `Content-Type: text/plain; charset=utf-8`; (b) 503 body `<reason>\n`, same Content-Type; (c) 503 `starting` until startup completes, registered checks not consulted before then; (d) a reason outside the defined set returns 503 `unknown`; (e) during graceful shutdown, 503 `shutting_down`, from the moment the lifecycle shutting-down record is emitted (spec Amendment 1). The spec writer is adding `unknown` and `shutting_down` to the reason set.
 - **D7 (Q7; T8).** One rate limiter per source and level, with level filtering before limiting (a record below the configured level never consumes a slot). The otel logger's logr `Error` calls map to warn.
-- **D8 (Q8; T10).** Validation rules for honoured variables that the spec does not spell out, as proposed by the planner: `OTEL_EXPORTER_OTLP_*ENDPOINT` must be an absolute `http`/`https` URL with a host; `*_TIMEOUT` a non-negative integer in milliseconds; `*_HEADERS` a comma-separated list of `key=value` with non-empty keys and valid percent-encoding; `OTEL_RESOURCE_ATTRIBUTES` the same list format; `OTEL_SERVICE_NAME` any non-empty string (empty counts as unset); `OTEL_BSP_MAX_QUEUE_SIZE` and `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` positive integers; `OTEL_BSP_SCHEDULE_DELAY` and `OTEL_BSP_EXPORT_TIMEOUT` positive integers in milliseconds.
+- **D8 (Q8; T10).** Validation rules for honoured variables that the spec does not spell out, as proposed by the planner: `OTEL_EXPORTER_OTLP_*ENDPOINT` must be an absolute `http`/`https` URL with a host; `*_TIMEOUT` a non-negative integer in milliseconds; `*_HEADERS` a comma-separated list of `key=value` with non-empty keys and valid percent-encoding; `OTEL_RESOURCE_ATTRIBUTES` the same list format; `OTEL_SERVICE_NAME` any non-empty string (empty counts as unset); `OTEL_BSP_MAX_QUEUE_SIZE` and `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` positive integers; `OTEL_BSP_SCHEDULE_DELAY` and `OTEL_BSP_EXPORT_TIMEOUT` positive integers in milliseconds. Refined after T10 review (see T10 "D8 refinements"; decided by Orchestrator under Owner's standing instruction, 2026-10-24): header keys are RFC 7230 tokens and not percent-decoded; per-prefix client cert/key pairing via `tls.X509KeyPair`; TrimSpace before the empty check; unset batch is `min(512, queue)`; queue and batch ≤ `1<<20`; exporter/protocol/sampler case-insensitive, compression exact; PEM files regular, ≤ 4 MiB, opened `O_NONBLOCK`; PKCS#8/PKCS#1/SEC1 keys accepted, encrypted keys rejected.
 - **D9 (Q9; T3, T15; ADR-0007).** `trace_id`/`span_id` are present in logs whenever tracing is enabled, including with `OTEL_TRACES_EXPORTER=none`.
+
+## Proposed for Owner (spec amendments, not decisions)
+
+These came out of the T10–T15 reviews. They are not decided and not planned into any task; they need the Owner's approval and a spec amendment before any implementation.
+
+- **P1 (FR-27/FR-28 area; would affect T10, T15, T18).** Emit a warning at startup when OTLP authentication headers would be sent over plaintext, i.e. `*_HEADERS` is set and the effective endpoint is `http://` or `*_INSECURE=true`. The warning names only the variable names, never header keys or values.
+- **P2 (FR-30; would affect T11).** Widen FR-30's resource-attribute ban list to also remove `process.executable.path`, `process.environment_variable.*`, `process.*user.name` (for example `process.user.name`, `process.real_user.name`, `process.saved_user.name`), `container.command*`, `user.*`, `enduser.*`, `host.ip` and `host.mac`.
