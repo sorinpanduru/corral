@@ -14,12 +14,11 @@ import (
 
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logging"
 	"github.com/sorinpanduru/corral/internal/testkit/fakeclock"
+	"github.com/sorinpanduru/corral/internal/testkit/logcheck"
 )
 
-// TODO(T4 retrofit): internal/testkit/logcheck was not merged when these
-// tests were written. capture below enforces the same AC-5 rules it will
-// (allowed keys via logging.AllowedKey, no groups, exactly one component) and
-// should be replaced by logcheck.New(t, logcheck.Tee(...)) once available.
+// AC-5: every record goes through internal/testkit/logcheck (allowed keys, no
+// groups, exactly one component), teed to a buffer holding the real JSON.
 
 var start = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 
@@ -53,67 +52,30 @@ func (r rec) suppressed(t testing.TB) int64 {
 	return v.Int64()
 }
 
-type store struct {
-	mu   sync.Mutex
-	recs []rec
-}
-
+// capture applies the configured level (logcheck itself is enabled at every
+// level) and delegates the AC-5 checks, recording and JSON tee to logcheck.
 type capture struct {
-	tb    testing.TB
-	st    *store
-	lv    slog.Leveler
-	pre   []slog.Attr
-	inner slog.Handler // real JSON handler, to scan the rendered output
+	lc *logcheck.Handler
+	lv slog.Leveler
 }
 
-func (c *capture) Enabled(_ context.Context, l slog.Level) bool { return l >= c.lv.Level() }
+func (c *capture) Enabled(ctx context.Context, l slog.Level) bool { return l >= c.lv.Level() }
 
 func (c *capture) WithAttrs(as []slog.Attr) slog.Handler {
-	n := *c
-	n.pre = append(append([]slog.Attr{}, c.pre...), as...)
-	n.inner = c.inner.WithAttrs(as)
-	return &n
+	return &capture{lc: c.lc.WithAttrs(as).(*logcheck.Handler), lv: c.lv}
 }
 
 func (c *capture) WithGroup(name string) slog.Handler {
-	c.tb.Errorf("AC-5: group %q used", name)
-	return c
+	return &capture{lc: c.lc.WithGroup(name).(*logcheck.Handler), lv: c.lv}
 }
 
-func (c *capture) Handle(ctx context.Context, r slog.Record) error {
-	attrs := map[string]slog.Value{}
-	comps := 0
-	add := func(a slog.Attr) {
-		if a.Value.Kind() == slog.KindGroup {
-			c.tb.Errorf("AC-5: group attribute %q", a.Key)
-			return
-		}
-		if !logging.AllowedKey(a.Key) {
-			c.tb.Errorf("AC-5: key %q is not allowed", a.Key)
-		}
-		if a.Key == "component" {
-			comps++
-		}
-		attrs[a.Key] = a.Value.Resolve()
-	}
-	for _, a := range c.pre {
-		add(a)
-	}
-	r.Attrs(func(a slog.Attr) bool { add(a); return true })
-	if comps != 1 {
-		c.tb.Errorf("AC-5: record %q has %d component attributes, want 1", r.Message, comps)
-	}
-	c.st.mu.Lock()
-	c.st.recs = append(c.st.recs, rec{Level: r.Level, Msg: r.Message, Attrs: attrs})
-	c.st.mu.Unlock()
-	return c.inner.Handle(ctx, r)
-}
+func (c *capture) Handle(ctx context.Context, r slog.Record) error { return c.lc.Handle(ctx, r) }
 
 type env struct {
 	t   *testing.T
 	f   *logging.Factory
 	lv  *slog.LevelVar
-	st  *store
+	lc  *logcheck.Handler
 	buf *syncBuf
 	clk *fakeclock.Clock
 }
@@ -140,14 +102,21 @@ func newEnv(t *testing.T, level slog.Level) *env {
 	lv := new(slog.LevelVar)
 	lv.Set(level)
 	buf := new(syncBuf)
-	c := &capture{tb: t, st: new(store), lv: lv, inner: logging.NewHandler(buf, logging.FormatJSON, lv)}
-	return &env{t: t, f: logging.NewFactory(c), lv: lv, st: c.st, buf: buf, clk: fakeclock.New(start)}
+	lc := logcheck.New(t, logcheck.Tee(buf, logging.FormatJSON))
+	c := &capture{lc: lc, lv: lv}
+	return &env{t: t, f: logging.NewFactory(c), lv: lv, lc: lc, buf: buf, clk: fakeclock.New(start)}
 }
 
 func (e *env) records() []rec {
-	e.st.mu.Lock()
-	defer e.st.mu.Unlock()
-	return append([]rec(nil), e.st.recs...)
+	var out []rec
+	for _, r := range e.lc.Records() {
+		attrs := map[string]slog.Value{}
+		for _, a := range r.Attrs {
+			attrs[a.Key] = a.Value.Resolve()
+		}
+		out = append(out, rec{Level: r.Level, Msg: r.Msg, Attrs: attrs})
+	}
+	return out
 }
 
 func (e *env) only() rec {

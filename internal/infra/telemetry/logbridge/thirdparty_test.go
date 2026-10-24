@@ -123,6 +123,7 @@ func TestSlogDefaultBridgeKeepsLevelAndDropsContent(t *testing.T) {
 
 	levels := []slog.Level{slog.LevelDebug, slog.LevelInfo, slog.LevelWarn, slog.LevelError}
 	for _, lvl := range levels {
+		//constmsg:allow simulated third-party caller
 		lg.Log(context.Background(), lvl, m, m, m, slog.Group(m, slog.String(m, m)))
 	}
 	rs := e.records()

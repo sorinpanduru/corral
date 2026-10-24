@@ -46,6 +46,7 @@ func TestInstallRoutesAllSources(t *testing.T) {
 	grpclog.Warning(m)
 	expect(t, e.last(), slog.LevelWarn, "grpc", 0)
 
+	//constmsg:allow simulated third-party caller
 	slog.Warn(m, m, m)
 	expect(t, e.last(), slog.LevelWarn, "thirdparty", 0)
 

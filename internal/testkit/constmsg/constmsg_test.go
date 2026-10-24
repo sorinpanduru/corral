@@ -128,8 +128,9 @@ func TestBuildTaggedFilesAreChecked(t *testing.T) {
 func TestPatternsSelectPackages(t *testing.T) {
 	dir := fixture(t)
 	all, _ := wantLocs(t, filepath.Join(dir, "bad"))
-	want := len(all)
-	for _, patterns := range [][]string{{"./..."}, {"./good", "./bad"}} {
+	allowed, _ := wantLocs(t, filepath.Join(dir, "allow"))
+	want := len(all) + len(allowed)
+	for _, patterns := range [][]string{{"./..."}, {"./good", "./bad", "./allow"}} {
 		fs, err := constmsg.Check(dir, patterns...)
 		if err != nil {
 			t.Fatalf("Check(%v): %v", patterns, err)
@@ -183,5 +184,34 @@ func TestLoadIsHermetic(t *testing.T) {
 	if _, err := os.Stat(sentinel); err == nil {
 		b, _ := os.ReadFile(sentinel)
 		t.Errorf("an external tool (gopackagesdriver or C compiler) was executed %d time(s)", strings.Count(string(b), "ran"))
+	}
+}
+
+// AC-5 (static check), Orchestrator decision for T8: a call carrying
+// "//constmsg:allow <reason>" on its own line or on the line before it is not
+// reported (a); an annotation with no reason, or a different keyword, is still
+// reported (b); an annotation covers only its own line (c).
+func TestAllowAnnotation(t *testing.T) {
+	dir := fixture(t)
+	fs, err := constmsg.Check(dir, "./allow")
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	want, _ := wantLocs(t, filepath.Join(dir, "allow"))
+	if len(want) != 5 {
+		t.Fatalf("fixture has %d want markers, want 5", len(want))
+	}
+	got := map[loc]bool{}
+	for _, f := range fs {
+		got[loc{filepath.Base(f.File), f.Line}] = true
+	}
+	for _, l := range want {
+		if !got[l] {
+			t.Errorf("missing finding at %s:%d (annotation must not cover it)", l.file, l.line)
+		}
+		delete(got, l)
+	}
+	for l := range got {
+		t.Errorf("annotated line reported: %s:%d", l.file, l.line)
 	}
 }

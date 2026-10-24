@@ -73,6 +73,7 @@ func TestNothingWrittenToStderr(t *testing.T) {
 	g.Error(m)
 	logbridge.NewHTTPErrorLog(e.f, e.clk.Now).Print(m)
 	log.New(logbridge.NewStdLogWriter(e.f, e.lv, e.clk.Now), m, 0).Print(m)
+	//constmsg:allow simulated third-party caller
 	slog.New(logbridge.NewSlogDefaultHandler(e.f, e.lv, e.clk.Now)).Warn(m, m, m)
 
 	// through the process globals
@@ -80,6 +81,7 @@ func TestNothingWrittenToStderr(t *testing.T) {
 	otel.Handle(markerErr(m))
 	grpclog.Warning(m)
 	grpclog.Error(m)
+	//constmsg:allow simulated third-party caller
 	slog.Info(m)
 	log.Print(m)
 	log.Printf("%s %s", m, m)
