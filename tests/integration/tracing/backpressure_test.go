@@ -6,6 +6,7 @@ package tracing_test
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -46,6 +47,23 @@ func (c *countingBlocker) ExportSpans(ctx context.Context, s []sdktrace.ReadOnly
 
 func (c *countingBlocker) Shutdown(context.Context) error { return nil }
 
+// runWithWatchdog runs fn in a goroutine. If it exceeds bound, the exporter is
+// released and the test fails, so a blocking OnEnd fails fast instead of hanging.
+func runWithWatchdog(t *testing.T, exp *countingBlocker, bound time.Duration, what string, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); fn(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(bound):
+		exp.Release()
+		t.Errorf("AC-36: %s exceeded %v; span Start/End blocked on the exporter", what, bound)
+	}
+	wg.Wait()
+}
+
 // AC-36 / FR-37: more spans than the queue holds; ending them never blocks; after
 // release and shutdown, dropped > 0 and dropped == ended - received.
 func TestAC36_DropsEqualEndedMinusReceived(t *testing.T) {
@@ -62,18 +80,20 @@ func TestAC36_DropsEqualEndedMinusReceived(t *testing.T) {
 	tr := h.tr.TracerProvider().Tracer("corral-test")
 	var worst time.Duration
 	start := time.Now()
-	for i := 0; i < total; i++ {
-		t0 := time.Now()
-		_, sp := tr.Start(context.Background(), "bp")
-		sp.End()
-		if d := time.Since(t0); d > worst {
-			worst = d
+	runWithWatchdog(t, exp, 5*time.Second, "ending spans", func() {
+		for i := 0; i < total; i++ {
+			t0 := time.Now()
+			_, sp := tr.Start(context.Background(), "bp")
+			sp.End()
+			if d := time.Since(t0); d > worst {
+				worst = d
+			}
+			if i == 0 {
+				// the export goroutine must pick up a batch and block in the exporter
+				waitFor(t, "exporter to be entered and blocked", exp.entered.Load)
+			}
 		}
-		if i == 0 {
-			// let the export goroutine pick up a batch and block in the exporter
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
+	})
 	if d := time.Since(start); d > 3*time.Second {
 		t.Errorf("AC-36: starting and ending %d spans took %v with a blocked exporter, want < 3s", total, d)
 	}
@@ -117,13 +137,13 @@ func TestAC36_ForceFlushAfterReleaseAccountsForEverySpan(t *testing.T) {
 
 	const total = 60
 	h.emit("first")
-	time.Sleep(100 * time.Millisecond)
+	waitFor(t, "exporter to be entered and blocked", exp.entered.Load)
 	names := make([]string, total-1)
 	for i := range names {
 		names[i] = "bp"
 	}
 	start := time.Now()
-	h.emit(names...)
+	runWithWatchdog(t, exp, 5*time.Second, "ending spans", func() { h.emit(names...) })
 	if d := time.Since(start); d > 3*time.Second {
 		t.Errorf("AC-36: ending %d spans took %v with a blocked exporter", total-1, d)
 	}
@@ -137,4 +157,8 @@ func TestAC36_ForceFlushAfterReleaseAccountsForEverySpan(t *testing.T) {
 		t.Errorf("AC-36: dropped = %v, received = %v, ended = %d; want dropped > 0 and dropped == ended - received", dropped, received, total)
 	}
 	h.finish()
+	// the counter must be stable once everything has been shut down
+	if again, _ := h.droppedValue(); again != dropped {
+		t.Errorf("%s changed from %v to %v after finish", droppedMetric, dropped, again)
+	}
 }

@@ -77,10 +77,15 @@ func TestAC28_ShutdownNoCallerDeadlineBoundedByFiveSeconds(t *testing.T) {
 			if d >= 7*time.Second {
 				t.Errorf("AC-28: Shutdown took %v, want < 7s (5s bound plus teardown)", d)
 			}
-			if d < 3*time.Second {
+			if d < 4500*time.Millisecond {
 				t.Errorf("Shutdown returned after %v against an unresponsive collector; the flush should have been attempted until the 5s bound", d)
 			}
 			assertConstantErr(t, "Shutdown", err, bannedFor(pc.addr(col))...)
+			// FR-37: the counter counts only queue-full drops, not spans lost
+			// to the shutdown flush deadline.
+			if v, ok := h.droppedValue(); !ok || v != 0 {
+				t.Errorf("FR-37: %s = %v (registered=%v) after a timed-out shutdown, want 0", droppedMetric, v, ok)
+			}
 			h.finish()
 		})
 	}
@@ -181,24 +186,51 @@ func TestShutdownAndFlushErrorsHaveConstantTextStrict(t *testing.T) {
 	}
 }
 
-// AC-3 / FR-28: a timed-out shutdown writes nothing to stderr and every log
-// line has a constant message; the finish helper checks stderr and JSON shape.
-// Here we also check no log record or log text carries the endpoint.
-func TestAC28_TimedOutShutdownLogsAreFixedMessages(t *testing.T) {
+// FR-29 / AC-3 / FR-28: a timed-out shutdown writes nothing to stderr, logs
+// exactly one fixed-message failure record, and neither stdout nor any record
+// carries the userinfo marker, "synthuser" or the collector host:port.
+func TestFR29_TimedOutShutdownLogsAreFixedMessages(t *testing.T) {
+	const failMsg = "tracing shutdown failed"
 	for _, pc := range protoCases {
 		t.Run(pc.name, func(t *testing.T) {
+			m := newMarker(t)
 			col := otlpcollector.Start(t, otlpcollector.WithMode(otlpcollector.ModeUnresponsive))
-			h := boot(t, opts{on: true, env: slowEnv(pc, pc.url(col))})
+			endpoint := strings.Replace(pc.url(col), "http://", "http://synthuser:"+m+"@", 1)
+			h := boot(t, opts{on: true, env: slowEnv(pc, endpoint)})
 			h.emit("stuck")
 			h.shutDown = true
 			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 			defer cancel()
 			_ = h.tr.Shutdown(ctx)
 			stdout, _ := h.finish()
-			for _, b := range bannedFor(pc.addr(col))[:3] {
-				if strings.Contains(string(stdout), b) {
-					t.Errorf("log output contains endpoint data")
+
+			n := 0
+			for _, r := range h.records() {
+				if r.Msg == failMsg {
+					n++
 				}
+			}
+			if n != 1 {
+				t.Errorf("found %d records with message %q, want exactly 1", n, failMsg)
+			}
+			banned := append(bannedFor(pc.addr(col)), m, "synthuser")
+			for _, b := range banned {
+				if strings.Contains(string(stdout), b) {
+					t.Errorf("stdout contains endpoint data")
+				}
+				for _, r := range h.records() {
+					if strings.Contains(r.Msg, b) {
+						t.Errorf("a log message contains endpoint data")
+					}
+					for k, v := range r.Attrs {
+						if strings.Contains(v.String(), b) {
+							t.Errorf("log attribute %q contains endpoint data", k)
+						}
+					}
+				}
+			}
+			if v, ok := h.droppedValue(); !ok || v != 0 {
+				t.Errorf("FR-37: %s = %v after a timed-out shutdown, want 0", droppedMetric, v)
 			}
 		})
 	}
