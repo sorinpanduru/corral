@@ -1,8 +1,8 @@
 # SPEC-003: Configuration loading
 
-Status: approved (Owner, 2026-10-24)
+Status: approved (Owner, 2026-10-24); Amendment 1 approved (Owner, 2026-10-24)
 Owner: Sorin Panduru
-Last updated: 2026-10-24 (revision 2, challenge-review fixes)
+Last updated: 2026-10-24 (Amendment 1)
 
 ## Goal
 
@@ -35,6 +35,8 @@ governs.
   such tools mount or render.
 - Binary (non-UTF-8) secret values.
 - Per-client or per-database configuration.
+- Signal behaviour before `main` starts running, while the Go runtime and
+  package initialisation are still running (FR-18).
 
 ## Users and context
 
@@ -134,8 +136,10 @@ governs.
   - an empty value (`--log.level=`) is passed to validation as an empty
     string. It fails unless the setting's type and rule allow empty values
     (FR-12);
-  - giving the same setting twice on the command line is an error. Writing
-    it once as `--x=` and once as `-x=` counts as twice (FR-28);
+  - giving the same setting twice on the command line is an error. Every
+    occurrence of a flag name counts, with or without `=` and whichever dash
+    form is used, so `--x=1 -x=2`, `--x=1 --x` and `--x --x=1` are all
+    repeats. The exact records are pinned in FR-28's occurrence rule;
   - positional arguments are config errors with `setting=argument`, and the
     argument is never echoed. `--` is not an end-of-flags marker, and on its
     own it is a malformed flag (FR-8);
@@ -147,6 +151,20 @@ governs.
   - a `CORRAL_*` variable whose value is empty or whitespace-only counts as
     unset (the same "set" rule as SPEC-001 FR-41). This applies to setting
     variables, `_FILE` reference variables and unknown variables (FR-8);
+  - *whitespace* means exactly the characters Go's `strings.TrimSpace`
+    removes, which are the characters for which `unicode.IsSpace` is true:
+    - U+0009 to U+000D (tab, line feed, vertical tab, form feed, carriage
+      return);
+    - U+0020 (space);
+    - U+0085 (next line) and U+00A0 (no-break space);
+    - every other Unicode `White_Space` character, such as U+1680, U+2000
+      to U+200A, U+2028, U+2029, U+202F, U+205F and U+3000.
+
+    Characters outside this set, such as U+200B (zero-width space) and
+    U+FEFF, are not whitespace. A value that is not valid UTF-8 is never
+    whitespace-only. The OpenTelemetry Go SDK uses the same `TrimSpace`
+    semantics, so the SPEC-001 FR-41 "set" rule and the FR-19 `OTEL_*`
+    trimming use the same set;
   - other values are used as given, with no trimming. A value with leading
     or trailing whitespace is validated as is, so for most types it fails;
   - *asymmetry, by design:* a flag can supply an empty value (`--x=`), which
@@ -176,10 +194,10 @@ governs.
     `CORRAL_<invalid-name>`, which appears at most once. The replacement
     happens before deduplication and sorting, so the token is sorted like any
     other name. `<` is byte 0x3C, so the token sorts after names whose next
-    byte is a digit and before names whose next byte is an uppercase letter. The record
-    never contains the variables' values. Rationale: Kubernetes service links
-    inject `CORRAL_SERVICE_HOST`, `CORRAL_PORT` and similar into pods when a
-    Service is named `corral`;
+    byte is a digit and before names whose next byte is an uppercase letter.
+    The record never contains the variables' values. Rationale: Kubernetes
+    service links inject `CORRAL_SERVICE_HOST`, `CORRAL_PORT` and similar into
+    pods when a Service is named `corral`;
   - `OTEL_*` variables are never unknown (FR-19).
 - **FR-9:** Presence:
   - a *required* setting that has no effective value from any source, and no
@@ -235,13 +253,19 @@ governs.
   | `float` | matches `-?([0-9]+(\.[0-9]*)?\|\.[0-9]+)([eE][+-]?[0-9]+)?`, finite as a 64-bit float; no `+` sign, hex, `_`, `Inf` or `NaN`; range per rule |
   | `duration` | one or more `<decimal><unit>` groups as in Go `time.ParseDuration` (`250ms`, `5s`, `1m30s`, `1.5h`), with ASCII units `ns`, `us`, `ms`, `s`, `m`, `h` only (`µs` / `μs` are rejected); no sign; a unit is required, so bare `5` and bare `0` are rejected; must be > 0 unless the rule allows zero, in which case `0s` (or `0` with any unit) is accepted |
   | `enum` | one of a declared value set; case-insensitive unless the rule says otherwise |
-  | `hostport` | `host:port`. The host is non-empty (SPEC-001 FR-16) and is either an IP literal (IPv6 in brackets) or a valid DNS hostname: letters, digits, `-` and `.`; labels 1 to 63 characters, not starting or ending with `-`; at most 253 characters; and a last label that is neither all-numeric nor `0x`-hex-like, so `0`, `0x0` and `127.1` are rejected. The port is decimal digits only, 0 to 65535, with no sign and no leading zeros (`09187` is rejected; `0` is accepted) |
+  | `hostport` | `host:port`. The host is non-empty (SPEC-001 FR-16) and is either an IP literal (IPv6 in brackets) or a valid DNS hostname: letters, digits, `-` and `.`; labels 1 to 63 characters, not starting or ending with `-`; at most 253 characters; and a last label that is neither all-numeric nor `0x`-hex-like, so `0`, `0x0` and `127.1` are rejected. A trailing dot (`localhost.`) is rejected, because it leaves an empty last label. IPv6 zone identifiers (`[fe80::1%eth0]`) are rejected. The port is decimal digits only, 0 to 65535, with no sign and no leading zeros (`09187` is rejected; `0` is accepted) |
   | `list` of one of the scalar types above except `text` | comma-separated; leading and trailing ASCII spaces and tabs around each element are trimmed; empty elements are rejected; an empty list only if the rule allows it |
+
+  List trimming (ASCII space and tab only) is deliberately narrower than the
+  FR-7 whitespace set. Any other whitespace character in an element is kept
+  and validated as part of the element.
 
   The SPEC-001 settings use these types as declared in Interfaces. *Note:*
   the following are tightenings relative to the interim loader, which used
-  `strconv`:
+  `strconv` and accepted a trailing dot on host names:
   - the stricter port syntax (no leading zeros or `+`);
+  - the rejection of a trailing dot and of IPv6 zone identifiers in
+    `hostport` hosts;
   - the rejection of a leading `+` on `int` and `float` values. For example,
     `tracing.sample_ratio=+0.5` was accepted before and is now rejected.
 - **FR-13:** Collection and ordering. corral collects every error from
@@ -324,17 +348,25 @@ governs.
   form. Changes to the environment or to referenced files after startup have
   no effect until restart.
 - **FR-18:** SIGHUP does not terminate corral and does not reload anything.
-  - SIGHUP handling is in place from process start, before arguments are
-    parsed, so a SIGHUP that arrives during loading, `--help`, `--version` or
-    `--check-config` does not terminate the process.
-  - Before the configured logger exists (FR-29), and in `--help` and
-    `--version` modes, SIGHUP is ignored without any record.
-  - Once the configured logger exists, each SIGHUP leads to a warn record
-    with `component=config` and the fixed message `configuration reload not
-    supported; restart required`. These records are rate-limited like
-    SPEC-001 FR-33: at most one per 30 seconds, and a record that follows
-    dropped ones carries `suppressed_count`, the number dropped since the
-    previous record.
+  - SIGHUP handling is installed as the first action of `main`, before
+    arguments are parsed or any configuration is loaded. A SIGHUP that
+    arrives after that point, during loading, help mode, version mode or
+    check-config mode, does not terminate the process.
+  - The window before `main` runs, while the Go runtime and package
+    initialisation are still running, is out of scope (Non-goals). A SIGHUP
+    in that window may terminate the process with the default signal action.
+  - SIGHUP never produces a record in these cases:
+    - before the configured logger exists (FR-29);
+    - in help mode and version mode;
+    - at any point in check-config mode, including after the configured
+      logger has been built. Check-config output is exactly the records FR-23
+      lists.
+  - In a normal run, once the configured logger exists, each SIGHUP leads to
+    a warn record with `component=config` and the fixed message
+    `configuration reload not supported; restart required`. These records are
+    rate-limited like SPEC-001 FR-33: at most one per 30 seconds, and a
+    record that follows dropped ones carries `suppressed_count`, the number
+    dropped since the previous record.
   - SIGINT and SIGTERM keep their existing graceful-shutdown behaviour.
 
 ### OTEL variables
@@ -345,7 +377,8 @@ governs.
     `CORRAL_`, and are never reported as unknown (FR-8);
   - are honoured, trimmed and validated as SPEC-001 FR-19 to FR-21, FR-27,
     FR-30, FR-37 and FR-41 require. SPEC-001's whitespace trimming of
-    `OTEL_*` values is kept; FR-7's no-trim rule applies to `CORRAL_*` only;
+    `OTEL_*` values is kept, using the FR-7 whitespace set; FR-7's no-trim
+    rule applies to `CORRAL_*` only;
   - are validated in the same pass as the CORRAL settings (FR-13 group 4),
     even when CORRAL errors exist, provided the effective `tracing.enabled`
     is known. It is *not known* when its winning input failed validation, or
@@ -355,7 +388,14 @@ governs.
     unknown when a valid flag wins. `OTEL_SDK_DISABLED=true` still turns
     tracing off and skips validation (SPEC-001 FR-19);
   - every invalid variable is reported, one record per variable, not just
-    the first. Cross-variable checks report under these fixed names:
+    the first;
+  - an invalid `OTEL_TRACES_EXPORTER` does not stop the other checks. Every
+    other honoured or validated variable is still validated and reported,
+    including the protocol, endpoint, headers, timeout, compression,
+    insecure, TLS and `OTEL_BSP_*` variables and both `OTEL_TRACES_SAMPLER`
+    variables. This is the same validation as when the exporter value is
+    valid, whether that value is `otlp` or `none`;
+  - cross-variable checks report under these fixed names:
     - batch size larger than queue size: `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`;
     - a client certificate without a key: the key variable of the same form
       (general or `_TRACES_`);
@@ -363,8 +403,12 @@ governs.
       same form;
     - a certificate and key that do not pair: the key variable of the same
       form;
-  - a variable that already has its own error is not used in cross-variable
-    checks;
+  - *skip rule for cross-variable checks* (consistent with FR-30): if any
+    variable a check involves already has its own error, the check is
+    skipped entirely and produces no record. It is not re-evaluated with
+    that variable's default. For example:
+    - an invalid `OTEL_BSP_MAX_QUEUE_SIZE` skips the batch-size check;
+    - a non-PEM client certificate skips the pairing check for that form;
   - for validation, PEM files named by `OTEL_*` variables are read through
     the same injected file reader (FR-25), with a maximum size of 4 MiB
     (4,194,304 bytes, measured on the raw file). This is the limit the
@@ -442,6 +486,7 @@ governs.
     that operators see the same output they will get in production.
   - On failure, it emits the failure-path records (FR-29) as JSON and exits
     2.
+  - It never emits the FR-18 SIGHUP record.
 
 ### Exit codes
 
@@ -539,9 +584,37 @@ governs.
   reader is not called for that reference. "Failed" means the setting's
   effective value is unavailable, which drives the skip rules below.
 
+  **Occurrence rule.** This general rule applies to every flag name
+  separately: each setting flag and each `<name>_file` reference flag. An
+  *occurrence* is any argument naming that flag, with or without `=`, in
+  either dash form. All records named below are group 1, use the flag name
+  as `setting`, and leave the setting failed.
+  - **Non-secret setting flags and `_file` reference flags:**
+    - two or more occurrences give exactly one repeat record, at the
+      position of the second occurrence. No missing-value record is
+      emitted, no occurrence is validated, and no file is read;
+    - a single occurrence without `=` gives one missing-value record at its
+      position.
+  - **Secret setting flags (`--a.b`):**
+    - if any occurrence has `=` (a literal), exactly one secret-literal
+      record is emitted, at the position of the first occurrence with `=`.
+      No repeat or missing-value record is emitted for `a.b`;
+    - otherwise, a single bare occurrence (`--a.b`) gives one missing-value
+      record, `setting=a.b`, at its position. It is not a secret-literal
+      record, because no value was supplied;
+    - otherwise (two or more bare occurrences), exactly one repeat record is
+      emitted, at the position of the second occurrence.
+  - The setting flag and its `_file` reference flag are evaluated
+    separately, so each can produce its own record (see the table).
+
+  The table below gives the main cases.
+
   | Input | Records (group, `setting`) | Effect |
   |---|---|---|
-  | secret literal flag `--a.b=v` (alone, or together with `--a.b_file=p`) | exactly one: group 1, `a.b` | the flag file reference is not read; the flag source counts as failed for `a.b`; environment inputs for `a.b` are still processed and validated (FR-5) |
+  | secret literal flag `--a.b=v` (alone, or together with a single `--a.b_file=p`) | exactly one: group 1, `a.b` | the flag file reference is not read; the flag source counts as failed for `a.b`; environment inputs for `a.b` are still processed and validated (FR-5) |
+  | `--a.b=v --a.b_file=p1 --a.b_file=p2` | two, in this order: group 1, `a.b`, at the literal's position; then group 1, `a.b_file`, at the position of the second `_file` occurrence | no file is read; `a.b` failed |
+  | bare secret flag `--a.b` (single occurrence, no `=`) | exactly one: group 1, `a.b`, at its position (missing value) | `a.b` failed |
+  | `--x=1 --x` or `--x --x=1` | exactly one: group 1, `x`, at the position of the second occurrence | no missing-value record; nothing validated; `x` failed |
   | `--x=1 --x=2` (or `--x=1 -x=2`), or any number of repeats such as `--x=1 --x=2 --x=3` | exactly one: group 1, `x`, placed at the position of the second occurrence; later occurrences add no record | no occurrence is validated; `x` failed |
   | repeated secret literal `--a.b=v1 --a.b=v2` (any count) | exactly one: group 1, `a.b`, placed at the position of the first occurrence (the secret-literal error), with no separate repeat record | as for a single secret literal flag |
   | `--a.b_file=p1 --a.b_file=p2` (any count ≥ 2) | exactly one: group 1, `a.b_file`, placed at the position of the second occurrence | no file is read; `a.b` failed |
@@ -673,7 +746,7 @@ See FR-27 for the grammar and combinations.
 | `invalid configuration` | error | `setting`, `error`, `corral.error.detail` | each config error (FR-11), including `OTEL_*` | bootstrap JSON |
 | `unknown CORRAL_ environment variables ignored` | warn | `setting` (sorted, comma-joined names) | once, if any (FR-8) | bootstrap JSON on failure, configured on success (FR-29) |
 | `configuration loaded` | info | `setting` (sorted, comma-joined names) | once, on success (FR-20) | configured |
-| `configuration reload not supported; restart required` | warn | `suppressed_count` when some were dropped | SIGHUP, rate-limited (FR-18) | configured |
+| `configuration reload not supported; restart required` | warn | `suppressed_count` when some were dropped | SIGHUP in a normal run, rate-limited (FR-18); never in check-config mode | configured |
 
 `invalid configuration` already exists. The other three messages are new.
 
@@ -689,12 +762,13 @@ See FR-27 for the grammar and combinations.
 - **Unknown `CORRAL_*` environment variables:** one warn record naming them.
   Startup continues unless there are other errors (FR-8, FR-29).
 - **Invalid `OTEL_*` values with tracing on:** every invalid variable is
-  reported in the same pass (FR-19), as JSON. Exit 2.
+  reported in the same pass (FR-19), as JSON, including when
+  `OTEL_TRACES_EXPORTER` itself is invalid. Exit 2.
 - **`tracing.enabled` itself invalid:** `OTEL_*` validation is skipped
   (FR-19).
 - **Admin listener bind failure:** SPEC-001 FR-35, exit 1.
-- **SIGHUP:** never terminates corral; once logging is configured, a
-  rate-limited warn record (FR-18).
+- **SIGHUP:** never terminates corral once `main` has started; in a normal
+  run, once logging is configured, a rate-limited warn record (FR-18).
 - **Unrecovered panic:** the Go runtime exits 2 (FR-24); this is not a
   config error.
 - **Registry declaration conflict (duplicate or colliding derived name,
@@ -781,6 +855,14 @@ See FR-27 for the grammar and combinations.
     - `--t.secret=v1 --t.secret=v2` (secret): `setting=t.secret`, at the
       position of the first occurrence;
     - `--x=1 -x=2`: `setting=x`;
+    - `--x=1 --x`: `setting=x`, at the position of the second occurrence,
+      with no missing-value record;
+    - `--x --x=1`: `setting=x`, at the position of the second occurrence,
+      with no missing-value record;
+    - bare secret `--t.secret`: `setting=t.secret`, at its position (missing
+      value, not a secret-literal record);
+    - `--t.secret --t.secret=v`: `setting=t.secret`, at the position of the
+      second argument (the first occurrence with `=`);
     - a positional argument: `setting=argument`;
     - `--`: `setting=unknown`;
     - `-`: `setting=unknown`.
@@ -795,7 +877,11 @@ See FR-27 for the grammar and combinations.
     - `duration` rejects `5`, `0`, `-1s`, `+1s` and `1µs`, and accepts
       `250ms` and `1m30s`; `0s` is accepted only with a rule that allows
       zero;
-    - `hostport` rejects `127.0.0.1:09187`, `127.0.0.1:+80` and `:9187`;
+    - `hostport` rejects `127.0.0.1:09187`, `127.0.0.1:+80`, `:9187`,
+      `localhost.:9187` (trailing dot) and `[fe80::1%eth0]:9187` (IPv6
+      zone), and accepts `localhost:9187` and `[::1]:9187`;
+    - `list` keeps a U+00A0 at the edge of an element (it is not trimmed),
+      so an `int` list `1, 2` is rejected;
     - `string` rejects a value containing U+007F and a value containing
       U+0085;
     - `text` accepts an inner `\n` and rejects U+0000;
@@ -849,6 +935,10 @@ See FR-27 for the grammar and combinations.
     (group 1), and exit code 2. The marker is not echoed.
   - `--t.secret=<marker> --t.secret_file=<path>` yields exactly one record,
     `setting=t.secret`, and the reader is not called for that path.
+  - `--t.secret=<marker> --t.secret_file=p1 --t.secret_file=p2` yields
+    exactly two records, in this order: `setting=t.secret` (at the literal's
+    position), then `setting=t.secret_file` (at the position of the second
+    `_file` occurrence). The reader is never called.
   - A literal via the environment is accepted.
   - `CORRAL_T_SECRET` and `CORRAL_T_SECRET_FILE` both set yields exactly one
     record, `setting=CORRAL_T_SECRET`, and the reader is not called.
@@ -887,7 +977,9 @@ See FR-27 for the grammar and combinations.
     serving `/healthz`, one warn record with the FR-18 message is emitted,
     and a later SIGTERM exits 0. SIGHUP sent while startup is held by a test
     hook before the configured logger exists does not terminate the process,
-    and it emits no record.
+    and it emits no record. The test sends signals only after `main` has
+    started (for example after a test hook confirms the SIGHUP handler is
+    installed), never in the pre-`main` window.
   - Unit, with a fake clock: 6 SIGHUPs within 30 seconds produce one record.
     The next SIGHUP after 30 seconds produces a record with
     `suppressed_count=5`.
@@ -951,6 +1043,40 @@ See FR-27 for the grammar and combinations.
     value or `t.b` was repeated on the command line;
   - group 3 records follow every group 2 record.
 
+### Added in Amendment 1
+
+- **AC-19** (FR-18, FR-23): Unit or functional: in check-config mode, with
+  a test hook that holds the process after the configured logger is built and
+  before exit, a SIGHUP neither terminates the process nor produces any
+  record. The output is exactly the FR-23 success records, and the exit code
+  is 0.
+- **AC-20** (FR-19): Unit, with tracing on:
+  - with `OTEL_BSP_MAX_QUEUE_SIZE=abc` and `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`
+    set to a value larger than the default queue size (2048), exactly one
+    record appears, with `setting=OTEL_BSP_MAX_QUEUE_SIZE`; there is no
+    batch-size record;
+  - with a non-PEM `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE` and a valid
+    `OTEL_EXPORTER_OTLP_CLIENT_KEY`, exactly one record appears, with
+    `setting=OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`; there is no pairing
+    record;
+  - with a valid queue size of 100 and a batch size of 200, exactly one
+    record appears, with `setting=OTEL_BSP_MAX_EXPORT_BATCH_SIZE`.
+- **AC-21** (FR-19): Unit, with tracing on: `OTEL_TRACES_EXPORTER=console`
+  together with an invalid `OTEL_EXPORTER_OTLP_PROTOCOL` and a malformed
+  `OTEL_EXPORTER_OTLP_HEADERS` yields exactly three records, sorted by
+  `setting`: `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_PROTOCOL`,
+  `OTEL_TRACES_EXPORTER`.
+- **AC-22** (FR-7, FR-19): Unit.
+  - A `CORRAL_LOG_LEVEL` whose value consists only of each of these counts as
+    unset (the default applies): U+0009, U+000B, U+000C, U+0085, U+00A0,
+    U+2003 and U+3000.
+  - A value consisting only of U+200B is set, and is rejected as an invalid
+    `log.level`.
+  - A value consisting of invalid UTF-8 bytes only is set and rejected.
+  - With tracing on and a CA certificate set, an `OTEL_EXPORTER_OTLP_ENDPOINT`
+    consisting only of U+00A0 counts as not set, so no FR-41 record is
+    emitted. This matches the SDK's `strings.TrimSpace` behaviour.
+
 ## Open questions
 
 Must be empty before approval.
@@ -981,3 +1107,5 @@ was merged into Q-9 before the questions were asked.
 | 2026-10-24 | SPEC-003 formally supersedes ADR-0003. The interim flags-only loader is retired. Unknown environment-variable names are logged (FR-8), unlike unknown flag names, which are never echoed. The ADR-0003 host-name rules for `admin.listen` and the `setting=unknown` / `setting=argument` reporting are carried into this spec (FR-6, FR-8, FR-12). | Owner decision. |
 | 2026-10-24 | Revision 2 resolves challenge-review findings M1 to M9 and S1 to S15 by making the existing decisions precise. No new product decision was taken; the Owner may override any of these. The resolutions are: environment snapshot injection (FR-7, FR-25); `file` / `_file` last-segment reservation and derived-name uniqueness (FR-2); a new `text` type for multi-line secrets (FR-12); an *optional* presence (FR-1, FR-9); cross-setting rules and their `setting` value (FR-30); grouped error ordering and the `OTEL_*` validation conditions, with every `OTEL_*` error reported (FR-13, FR-19); control-flag grammar with help > version > check-config precedence (FR-27); pinned conflict and repeat outcomes (FR-28); output path and order (FR-29), with all config errors (including `OTEL_*`) as bootstrap JSON and success records through the configured logger and level, including in check-config; panic exit code 2 documented (FR-24, FR-26); SIGHUP from process start (FR-18); overridden `_FILE` references still read (FR-5); unknown-variable matching and rendering rules (FR-8); exact numeric, duration, port and control-character syntax (FR-12); the empty-value asymmetry stated (FR-7); SPEC-001 table status and namespace list (Interfaces); file-reader contract (FR-25); version stamping (FR-22); documentation path (FR-26); help text for secrets and defaults (FR-21); FR-20 lists sources, not effects. | Challenge review REQUEST_CHANGES, relayed by the Orchestrator, 2026-10-24. |
 | 2026-10-24 | Re-check fixes N1 to N5:<br>N1: uniqueness is checked over two name sets, flag names (including `<name>_file`) and environment names (including `CORRAL_<NAME>_FILE`) (FR-2).<br>N2: injection covers validation only, and the OTLP exporter keeps SDK semantics over the real environment and files (FR-19, FR-25).<br>N3: the PEM validation size limit is 4 MiB (FR-19).<br>N4: three or more repeats, and repeated secret literals, each give one record at a fixed position (FR-28, AC-3).<br>N5: `CORRAL_<invalid-name>` is substituted before deduplication and sorting (FR-8).<br>Optional item applied: the tightening note now includes leading `+` on `int` and `float` (FR-12). | Re-check verdict APPROVE with small fixes, relayed by the Orchestrator, 2026-10-24. |
+| 2026-10-24 | Amendment 1 (approved by the Owner, 2026-10-24, together with the additional pins below) closes five gaps found while deriving acceptance tests:<br>(1) the SIGHUP handler is installed as the first action of `main`, before configuration loading. Signal behaviour before `main` starts running, while the Go runtime and package initialisation are still running, is out of scope. Package init code, such as the `earlyslog` package, does run in that window, but `main` has not yet installed the handler, so a SIGHUP there may still terminate the process (FR-18, Non-goals, AC-10).<br>(2) check-config mode never emits the SIGHUP record, even after the configured logger exists, so its output is deterministic (FR-18, FR-23, AC-19).<br>(3) an `OTEL_*` cross-variable check is skipped, not evaluated with a default, when any variable it involves has its own error, consistent with the FR-30 skip rule (FR-19, AC-20).<br>(4) an invalid `OTEL_TRACES_EXPORTER` does not stop validation of the other honoured or validated `OTEL_*` variables, consistent with Q-7's report-everything rule (FR-19, AC-21).<br>(5) "whitespace" in FR-7 is the `strings.TrimSpace` / `unicode.IsSpace` set that the OpenTelemetry Go SDK uses, so it matches SPEC-001 FR-41 (FR-7, FR-19, AC-22).<br>These are spec-writer resolutions that make existing decisions precise; the Owner may override any of them. | Gaps found while deriving acceptance tests, relayed by the Orchestrator, 2026-10-24. Drafted in `specs/drafts/` by the spec-writer, which may not edit approved specs. Promotion to `specs/` needs Owner approval. |
+| 2026-10-24 | Amendment 1, additional pins (spec-writer resolutions; the Owner may override any of them when approving the text):<br>(P2) a `hostport` host with a trailing dot (`localhost.`) is rejected, because it leaves an empty last label; IPv6 zone identifiers (`[fe80::1%eth0]`) are rejected. Both are listed as tightenings relative to the interim loader (FR-12, AC-4).<br>(P4) FR-28 row 1 now applies to a literal together with a *single* `--a.b_file=p`. `--a.b=v --a.b_file=p1 --a.b_file=p2` gives two group 1 records, `a.b` at the literal's position and `a.b_file` at the second `_file` position, and no file is read (FR-28, AC-8).<br>(P5) one general occurrence rule: every occurrence of a flag name counts toward repeats, with or without `=`. Two or more occurrences give one repeat record at the second occurrence, with no missing-value record. A single bare occurrence gives a missing-value record. A bare secret `--a.b` gives one `a.b` record at its position, counted as a missing value, not a literal. If any occurrence of a secret flag has `=`, the single secret-literal record (at the first such occurrence) takes precedence (FR-6, FR-28, AC-3).<br>(Optional) FR-12 list trimming (ASCII space and tab) is stated to be deliberately narrower than the FR-7 whitespace set (FR-12, AC-4).<br>(Nit) the pre-`main` rationale in the previous row now uses the Non-goals wording. | Challenge review of Amendment 1, relayed by the Orchestrator, 2026-10-24. |
