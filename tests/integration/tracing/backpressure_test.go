@@ -79,18 +79,19 @@ func TestAC36_DropsEqualEndedMinusReceived(t *testing.T) {
 	const total = 200
 	tr := h.tr.TracerProvider().Tracer("corral-test")
 	var worst time.Duration
+	// First span on the test goroutine; wait until the exporter is blocked
+	// (waitFor may call t.Fatalf, so it must not run in another goroutine).
+	_, first := tr.Start(context.Background(), "bp")
+	first.End()
+	waitFor(t, "exporter to be entered and blocked", exp.entered.Load)
 	start := time.Now()
 	runWithWatchdog(t, exp, 5*time.Second, "ending spans", func() {
-		for i := 0; i < total; i++ {
+		for i := 1; i < total; i++ {
 			t0 := time.Now()
 			_, sp := tr.Start(context.Background(), "bp")
 			sp.End()
 			if d := time.Since(t0); d > worst {
 				worst = d
-			}
-			if i == 0 {
-				// the export goroutine must pick up a batch and block in the exporter
-				waitFor(t, "exporter to be entered and blocked", exp.entered.Load)
 			}
 		}
 	})
