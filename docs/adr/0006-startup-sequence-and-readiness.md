@@ -40,9 +40,10 @@ Startup order in `internal/app/runtime`:
 9. Mark startup complete in the admin listener, then emit the `lifecycle`
    *startup-complete* record.
 
-Shutdown (SIGINT/SIGTERM or context cancel): emit `lifecycle` *shutting
-down*; mark the admin listener stopping, so `/readyz` returns 503
-`shutting_down`; shut down the admin server; shut down tracing with a
+Shutdown (SIGINT/SIGTERM or context cancel): mark the admin listener
+stopping, so `/readyz` returns 503 `shutting_down`; immediately emit the
+`lifecycle` *shutting down* record (so `/readyz` reports `shutting_down`
+from the moment that record exists); shut down the admin server; shut down tracing with a
 5-second bound (FR-34); exit 0. Any startup failure exits with a non-zero
 code after its error record is written.
 
@@ -56,8 +57,8 @@ Readiness (D6):
   200.
 - If a registered check reports a reason outside the defined set, the
   response is 503 `unknown`; the reported reason is not echoed.
-- Once shutdown begins, `/readyz` returns 503 `shutting_down` regardless of
-  any registered check.
+- From the moment the lifecycle *shutting down* record is emitted, `/readyz`
+  returns 503 `shutting_down` regardless of any registered check.
 - The defined reason set therefore includes `starting`, `shutting_down` and
   `unknown`; the spec writer is adding `unknown` and `shutting_down` to the
   spec.
