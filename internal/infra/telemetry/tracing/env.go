@@ -76,6 +76,9 @@ type EnvConfig struct {
 	Queue       QueueSettings
 }
 
+// maxQueueBound caps OTEL_BSP_MAX_QUEUE_SIZE and OTEL_BSP_MAX_EXPORT_BATCH_SIZE.
+const maxQueueBound = 1 << 20
+
 // Variable names.
 const (
 	varSDKDisabled   = "OTEL_SDK_DISABLED"
@@ -98,7 +101,9 @@ var (
 	errBadSamplerArg  = errors.New("tracing: sampler argument not a ratio in [0,1]")
 	errBadProtocol    = errors.New("tracing: unsupported protocol")
 	errBadEndpoint    = errors.New("tracing: invalid endpoint")
-	errBadHeaders     = errors.New("tracing: invalid key=value list")
+	errBadHeaders     = errors.New("tracing: invalid header list")
+	errBadKVList      = errors.New("tracing: invalid key=value list")
+	errBadPair        = errors.New("tracing: client certificate and key do not pair")
 	errBadTimeout     = errors.New("tracing: invalid timeout")
 	errBadCompression = errors.New("tracing: unsupported compression")
 	errBadBool        = errors.New("tracing: not a boolean")
@@ -136,6 +141,7 @@ func Resolve(s config.Settings, env LookupEnv) (bool, EnvConfig, error) {
 	}
 	get := func(name string) (string, bool) {
 		v, ok := env(name)
+		v = strings.TrimSpace(v) // whitespace-only counts as unset
 		return v, ok && v != ""
 	}
 	fail := func(name string, cause error) (bool, EnvConfig, error) {
@@ -143,9 +149,9 @@ func Resolve(s config.Settings, env LookupEnv) (bool, EnvConfig, error) {
 	}
 
 	if v, ok := get(varExporter); ok {
-		switch ExporterKind(v) {
+		switch ExporterKind(strings.ToLower(v)) {
 		case ExporterOTLP, ExporterNone:
-			cfg.Exporter = ExporterKind(v)
+			cfg.Exporter = ExporterKind(strings.ToLower(v))
 		default:
 			return fail(varExporter, errBadExporter)
 		}
@@ -157,9 +163,9 @@ func Resolve(s config.Settings, env LookupEnv) (bool, EnvConfig, error) {
 		if !ok {
 			continue
 		}
-		switch Protocol(v) {
+		switch Protocol(strings.ToLower(v)) {
 		case ProtocolHTTPProtobuf, ProtocolGRPC:
-			cfg.Protocol = Protocol(v) // the later (_TRACES_) variant overrides
+			cfg.Protocol = Protocol(strings.ToLower(v)) // the later (_TRACES_) variant overrides
 		default:
 			return fail(name, errBadProtocol)
 		}
@@ -178,19 +184,34 @@ func Resolve(s config.Settings, env LookupEnv) (bool, EnvConfig, error) {
 		}
 	}
 
+	// Client certificate and key are paired under the same prefix.
+	for _, prefix := range []string{otlpPrefix, otlpTracesPrefix} {
+		certName, keyName := prefix+"CLIENT_CERTIFICATE", prefix+"CLIENT_KEY"
+		cp, cok := get(certName)
+		kp, kok := get(keyName)
+		switch {
+		case cok && !kok:
+			return fail(keyName, errBadPair)
+		case kok && !cok:
+			return fail(certName, errBadPair)
+		case cok && kok && !keyPairOK(cp, kp):
+			return fail(keyName, errBadPair)
+		}
+	}
+
 	if v, ok := get(varResourceAttrs); ok {
-		if !validKeyValueList(v) {
-			return fail(varResourceAttrs, errBadHeaders)
+		if !validKeyValueList(v, false) {
+			return fail(varResourceAttrs, errBadKVList)
 		}
 	}
 	// OTEL_SERVICE_NAME: any non-empty string is valid (empty is unset); nothing to check.
 
 	// Sampler.
 	if v, ok := get(varSampler); ok {
-		switch SamplerKind(v) {
+		switch k := SamplerKind(strings.ToLower(v)); k {
 		case SamplerAlwaysOn, SamplerAlwaysOff, SamplerTraceIDRatio,
 			SamplerParentBasedAlwaysOn, SamplerParentBasedAlwaysOff, SamplerParentBasedTraceIDRatio:
-			cfg.Sampler = SamplerKind(v)
+			cfg.Sampler = k
 		default:
 			return fail(varSampler, errBadSampler)
 		}
@@ -216,6 +237,9 @@ func Resolve(s config.Settings, env LookupEnv) (bool, EnvConfig, error) {
 		if cfg.Queue.MaxExportBatchSize, err = parsePositiveInt(v); err != nil {
 			return fail(varBSPBatch, err)
 		}
+	} else if cfg.Queue.MaxExportBatchSize > cfg.Queue.MaxQueueSize {
+		// Unset batch: effective value is min(default, queue).
+		cfg.Queue.MaxExportBatchSize = cfg.Queue.MaxQueueSize
 	}
 	if v, ok := get(varBSPDelay); ok {
 		if cfg.Queue.ScheduleDelay, err = parsePositiveMillis(v); err != nil {
@@ -240,7 +264,7 @@ func validateExporterVar(suffix, v string) error {
 			return errBadEndpoint
 		}
 	case "HEADERS":
-		if !validKeyValueList(v) {
+		if !validKeyValueList(v, true) {
 			return errBadHeaders
 		}
 	case "TIMEOUT":
@@ -270,7 +294,7 @@ func validateExporterVar(suffix, v string) error {
 
 func parsePositiveInt(v string) (int, error) {
 	n, err := strconv.ParseInt(v, 10, 32)
-	if err != nil || n <= 0 {
+	if err != nil || n <= 0 || n > maxQueueBound {
 		return 0, errBadPositive
 	}
 	return int(n), nil
