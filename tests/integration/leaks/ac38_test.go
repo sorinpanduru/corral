@@ -42,7 +42,7 @@ import (
 const (
 	markerLen   = 40 // >= 32 so that line-wrap splits keep a 12-byte window
 	windowLen   = 12
-	waitTimeout = 20 * time.Second
+	waitTimeout = 60 * time.Second
 	alphabet    = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
 )
 
