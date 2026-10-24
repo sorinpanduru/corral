@@ -31,6 +31,7 @@ const (
 	ClassServer   Class = "server"
 	ClassConfig   Class = "config"
 	ClassInternal Class = "internal"
+	ClassRejected Class = "rejected"
 )
 
 // Error details.
@@ -51,9 +52,60 @@ const (
 	DetailOther            Detail = "other"
 )
 
+// Amendment 3 details. Each has a fixed class (see DetailClass).
+const (
+	DetailPoolWaitTimeout       Detail = "pool_wait_timeout"
+	DetailPoolQueueFull         Detail = "pool_queue_full"
+	DetailUpstreamUnavailable   Detail = "upstream_unavailable"
+	DetailUpstreamAuthFailed    Detail = "upstream_auth_failed"
+	DetailUpstreamIncompatible  Detail = "upstream_incompatible"
+	DetailShuttingDown          Detail = "shutting_down"
+	DetailClientAuthUnsupported Detail = "client_auth_unsupported"
+	DetailCommandBlocked        Detail = "command_blocked"
+	DetailHandshakeRejected     Detail = "handshake_rejected"
+	DetailUnsupportedOpcode     Detail = "unsupported_opcode"
+	DetailMessageTooLarge       Detail = "message_too_large"
+	DetailMalformedMessage      Detail = "malformed_message"
+	DetailChecksumMismatch      Detail = "checksum_mismatch"
+	DetailUnexpectedResponse    Detail = "unexpected_response"
+)
+
+var fixedDetailClass = map[Detail]Class{
+	DetailPoolWaitTimeout:       ClassTimeout,
+	DetailPoolQueueFull:         ClassRejected,
+	DetailUpstreamUnavailable:   ClassNetwork,
+	DetailUpstreamAuthFailed:    ClassServer,
+	DetailUpstreamIncompatible:  ClassConfig,
+	DetailShuttingDown:          ClassRejected,
+	DetailClientAuthUnsupported: ClassRejected,
+	DetailCommandBlocked:        ClassRejected,
+	DetailHandshakeRejected:     ClassRejected,
+	DetailUnsupportedOpcode:     ClassProtocol,
+	DetailMessageTooLarge:       ClassProtocol,
+	DetailMalformedMessage:      ClassProtocol,
+	DetailChecksumMismatch:      ClassProtocol,
+	DetailUnexpectedResponse:    ClassProtocol,
+}
+
+// DetailClass returns the fixed class of an Amendment 3 detail. ok is false
+// for the original details (their class depends on the error) and for
+// unknown values.
+func DetailClass(d Detail) (Class, bool) {
+	c, ok := fixedDetailClass[d]
+	return c, ok
+}
+
+// DetailedError is satisfied by synthesized errors that name their own
+// detail token. Unknown tokens are ignored. Compliance: the token is an enum
+// value, never message text.
+type DetailedError interface {
+	error
+	CorralErrorDetail() string
+}
+
 // Classes returns the closed set of classes.
 func Classes() []Class {
-	return []Class{ClassTimeout, ClassNetwork, ClassProtocol, ClassServer, ClassConfig, ClassInternal}
+	return []Class{ClassTimeout, ClassNetwork, ClassProtocol, ClassServer, ClassConfig, ClassInternal, ClassRejected}
 }
 
 // Details returns the closed set of details.
@@ -63,6 +115,11 @@ func Details() []Detail {
 		DetailEPIPE, DetailEHOSTUNREACH, DetailENETUNREACH, DetailEADDRINUSE,
 		DetailDeadlineExceeded, DetailCanceled, DetailEOF, DetailTLSHandshake,
 		DetailDNSResolution, DetailOther,
+		DetailPoolWaitTimeout, DetailPoolQueueFull, DetailUpstreamUnavailable,
+		DetailUpstreamAuthFailed, DetailUpstreamIncompatible, DetailShuttingDown,
+		DetailClientAuthUnsupported, DetailCommandBlocked, DetailHandshakeRejected,
+		DetailUnsupportedOpcode, DetailMessageTooLarge, DetailMalformedMessage,
+		DetailChecksumMismatch, DetailUnexpectedResponse,
 	}
 }
 
@@ -165,7 +222,7 @@ func hasTarget(nodes []error, target error) bool {
 // Classify maps err to its FR-29 class and detail (plan decision D3). It
 // never reads the error text.
 //
-// Precedence over the whole chain: recovered panic > config > server >
+// Precedence over the whole chain: recovered panic > detailed (ADR-0016) > config > server >
 // protocol > errno/sentinels. For the last group the detail is chosen in
 // this order: deadline_exceeded, canceled, errno values, eof, dns_resolution,
 // tls_handshake, then any net.Error-style Timeout() (ETIMEDOUT). EOF is
@@ -184,6 +241,10 @@ func classify(nodes []error) (Class, Detail) {
 	switch {
 	case anyNode(nodes, func(n error) bool { _, ok := n.(*panicError); return ok }):
 		return ClassInternal, DetailOther
+	case hasDetailed(nodes):
+		d := detailedOf(nodes)
+		c, _ := DetailClass(d)
+		return c, d
 	case anyNode(nodes, func(n error) bool { _, ok := n.(ConfigError); return ok }):
 		return ClassConfig, detailOf(nodes)
 	case anyNode(nodes, func(n error) bool { _, ok := n.(ServerError); return ok }):
@@ -194,6 +255,21 @@ func classify(nodes []error) (Class, Detail) {
 	d := detailOf(nodes)
 	return classOfDetail(d), d
 }
+
+// detailedOf returns the first known Amendment 3 token in walk order.
+func detailedOf(nodes []error) Detail {
+	for _, n := range nodes {
+		if de, ok := n.(DetailedError); ok {
+			d := Detail(de.CorralErrorDetail())
+			if _, known := DetailClass(d); known {
+				return d
+			}
+		}
+	}
+	return ""
+}
+
+func hasDetailed(nodes []error) bool { return detailedOf(nodes) != "" }
 
 func classOfDetail(d Detail) Class {
 	switch d {

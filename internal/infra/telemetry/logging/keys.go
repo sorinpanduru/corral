@@ -17,6 +17,7 @@ var allowedKeys = map[string]struct{}{
 	attr.ConnectionID: {}, attr.UpstreamConnectionID: {}, attr.RequestID: {},
 	attr.SessionID: {}, attr.CursorID: {}, attr.ClientAppName: {},
 	attr.ClientDriverName: {}, attr.ClientDriverVersion: {},
+	attr.Reason: {},
 }
 
 var numericKeyRE = regexp.MustCompile(`^[a-z][a-z0-9]*(_[a-z0-9]+)*_(seconds|bytes|count)$`)

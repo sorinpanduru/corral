@@ -13,13 +13,20 @@ const (
 	ReasonStarting Reason = "starting"
 	// ReasonShuttingDown means graceful shutdown has begun.
 	ReasonShuttingDown Reason = "shutting_down"
+	// ReasonUpstreamUnavailable means no upstream server is reachable.
+	ReasonUpstreamUnavailable Reason = "upstream_unavailable"
+	// ReasonUpstreamAuthFailed means upstream authentication failed.
+	ReasonUpstreamAuthFailed Reason = "upstream_auth_failed"
+	// ReasonUpstreamIncompatible means the upstream server is incompatible.
+	ReasonUpstreamIncompatible Reason = "upstream_incompatible"
 	// ReasonUnknown stands for any reason outside the defined set.
 	ReasonUnknown Reason = "unknown"
 )
 
 // Reasons returns the full defined reason set. The caller owns the slice.
 func Reasons() []Reason {
-	return []Reason{ReasonStarting, ReasonShuttingDown, ReasonUnknown}
+	return []Reason{ReasonStarting, ReasonShuttingDown, ReasonUpstreamUnavailable,
+		ReasonUpstreamAuthFailed, ReasonUpstreamIncompatible, ReasonUnknown}
 }
 
 // Status is a readiness report. The zero value is not ready.

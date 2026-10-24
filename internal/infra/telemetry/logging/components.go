@@ -14,17 +14,20 @@ const (
 	OTel       Component = "otel"
 	GRPC       Component = "grpc"
 	ThirdParty Component = "thirdparty"
+	Proxy      Component = "proxy"
+	Pool       Component = "pool"
+	Upstream   Component = "upstream"
 )
 
 // Components returns a fresh copy of the fixed component set.
 func Components() []Component {
-	return []Component{Config, Lifecycle, AdminHTTP, Tracing, OTel, GRPC, ThirdParty}
+	return []Component{Config, Lifecycle, AdminHTTP, Tracing, OTel, GRPC, ThirdParty, Proxy, Pool, Upstream}
 }
 
 // ValidComponent reports whether c is in the fixed set.
 func ValidComponent(c Component) bool {
 	switch c {
-	case Config, Lifecycle, AdminHTTP, Tracing, OTel, GRPC, ThirdParty:
+	case Config, Lifecycle, AdminHTTP, Tracing, OTel, GRPC, ThirdParty, Proxy, Pool, Upstream:
 		return true
 	}
 	return false

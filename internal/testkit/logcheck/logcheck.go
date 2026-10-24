@@ -149,6 +149,9 @@ func (h *Handler) checkAttr(c ctxInfo, a slog.Attr, inRecord bool) {
 		h.fail(c, "callers must not set %q (FR-8, FR-39)", a.Key)
 		return
 	}
+	if a.Key == attr.Reason && v.Kind() != slog.KindString {
+		h.fail(c, "key %q needs a string value, got kind %v (FR-39)", a.Key, v.Kind())
+	}
 	if logging.NumericKey(a.Key) {
 		switch v.Kind() {
 		case slog.KindInt64, slog.KindUint64, slog.KindFloat64:

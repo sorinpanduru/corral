@@ -17,6 +17,7 @@ const (
 	SpanID    = "span_id"
 	Stack     = "stack"
 	Setting   = "setting"
+	Reason    = "reason"
 )
 
 // Numeric count key used by rate-limited sources (FR-28, FR-33).
