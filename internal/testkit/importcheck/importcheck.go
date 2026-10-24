@@ -31,6 +31,7 @@ func (v Violation) String() string {
 type listedPkg struct {
 	ImportPath string
 	Standard   bool
+	DepOnly    bool
 	Imports    []string
 }
 
@@ -43,7 +44,8 @@ func list(dir, pattern string) ([]listedPkg, error) {
 	}
 	cmd := exec.Command("go", "list", "-deps", "-json", pattern)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GOFLAGS=", "GOTOOLCHAIN=local", "GOPROXY=off", "GOWORK=off")
+	cmd.Env = append(os.Environ(), "GOFLAGS=", "GOTOOLCHAIN=local", "GOPROXY=off", "GOWORK=off",
+		"GOENV=off", "GOPACKAGESDRIVER=off")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
@@ -128,6 +130,56 @@ func Check(dir, pattern, domainPrefix string, allow []string) ([]Violation, erro
 			}
 			out = append(out, Violation{Package: p.ImportPath, Import: imp})
 		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Package != out[j].Package {
+			return out[i].Package < out[j].Package
+		}
+		return out[i].Import < out[j].Import
+	})
+	return out, nil
+}
+
+// hasPrefix reports whether path equals prefix or lies under it on a path
+// boundary, so "a/testkit" does not match "a/testkitx".
+func hasPrefix(path, prefix string) bool {
+	return path == prefix || strings.HasPrefix(path, prefix+"/")
+}
+
+func matchesAny(path string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if hasPrefix(path, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// Forbidden reports every non-test import, by a package matched by pattern and
+// not under an exclude prefix, of a path under a forbidden prefix. Prefixes
+// match on path boundaries. Dependency-only packages are not examined. It
+// errors if no matched package remains after exclusion, so callers cannot pass
+// vacuously. Results are sorted by Package then Import.
+func Forbidden(dir, pattern string, exclude, forbidden []string) ([]Violation, error) {
+	pkgs, err := list(dir, pattern)
+	if err != nil {
+		return nil, err
+	}
+	var out []Violation
+	checked := 0
+	for _, p := range pkgs {
+		if p.DepOnly || matchesAny(p.ImportPath, exclude) {
+			continue
+		}
+		checked++
+		for _, imp := range p.Imports {
+			if matchesAny(imp, forbidden) {
+				out = append(out, Violation{Package: p.ImportPath, Import: imp})
+			}
+		}
+	}
+	if checked == 0 {
+		return nil, fmt.Errorf("no packages matched %q after exclusion", pattern)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Package != out[j].Package {
