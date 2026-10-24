@@ -57,22 +57,33 @@ version set, and its exporters pull in gRPC and the OTLP protobuf module.
   not already listed here is recorded in this ADR by the planner afterwards.
 
 - SPEC-002 additions (planner, 2026-10-24):
-  - production (approved by the Owner, 2026-10-24, P2):
-    `github.com/xdg-go/scram` (latest v1 release when added; v1.1.2 at
-    planning time, to be confirmed), used behind the ADR-0019 adapter. It
-    brings `github.com/xdg-go/stringprep` (v1.0.4) and
-    `github.com/xdg-go/pbkdf2` (v1.0.0) at the versions it selects, and
+  - production (approved by the Owner, 2026-10-24, P2), as pinned in
+    `go.mod`:
+
+    | Module | Version | Requirement |
+    |---|---|---|
+    | `github.com/xdg-go/scram` | v1.2.0 | direct; used behind the ADR-0019 adapter |
+    | `github.com/xdg-go/stringprep` | v1.0.4 | indirect, via scram |
+    | `github.com/xdg-go/pbkdf2` | v1.0.0 | indirect, via scram |
+    | `golang.org/x/sys` | v0.49.0 | direct (`TCP_USER_TIMEOUT`); unchanged version |
+
     `golang.org/x/text` stays at the already-pinned v0.43.0.
-    `golang.org/x/sys` becomes a direct requirement at the already-pinned
-    v0.49.0 (`TCP_USER_TIMEOUT`). Exact versions are recorded here when T6
-    lands.
-  - test-only: `go.mongodb.org/mongo-driver/v2` (latest v2 release when
-    first added; the exact version is recorded here when it lands). It is
-    allowed only in `_test.go` files, `internal/testkit/...`, `tests/...`
-    and `twins/...` (ADR-0022). The production import lint enforces this.
-  - The Docker image digests (`mongo:7.0`, `mongo:8.0`, the PHP-FPM base)
-    and the PECL `mongodb` extension version used by the functional
-    fixtures are recorded here when the fixtures land (ADR-0022).
+  - test-only: `go.mongodb.org/mongo-driver/v2` v2.9.2. It is allowed only
+    in `_test.go` files, `internal/testkit/...`, `tests/...` and
+    `twins/...` (ADR-0022). The production import lint enforces this.
+  - Functional fixture images and packages (ADR-0022; P1 access granted by
+    the Owner). The source of truth is the code named below; update both
+    together, with a full functional run.
+
+    | Item | Pin | Defined in |
+    |---|---|---|
+    | `mongo:7.0` | `docker.io/library/mongo@sha256:c53852c00c23ca9f23fc39690350ffa9a80e3642fe8f96879726d8da0abe80a7` | `internal/testkit/mongofx/images.go` |
+    | `mongo:8.0` | `docker.io/library/mongo@sha256:4a4ab5d4834207389e0d7270fac988e21ffedccecba77991a552f755df229907` | `internal/testkit/mongofx/images.go` |
+    | PHP 8.3 FPM base (Debian bookworm) | `docker.io/library/php@sha256:6b4641a875dd3e0f7551b2751e1f5909084856d18166af7fbb522ac230feb702` | `internal/testkit/phpfpm/phpfpm.go` (`BaseImage`) |
+    | PECL `mongodb` (`ext-mongodb`) | 2.5.5 | `internal/testkit/phpfpm/phpfpm.go` (`PeclMongoDBVersion`) |
+
+    The mongo digests are the multi-platform index digests as of
+    2026-10-24.
 
 ## Consequences
 

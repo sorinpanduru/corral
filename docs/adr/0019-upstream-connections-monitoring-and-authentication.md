@@ -44,11 +44,23 @@ Owner decision, 2026-10-24: use the maintained library, not an in-house
 client.
 
 - `internal/infra/upstreamconn/scram` is a thin adapter around
-  `github.com/xdg-go/scram` (`scram.SHA256.NewClient`, one
-  `ClientConversation` per authentication). The library does:
-  - SASLprep (RFC 4013) of the password, through its own dependency
-    `github.com/xdg-go/stringprep`;
-  - username escaping (RFC 5802);
+  `github.com/xdg-go/scram` v1.2.0, with one `ClientConversation` per
+  authentication.
+- **Only the password is SASLprepped** (parity with the official Go
+  driver). The adapter builds the client as:
+
+  ```go
+  scram.SHA256.NewClientUnprepped(username, stringprep.SASLprep.Prepare(password), "")
+  ```
+
+  - The username is passed through unchanged, apart from RFC 5802
+    escaping. `NewClient` is not used, because it would also SASLprep the
+    username, and a username that differs after preparation would then
+    authenticate differently from the driver.
+  - SASLprep of the password uses `github.com/xdg-go/stringprep`. A
+    password that fails preparation gives `scram.ErrSASLprep`.
+- The library also does:
+  - username escaping (RFC 5802: `=2C`, `=3D`);
   - nonce generation;
   - the PBKDF2 cache: one `Client` per process caches derived keys per
     (salt, iteration count), so there is no PBKDF2 per pool connection.
@@ -62,8 +74,14 @@ client.
     the adapter returns `scram.ErrServerSignature`.
   - The library's error values are never logged or wrapped into records.
     Only the adapter's constant sentinels leave the package.
-- The adapter rejects iteration counts below 4096 (`scram.ErrIterations`)
-  by checking the server-first message before stepping.
+- The adapter checks the server-first message's iteration count before
+  stepping, and returns `scram.ErrIterations` when the count is out of
+  range:
+  - below 4096 (RFC 7677 minimum);
+  - **above an upper bound** (constant `scram.MaxIterations`), so that a malicious or misconfigured upstream
+    cannot make corral run an unbounded PBKDF2. The implementer states
+    the bound and its reason here when T6 lands: "The upper bound is
+    <N> iterations, because <reason>." (placeholder).
 - Conversation on the wire (in `upstreamconn`): `saslStart` (mechanism
   `SCRAM-SHA-256`, `options: {skipEmptyExchange: true}`), then
   `saslContinue` until `done`.
@@ -147,9 +165,9 @@ client.
 
 ## Consequences
 
-- `go.mod` gains `github.com/xdg-go/scram` (production, approved by the
-  Owner, P2). It brings `github.com/xdg-go/stringprep` and
-  `github.com/xdg-go/pbkdf2`, and `golang.org/x/sys` becomes direct.
-  Versions are recorded in ADR-0002.
+- `go.mod` gains `github.com/xdg-go/scram` v1.2.0 (production, approved by
+  the Owner, P2). It brings `github.com/xdg-go/stringprep` v1.0.4 and
+  `github.com/xdg-go/pbkdf2` v1.0.0, and `golang.org/x/sys` v0.49.0 becomes
+  direct. ADR-0002 is the record.
 - The library's key cache holds derived key material in memory. It is never
   emitted and is dropped at process exit.

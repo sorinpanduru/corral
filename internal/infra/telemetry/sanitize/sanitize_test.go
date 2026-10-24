@@ -206,7 +206,10 @@ func TestMetricLabel(t *testing.T) {
 		"HELLO":                  "other",
 		"IsMaster":               "other", // only the two listed spellings alias
 		"ISMASTER":               "other",
-		"insert":                 "other", // allowlist is exactly find and hello (D2)
+		"insert":                 "insert", // Amendment 3 adds 25 names (FR-12)
+		"getMore":                "getMore",
+		"GetMore":                "other", // case-sensitive
+		"getmore":                "other",
 		"":                       "other",
 		" find":                  "other",
 		"find ":                  "other",
@@ -229,14 +232,27 @@ func TestMetricLabelNoMatchAfterTruncation(t *testing.T) {
 	}
 }
 
-// FR-12 (D2): the allowlist is exactly find and hello; "other" is the literal.
+// FR-12 (Amendment 3, AC-41): the allowlist is exactly the 27 names; "other"
+// is the literal.
 func TestAllowlistContents(t *testing.T) {
 	if sanitize.OtherCommand != "other" {
 		t.Fatalf("OtherCommand=%q", sanitize.OtherCommand)
 	}
 	got := slices.Clone(sanitize.CommandAllowlist())
 	slices.Sort(got)
-	if want := []string{"find", "hello"}; !slices.Equal(got, want) {
+	want := []string{
+		"find", "hello", "getMore", "killCursors", "insert", "update", "delete",
+		"findAndModify", "aggregate", "count", "distinct", "bulkWrite",
+		"createIndexes", "dropIndexes", "listIndexes", "listCollections",
+		"listDatabases", "create", "drop", "ping", "buildInfo", "endSessions",
+		"commitTransaction", "abortTransaction", "saslStart", "saslContinue",
+		"authenticate",
+	}
+	slices.Sort(want)
+	if len(want) != 27 {
+		t.Fatalf("test oracle has %d names, want 27", len(want))
+	}
+	if !slices.Equal(got, want) {
 		t.Fatalf("allowlist=%v want %v", got, want)
 	}
 	for _, name := range sanitize.CommandAllowlist() {

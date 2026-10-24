@@ -257,16 +257,28 @@
 ### T6: SCRAM-SHA-256 adapter around `github.com/xdg-go/scram`
 
 - Goal: `internal/infra/upstreamconn/scram`, a thin adapter around the maintained `github.com/xdg-go/scram` library (Owner decision, 2026-10-24; ADR-0019). No in-house SCRAM.
-  - The library does SASLprep (through its `xdg-go/stringprep` dependency), username escaping, nonces and the derived-key cache. The adapter holds one library `Client` per process and one `ClientConversation` per authentication.
+  - **Only the password is SASLprepped**, for parity with the official Go driver (ADR-0019). The adapter builds the client with:
+
+    ```go
+    scram.SHA256.NewClientUnprepped(username, stringprep.SASLprep.Prepare(password), "")
+    ```
+
+    - `NewClient` is not used, because it would also prepare the username.
+    - The username is passed unchanged, apart from the library's RFC 5802 escaping.
+    - A password that fails preparation gives `ErrSASLprep`.
+  - The library does username escaping, nonces and the derived-key cache. The adapter holds one library `Client` per process and one `ClientConversation` per authentication.
   - The adapter adds:
-    - shape checks on server messages: an iteration count below 4096 gives `ErrIterations`; an `e=` server-final or malformed content gives `ErrProtocol`;
+    - shape checks on server messages:
+      - an iteration count below 4096, or above the upper bound the implementer fixes and records in ADR-0019 (constant `scram.MaxIterations`), gives `ErrIterations`. The check runs before any PBKDF2, so a hostile upstream cannot force unbounded work;
+      - an `e=` server-final or malformed content gives `ErrProtocol`;
     - mapping of a failed `v=` verification (a `Step` error on a well-formed `v=` message, or `Valid() == false` at the end) to `ErrServerSignature`;
     - constant sentinels as the only errors that leave the package. Library error values are never wrapped or logged.
 - FRs/ACs: FR-22 (failure classification), FR-24; AC-25 (unit: failed signature); AC-11 (support).
 - Implementer owns: `internal/infra/upstreamconn/scram/*.go` (non-test), `go.mod` / `go.sum` (`github.com/xdg-go/scram` and what it selects; versions recorded in ADR-0002).
 - Test writer owns: `internal/infra/upstreamconn/scram/*_test.go`.
 - Interfaces defined:
-  - `scram.NewClient(username, password []byte) (*Client, error)`. It wraps the library client, and a SASLprep failure gives `ErrSASLprep`.
+  - `scram.NewClient(username, password []byte) (*Client, error)`. It wraps `scram.SHA256.NewClientUnprepped` with the password prepared by `stringprep.SASLprep.Prepare` and the username unprepared; a preparation failure gives `ErrSASLprep`.
+  - Constant `scram.MaxIterations` (the upper bound; value and reason recorded in ADR-0019).
   - `(*Client).NewConversation() *Conversation`.
   - `(*Conversation).First() ([]byte, error)`; `(*Conversation).Step(server []byte) (reply []byte, done bool, err error)`.
   - Sentinels `scram.ErrServerSignature`, `scram.ErrProtocol`, `scram.ErrSASLprep`, `scram.ErrIterations`. Constant text only.
@@ -275,9 +287,12 @@
   - A tampered `v=` gives `ErrServerSignature`.
   - An `e=invalid-proof` server-final gives `ErrProtocol`, not `ErrServerSignature`.
   - A malformed server-first or server-final message, and a nonce that does not extend the client nonce, give `ErrProtocol`.
-  - Iteration count 4095 gives `ErrIterations`.
+  - Iteration count 4095 gives `ErrIterations`. `MaxIterations` is accepted, and `MaxIterations + 1` gives `ErrIterations` before any key derivation; for example, the call returns promptly and the test server's later messages are never requested.
   - A username containing `,` or `=` authenticates.
   - A non-ASCII-space password authenticates after SASLprep; a prohibited character gives `ErrSASLprep`.
+  - Username not prepared (driver parity):
+    - a username containing a character that SASLprep would map, for example U+00A0, authenticates against a test server whose stored user is exactly that unprepared name;
+    - it fails against a server that stores the SASLprep-mapped form.
   - A second conversation with the same salt and iteration count reuses the derived keys. Assert through timing-independent means, for example by counting server-first messages per derived-key computation if the library exposes it; otherwise this is a review item.
   - The marker username and password never appear in any error text (`fmt.Sprint(err)`).
 - Docker: no.

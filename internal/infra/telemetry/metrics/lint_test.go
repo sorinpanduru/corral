@@ -219,11 +219,11 @@ func detailValues() []string {
 	return out
 }
 
-// D: label names are an allowlist. Exactly command, error_class, error_detail.
+// D (Amendment 3, AC-41): label names are an allowlist of exactly nine names.
 func TestAllowedLabelNames(t *testing.T) {
 	got := append([]string(nil), metrics.AllowedLabelNames()...)
 	sort.Strings(got)
-	want := []string{"command", "error_class", "error_detail"}
+	want := []string{"command", "error_class", "error_detail", "kind", "opcode", "outcome", "reason", "side", "state"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("AllowedLabelNames() = %v, want %v", got, want)
 	}
@@ -244,7 +244,7 @@ func TestLintRejectsNonAllowlistedLabelNames(t *testing.T) {
 		"db_name", "database_name", "collection_name", "coll", "ns", "error_code", "err_code",
 		"client_addr", "peer", "remote_addr", "upstream", "server", "hostname", "app", "application",
 		"client_app_name", "role", "error", "error_type", "err_class", "detail",
-		"connection_state", "session_state", "state", "result", "pool", "a",
+		"connection_state", "session_state", "result", "pool", "a",
 	} {
 		t.Run(l, func(t *testing.T) {
 			c := parse(t, metricSpec{Name: "corral_x_total", Type: "counter", Help: "h",
