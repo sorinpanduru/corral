@@ -1,12 +1,15 @@
 package logging
 
 import (
-	"fmt"
+	"errors"
 	"io"
 	"log/slog"
 
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/attr"
 )
+
+// ErrUnknownComponent is returned for a component outside the fixed set.
+var ErrUnknownComponent = errors.New("logging: component not in the fixed set")
 
 // Factory is the only way to obtain a logger (FR-7).
 type Factory struct{ h slog.Handler }
@@ -21,7 +24,7 @@ func (f *Factory) Handler() slog.Handler { return f.h }
 // the fixed set. The error does not echo c.
 func (f *Factory) Logger(c Component) (*slog.Logger, error) {
 	if !ValidComponent(c) {
-		return nil, fmt.Errorf("logging: component not in the fixed set")
+		return nil, ErrUnknownComponent
 	}
 	return slog.New(f.h).With(attr.Component, string(c)), nil
 }

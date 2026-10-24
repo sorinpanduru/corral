@@ -25,6 +25,9 @@ type correlationHandler struct{ next slog.Handler }
 // WithTraceCorrelation wraps h so records whose context holds a valid span
 // context (sampled or not, FR-8, D9) carry trace_id and span_id in lowercase
 // hex. Install it only when tracing is enabled.
+//
+// Callers must never set trace_id or span_id themselves; the wrapper is the
+// only source of these attributes (the T4 logcheck handler enforces this).
 func WithTraceCorrelation(h slog.Handler) slog.Handler { return correlationHandler{next: h} }
 
 func (c correlationHandler) Enabled(ctx context.Context, l slog.Level) bool {

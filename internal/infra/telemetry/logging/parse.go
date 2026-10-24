@@ -1,7 +1,7 @@
 package logging
 
 import (
-	"fmt"
+	"errors"
 	"log/slog"
 	"strings"
 )
@@ -14,15 +14,21 @@ const (
 	FormatText Format = "text"
 )
 
+// Sentinel errors carry constant messages and never echo the supplied value (FR-27).
+var (
+	ErrInvalidFormat = errors.New("logging: invalid log format")
+	ErrInvalidLevel  = errors.New("logging: invalid log level")
+)
+
 // ParseFormat parses log.format. Errors never echo the supplied value (FR-27).
 func ParseFormat(s string) (Format, error) {
-	switch s {
+	switch strings.ToLower(s) {
 	case "json":
 		return FormatJSON, nil
 	case "text":
 		return FormatText, nil
 	}
-	return "", fmt.Errorf("logging: invalid log format")
+	return "", ErrInvalidFormat
 }
 
 // ParseLevel parses log.level case-insensitively (FR-6). Offsets such as
@@ -38,5 +44,5 @@ func ParseLevel(s string) (slog.Level, error) {
 	case "error":
 		return slog.LevelError, nil
 	}
-	return 0, fmt.Errorf("logging: invalid log level")
+	return 0, ErrInvalidLevel
 }

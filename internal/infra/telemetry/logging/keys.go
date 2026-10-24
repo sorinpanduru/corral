@@ -19,7 +19,7 @@ var allowedKeys = map[string]struct{}{
 	attr.ClientDriverName: {}, attr.ClientDriverVersion: {},
 }
 
-var numericKeyRE = regexp.MustCompile(`^[a-z0-9]+(_[a-z0-9]+)*_(seconds|bytes|count)$`)
+var numericKeyRE = regexp.MustCompile(`^[a-z][a-z0-9]*(_[a-z0-9]+)*_(seconds|bytes|count)$`)
 
 // NumericKey reports whether key is a snake_case name ending in _seconds,
 // _bytes or _count (FR-39). The value must be numeric; that is checked by the
