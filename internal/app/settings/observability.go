@@ -66,8 +66,10 @@ func DefaultObservability() Observability {
 	}
 }
 
-// ObservabilityFrom maps a successful load result to the typed view. A value
-// that is missing or of an unexpected type keeps its default.
+// ObservabilityFrom maps a load result to the typed view. Callers must check
+// res.Errors first: for a failed setting this returns the default, which is
+// not a usable configuration. A value that is missing or of an unexpected type
+// keeps its default.
 func ObservabilityFrom(res loader.Result) Observability {
 	o := DefaultObservability()
 	if v, ok := res.Get(LogFormat); ok {
