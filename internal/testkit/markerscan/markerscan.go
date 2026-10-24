@@ -6,6 +6,9 @@
 // (standard and URL-safe alphabets) at all three alignments, with the unstable
 // edge characters dropped from each base64 pattern.
 //
+// Allowed and banned markers must not share any 12-byte substring, because
+// raw-partial matches any 12-byte window of the joined stream.
+//
 // All data handled here must be synthetic. Findings never contain the matched
 // data, only the marker as the test supplied it, the source and the encoding
 // name.
@@ -198,10 +201,13 @@ func New() *Scanner {
 }
 
 // AddMarker registers a marker. With no sources it is scanned in all of them.
-// A marker must be at least 16 bytes and use only [A-Za-z0-9_-].
-func (s *Scanner) AddMarker(m string, sources ...Source) error {
+// A marker must be at least 16 bytes and use only [A-Za-z0-9_-]; otherwise it
+// calls tb.Fatalf with the reason (never the marker itself).
+func (s *Scanner) AddMarker(tb testing.TB, m string, sources ...Source) {
+	tb.Helper()
 	if err := validMarker(m); err != nil {
-		return err
+		tb.Fatalf("markerscan: invalid marker: %v", err)
+		return
 	}
 	e := markerEntry{marker: m, patterns: Patterns(m)}
 	if len(sources) > 0 {
@@ -213,7 +219,6 @@ func (s *Scanner) AddMarker(m string, sources ...Source) error {
 	s.mu.Lock()
 	s.markers = append(s.markers, e)
 	s.mu.Unlock()
-	return nil
 }
 
 // Add appends data from a source. Successive calls for one source form a
@@ -295,10 +300,14 @@ func (s *Scanner) snapshot() view {
 // is incomplete.
 func (s *Scanner) Truncated(src Source) bool { return s.snapshot().truncated[src] }
 
-// AssertClean fails tb if there is any finding or any truncated source.
+// AssertClean fails tb if there is any finding or any truncated source, or if
+// no marker was registered (a scan without markers proves nothing).
 func (s *Scanner) AssertClean(tb testing.TB) {
 	tb.Helper()
 	v := s.snapshot()
+	if len(v.markers) == 0 {
+		tb.Errorf("markerscan: no markers registered; nothing was scanned")
+	}
 	for _, f := range v.findings() {
 		tb.Errorf("markerscan: %s", f)
 	}
