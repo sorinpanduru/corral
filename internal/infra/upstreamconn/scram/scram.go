@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	xscram "github.com/xdg-go/scram"
+	"github.com/xdg-go/stringprep"
 )
 
 // Sentinels. Constant text only.
@@ -27,20 +28,32 @@ var (
 	ErrProtocol = errors.New("scram: protocol error")
 	// ErrSASLprep means the username or password cannot be prepared.
 	ErrSASLprep = errors.New("scram: credential rejected by SASLprep")
-	// ErrIterations means the server asked for fewer than 4096 iterations.
-	ErrIterations = errors.New("scram: iteration count below the minimum")
+	// ErrIterations means the server asked for fewer than 4096 or more than 1,000,000 iterations.
+	ErrIterations = errors.New("scram: iteration count outside the accepted range")
 )
 
-const minIterations = 4096
+const (
+	minIterations = 4096
+	// maxIterations caps the server-requested PBKDF2 work. A hostile or
+	// compromised upstream could otherwise burn CPU with a huge count.
+	// MongoDB defaults are 15000 (SHA-256); 1,000,000 leaves ample headroom.
+	maxIterations = 1_000_000
+)
 
 // Client holds one library client (and its derived-key cache) per credential.
 type Client struct {
 	c *xscram.Client
 }
 
-// NewClient prepares a client. A SASLprep failure gives ErrSASLprep.
+// NewClient prepares a client. Like the official MongoDB drivers, only the
+// password is SASLprepped; the username is used as given (MongoDB stores it
+// unprepared). A SASLprep failure gives ErrSASLprep.
 func NewClient(username, password []byte) (*Client, error) {
-	c, err := xscram.SHA256.NewClient(string(username), string(password), "")
+	pw, err := stringprep.SASLprep.Prepare(string(password))
+	if err != nil {
+		return nil, ErrSASLprep
+	}
+	c, err := xscram.SHA256.NewClientUnprepped(string(username), pw, "")
 	if err != nil {
 		return nil, ErrSASLprep
 	}
@@ -110,7 +123,7 @@ func (c *Conversation) onServerFirst(msg string) ([]byte, bool, error) {
 	if err != nil {
 		return nil, false, ErrProtocol
 	}
-	if iters < minIterations {
+	if iters < minIterations || iters > maxIterations {
 		return nil, false, ErrIterations
 	}
 	out, err := c.cc.Step(msg)

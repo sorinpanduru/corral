@@ -14,6 +14,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -87,24 +88,48 @@ func docker(args ...string) (string, error) {
 	return string(out), err
 }
 
-func run(tb testing.TB, o Opts, prefix string, port int, args ...string) *container {
+// run starts a container on a freshly chosen port. Choosing a free port and
+// binding it in the container cannot be atomic, so it checks that mongod stayed
+// up and retries with a new port if it failed to bind.
+func run(tb testing.TB, o Opts, prefix string, build func(port int) []string) *container {
 	tb.Helper()
-	name := fmt.Sprintf("corralfx-%s-%s-%d", prefix, randHex(tb, 3), port)
-	dargs := []string{"run", "-d", "--name", name, "--network", "host"}
-	if o.Auth != nil {
-		dargs = append(dargs, "-e", "FX_KEYFILE_B64="+base64.StdEncoding.EncodeToString(o.Auth.Keyfile))
+	for attempt := 0; attempt < 4; attempt++ {
+		port := freePorts(tb, 1)[0]
+		name := fmt.Sprintf("corralfx-%s-%s-%d", prefix, randHex(tb, 3), port)
+		dargs := []string{"run", "-d", "--name", name, "--network", "host"}
+		if o.Auth != nil {
+			dargs = append(dargs, "-e", "FX_KEYFILE_B64="+base64.StdEncoding.EncodeToString(o.Auth.Keyfile))
+		}
+		if o.TLS != nil {
+			dargs = append(dargs, "-e", "FX_CA_B64="+base64.StdEncoding.EncodeToString(o.TLS.CAPEM),
+				"-e", "FX_PEM_B64="+base64.StdEncoding.EncodeToString(o.TLS.ServerPEM))
+		}
+		dargs = append(dargs, "--entrypoint", "bash", Image(o.Version), "-c", entry, "fxsh")
+		dargs = append(dargs, build(port)...)
+		if out, err := docker(dargs...); err != nil {
+			tb.Fatalf("mongofx: docker run failed: %s", strings.TrimSpace(out))
+		}
+		tb.Cleanup(func() { _, _ = docker("rm", "-f", name) })
+		time.Sleep(1500 * time.Millisecond)
+		if out, _ := docker("inspect", "-f", "{{.State.Running}}", name); strings.TrimSpace(out) == "true" {
+			return &container{name: name, addr: "127.0.0.1:" + strconv.Itoa(port)}
+		}
+		logs, _ := docker("logs", name)
+		_, _ = docker("rm", "-f", name)
+		if !strings.Contains(logs, "Address already in use") {
+			tb.Fatalf("mongofx: container exited early: %s", tail(logs))
+		}
 	}
-	if o.TLS != nil {
-		dargs = append(dargs, "-e", "FX_CA_B64="+base64.StdEncoding.EncodeToString(o.TLS.CAPEM),
-			"-e", "FX_PEM_B64="+base64.StdEncoding.EncodeToString(o.TLS.ServerPEM))
+	tb.Fatal("mongofx: no free port after 4 attempts")
+	return nil
+}
+
+func tail(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 1500 {
+		s = s[len(s)-1500:]
 	}
-	dargs = append(dargs, "--entrypoint", "bash", Image(o.Version), "-c", entry, "fxsh")
-	dargs = append(dargs, args...)
-	if out, err := docker(dargs...); err != nil {
-		tb.Fatalf("mongofx: docker run failed: %s", strings.TrimSpace(out))
-	}
-	tb.Cleanup(func() { _, _ = docker("rm", "-f", name) })
-	return &container{name: name, addr: "127.0.0.1:" + strconv.Itoa(port)}
+	return s
 }
 
 func serverArgs(o Opts, bin string, port int, extra ...string) []string {
@@ -156,22 +181,34 @@ func cmd(tb testing.TB, c *mongo.Client, db string, d bson.D) bson.M {
 	return res
 }
 
-func waitFor(tb testing.TB, what string, timeout time.Duration, f func() bool) {
+// waitFor polls f until it returns nil, and reports the last error on timeout.
+func waitFor(tb testing.TB, what string, timeout time.Duration, f func() error) {
 	tb.Helper()
 	end := time.Now().Add(timeout)
+	var last error
 	for time.Now().Before(end) {
-		if f() {
+		if last = f(); last == nil {
 			return
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	tb.Fatalf("mongofx: timed out waiting for %s", what)
+	tb.Fatalf("mongofx: timed out waiting for %s; last error: %v", what, last)
 }
 
-func try(c *mongo.Client, db string, d bson.D) (res bson.M, ok bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+func tryT(c *mongo.Client, db string, d bson.D, timeout time.Duration) (res bson.M, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return res, c.Database(db).RunCommand(ctx, d).Decode(&res) == nil
+	err = c.Database(db).RunCommand(ctx, d).Decode(&res)
+	return res, err
+}
+
+func try(c *mongo.Client, db string, d bson.D) (bson.M, error) {
+	return tryT(c, db, d, 5*time.Second)
+}
+
+func pingErr(c *mongo.Client) error {
+	_, err := try(c, "admin", bson.D{{Key: "ping", Value: 1}})
+	return err
 }
 
 // initReplSet runs replSetInitiate against the first member and waits for a
@@ -184,16 +221,19 @@ func initReplSet(tb testing.TB, o Opts, name string, addrs []string) {
 		if a != addrs[0] {
 			c = connect(tb, o, "mongodb://"+a+"/?directConnection=true", nil)
 		}
-		waitFor(tb, "mongod to answer", 90*time.Second, func() bool { _, ok := try(c, "admin", bson.D{{Key: "ping", Value: 1}}); return ok })
+		waitFor(tb, "mongod to answer", 90*time.Second, func() error { return pingErr(c) })
 	}
 	var members bson.A
 	for i, a := range addrs {
 		members = append(members, bson.D{{Key: "_id", Value: i}, {Key: "host", Value: a}})
 	}
 	cmd(tb, direct, "admin", bson.D{{Key: "replSetInitiate", Value: bson.D{{Key: "_id", Value: name}, {Key: "members", Value: members}}}})
-	waitFor(tb, "a primary", 90*time.Second, func() bool {
-		r, ok := try(direct, "admin", bson.D{{Key: "hello", Value: 1}})
-		return ok && r["isWritablePrimary"] == true
+	waitFor(tb, "a primary", 90*time.Second, func() error {
+		r, err := try(direct, "admin", bson.D{{Key: "hello", Value: 1}})
+		if err == nil && r["isWritablePrimary"] != true {
+			err = errors.New("not yet primary")
+		}
+		return err
 	})
 }
 
@@ -237,11 +277,10 @@ func StartReplicaSet(tb testing.TB, o Opts) *ReplicaSet {
 	if n == 0 {
 		n = 1
 	}
-	ports := freePorts(tb, n)
 	rs := &ReplicaSet{tb: tb}
 	var addrs []string
 	for i := 0; i < n; i++ {
-		c := run(tb, o, "rs", ports[i], serverArgs(o, "mongod", ports[i], "--replSet", "rs0")...)
+		c := run(tb, o, "rs", func(p int) []string { return serverArgs(o, "mongod", p, "--replSet", "rs0") })
 		rs.members = append(rs.members, c)
 		addrs = append(addrs, c.addr)
 	}
@@ -251,7 +290,7 @@ func StartReplicaSet(tb testing.TB, o Opts) *ReplicaSet {
 		createUsers(tb, o, first)
 	}
 	rs.admin = connect(tb, o, "mongodb://"+strings.Join(addrs, ",")+"/?replicaSet=rs0", rootCred(o))
-	waitFor(tb, "all members to join", 120*time.Second, func() bool {
+	waitFor(tb, "all members to join", 120*time.Second, func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		var st struct {
@@ -259,15 +298,18 @@ func StartReplicaSet(tb testing.TB, o Opts) *ReplicaSet {
 				State int32 `bson:"state"`
 			} `bson:"members"`
 		}
-		if rs.admin.Database("admin").RunCommand(ctx, bson.D{{Key: "replSetGetStatus", Value: 1}}).Decode(&st) != nil || len(st.Members) != n {
-			return false
+		if err := rs.admin.Database("admin").RunCommand(ctx, bson.D{{Key: "replSetGetStatus", Value: 1}}).Decode(&st); err != nil {
+			return err
+		}
+		if len(st.Members) != n {
+			return errors.New("not all members listed")
 		}
 		for _, m := range st.Members {
 			if m.State != 1 && m.State != 2 {
-				return false
+				return fmt.Errorf("member in state %d", m.State)
 			}
 		}
-		return true
+		return nil
 	})
 	return rs
 }
@@ -327,17 +369,29 @@ func StartShardedOneMongos(tb testing.TB, o Opts) *Sharded {
 	if o.Auth != nil {
 		tb.Fatal("mongofx: Auth is not supported for the sharded topology")
 	}
-	p := freePorts(tb, 3)
-	cfg := run(tb, o, "cfg", p[0], serverArgs(o, "mongod", p[0], "--configsvr", "--replSet", "cfg")...)
-	shard := run(tb, o, "shard", p[1], serverArgs(o, "mongod", p[1], "--shardsvr", "--replSet", "shard0")...)
+	cfg := run(tb, o, "cfg", func(p int) []string { return serverArgs(o, "mongod", p, "--configsvr", "--replSet", "cfg") })
+	shard := run(tb, o, "shard", func(p int) []string { return serverArgs(o, "mongod", p, "--shardsvr", "--replSet", "shard0") })
 	initReplSet(tb, o, "cfg", []string{cfg.addr})
 	initReplSet(tb, o, "shard0", []string{shard.addr})
-	mongos := run(tb, o, "mongos", p[2], serverArgs(o, "mongos", p[2], "--configdb", "cfg/"+cfg.addr)...)
+	mongos := run(tb, o, "mongos", func(p int) []string { return serverArgs(o, "mongos", p, "--configdb", "cfg/"+cfg.addr) })
 	admin := connect(tb, o, "mongodb://"+mongos.addr+"/", nil)
-	waitFor(tb, "mongos", 90*time.Second, func() bool { _, ok := try(admin, "admin", bson.D{{Key: "ping", Value: 1}}); return ok })
-	waitFor(tb, "addShard", 90*time.Second, func() bool {
-		_, ok := try(admin, "admin", bson.D{{Key: "addShard", Value: "shard0/" + shard.addr}})
-		return ok
+	waitFor(tb, "mongos", 90*time.Second, func() error { return pingErr(admin) })
+	waitFor(tb, "addShard", 120*time.Second, func() error {
+		// addShard can outlive the client timeout and still succeed, so a
+		// retry must treat an already-added shard as success.
+		_, err := tryT(admin, "admin", bson.D{{Key: "addShard", Value: "shard0/" + shard.addr}}, 30*time.Second)
+		if err == nil {
+			return nil
+		}
+		var ls struct {
+			Shards []struct{} `bson:"shards"`
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if admin.Database("admin").RunCommand(ctx, bson.D{{Key: "listShards", Value: 1}}).Decode(&ls) == nil && len(ls.Shards) >= 1 {
+			return nil
+		}
+		return err
 	})
 	return &Sharded{mongos: mongos.addr, admin: admin}
 }

@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -92,7 +93,7 @@ func Start(tb testing.TB, o Opts) *Proc {
 		tb.Fatal(err)
 	}
 	p.cmd = exec.Command(o.Binary, o.Args...)
-	p.cmd.Env = append(append(os.Environ(), o.Env...), "CORRALTEST_HOLD_DIR="+p.holdDir)
+	p.cmd.Env = append(append(cleanEnv(), o.Env...), "CORRALTEST_HOLD_DIR="+p.holdDir)
 	p.cmd.Stdout = p.out
 	p.cmd.Stderr = p.errc
 	if err := p.cmd.Start(); err != nil {
@@ -206,7 +207,24 @@ func (p *Proc) Metrics() (string, error) {
 // HoldDir returns the CORRALTEST_HOLD_DIR of the process.
 func (p *Proc) HoldDir() string { return p.holdDir }
 
-// specThree points keep the SPEC-003 file names held / release.
+// cleanEnv returns the inherited environment without CORRAL_* and CORRALTEST_*
+// variables, so a developer's shell cannot change the process under test.
+// Variables the test wants are passed explicitly in Opts.Env.
+func cleanEnv() []string {
+	var out []string
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "CORRAL_") || strings.HasPrefix(kv, "CORRALTEST_") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+// SPEC-003 hold points keep the SPEC-003 file names held / release.
+// The SPEC-003 hold points keep the plain held/release file names (ADR-0014).
+// cmd/corral has no exported constant for them yet, so the names are listed
+// here; keep in step with cmd/corral/testbuild_on.go.
 func holdNames(point string) (held, release string) {
 	if point == "logger" || point == "checkconfig" {
 		return "held", "release"

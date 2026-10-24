@@ -79,6 +79,17 @@ func ServerTLS(certPEM, keyPEM, clientCAPEM []byte) (*tls.Config, error) {
 	return cfg, nil
 }
 
+// Concurrency precondition for Peek, WatchClose and WatchReadable: nothing may
+// read from the connection while a watcher runs. Peek never consumes data, but
+// a concurrent reader would race with it for the same bytes and could make a
+// close or data event be missed or misreported. Stop the watcher (close its
+// stop channel) before reading.
+//
+// Off Linux, Peek always returns PeekNone: the watchers never report anything.
+// Callers (the upstream connection pool) must then fall back to a zero-deadline
+// read at checkout and treat returned data or an error as a fault, discarding
+// the connection (ADR-0018).
+//
 // PeekState is the result of a non-consuming look at a socket.
 type PeekState int
 
