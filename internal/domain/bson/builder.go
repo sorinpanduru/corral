@@ -101,7 +101,7 @@ func (b *Builder) start(t Type, k string) {
 
 func (b *Builder) end() {
 	if len(b.starts) == 0 {
-		return
+		panic("bson: End without a matching Start")
 	}
 	s := b.starts[len(b.starts)-1]
 	b.starts = b.starts[:len(b.starts)-1]
@@ -122,8 +122,11 @@ func (b *Builder) StartArray(k string) { b.start(TypeArray, k) }
 func (b *Builder) EndArray() { b.end() }
 
 // Bytes returns the finished document as a new slice. The builder stays
-// usable.
+// usable. It panics if a container is still open.
 func (b *Builder) Bytes() []byte {
+	if len(b.starts) != 0 {
+		panic("bson: Bytes with open containers")
+	}
 	out := make([]byte, len(b.buf)+1)
 	copy(out, b.buf)
 	binary.LittleEndian.PutUint32(out, uint32(len(out)))

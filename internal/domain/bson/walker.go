@@ -28,8 +28,12 @@ type Capture struct {
 type Value struct {
 	Type    Type
 	TooLong bool // value exceeded MaxCaptureBytes; no data is kept
-	sub     byte
-	data    []byte
+	// Count is the number of times the key occurs at the top level, for
+	// captures whose path is a single key (0 otherwise). The value is the
+	// first occurrence (FR-60).
+	Count int
+	sub   byte
+	data  []byte
 }
 
 // Int32 returns the value if it is an int32.
@@ -114,6 +118,7 @@ type frame struct {
 	alive  uint64 // captures whose path matches down to this frame
 	fk     uint64 // first-key captures targeting this frame
 	first  bool   // no key seen yet
+	seen   uint64 // captures whose key already matched at this level (first wins)
 }
 
 // Walker is a push parser: Write feeds chunks, Close ends the stream. It
@@ -142,17 +147,20 @@ type Walker struct {
 	keyLen  int  // bytes seen
 	pendLen bool // pending sLen belongs to a nested container
 
-	caps     []Capture
-	found    []bool
-	vals     []Value
-	done     uint64
-	capMask  uint64 // captures recording the current element's payload
-	pendLive uint64
-	pendFK   uint64
-	cbuf     [MaxCaptureBytes]byte
-	cn       int
-	cTooLong bool
-	cSub     byte
+	caps        []Capture
+	found       []bool
+	vals        []Value
+	counts      []int
+	topFirst    [MaxCaptureBytes]byte // first top-level key, bounded
+	topFirstLen int
+	topRepeats  int
+	capMask     uint64 // captures recording the current element's payload
+	pendLive    uint64
+	pendFK      uint64
+	cbuf        [MaxCaptureBytes]byte
+	cn          int
+	cTooLong    bool
+	cSub        byte
 }
 
 // NewWalker returns a Walker recording captures (may be nil).
@@ -165,6 +173,7 @@ func NewWalker(captures []Capture) *Walker {
 		w.caps = captures[:n]
 		w.found = make([]bool, n)
 		w.vals = make([]Value, n)
+		w.counts = make([]int, n)
 	}
 	return w
 }
@@ -177,8 +186,17 @@ func (w *Walker) Captured(i int) (Value, bool) {
 	if i < 0 || i >= len(w.found) || !w.found[i] {
 		return Value{}, false
 	}
-	return w.vals[i], true
+	v := w.vals[i]
+	if len(w.caps[i].Path) == 1 {
+		v.Count = w.counts[i]
+	}
+	return v, true
 }
+
+// TopLevelKeyEqualsFirst returns how many later top-level keys equal the
+// first top-level key (a repeated command name). Keys are compared up to
+// MaxCaptureBytes bytes plus their full length.
+func (w *Walker) TopLevelKeyEqualsFirst() int { return w.topRepeats }
 
 func (w *Walker) fail(err error) error {
 	w.err = err
@@ -464,6 +482,14 @@ func (w *Walker) onCWSLen(v int32) error {
 func (w *Walker) onKey() error {
 	f := w.top()
 	d := len(w.stack) - 1
+	if d == 0 {
+		if f.first {
+			w.topFirstLen = w.keyLen
+			copy(w.topFirst[:], w.key[:w.keyN])
+		} else if w.keyLen == w.topFirstLen && string(w.key[:w.keyN]) == string(w.topFirst[:min(w.topFirstLen, MaxCaptureBytes)]) {
+			w.topRepeats++
+		}
+	}
 	if f.first {
 		f.first = false
 		for m := f.fk; m != 0; m &= m - 1 {
@@ -481,7 +507,7 @@ func (w *Walker) onKey() error {
 	w.capMask, w.pendLive, w.pendFK = 0, 0, 0
 	w.cn, w.cTooLong = 0, false
 	container := w.curType == TypeDocument || w.curType == TypeArray
-	for m := f.alive &^ w.done; m != 0; m &= m - 1 {
+	for m := f.alive; m != 0; m &= m - 1 {
 		i := trailingZeros(m)
 		path := w.caps[i].Path
 		if d >= len(path) || w.keyLen != len(path[d]) || w.keyLen > MaxCaptureBytes ||
@@ -489,15 +515,26 @@ func (w *Walker) onKey() error {
 			continue
 		}
 		bit := uint64(1) << uint(i)
+		if f.seen&bit != 0 {
+			// Duplicate key at this level: the first occurrence wins, for
+			// intermediate and terminal keys alike (ADR-0017). Top-level
+			// single-key captures still count it (FR-60).
+			if d == 0 && len(path) == 1 {
+				w.counts[i]++
+			}
+			continue
+		}
+		f.seen |= bit
 		if len(path) > d+1 {
 			if container {
 				w.pendLive |= bit
 			}
 			continue
 		}
-		// Terminal match. Duplicate keys: the first occurrence wins, because
-		// done is set here and later matches are skipped (ADR-0017).
-		w.done |= bit
+		// Terminal match (first occurrence at this level).
+		if d == 0 && len(path) == 1 {
+			w.counts[i]++
+		}
 		switch w.caps[i].Mode {
 		case CapturePresence:
 			w.found[i], w.vals[i] = true, Value{Type: w.curType}

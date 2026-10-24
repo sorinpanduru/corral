@@ -51,7 +51,8 @@ func (c *Clock) Now() time.Time {
 	return c.now
 }
 
-// AfterFunc registers f to run during the Advance that makes d elapse. A
+// AfterFunc registers f (callbacks run synchronously on the goroutine that
+// calls Advance, unlike the real clock's own goroutine) to run during the Advance that makes d elapse. A
 // zero or negative d is due at the next Advance (even Advance(0)).
 func (c *Clock) AfterFunc(d time.Duration, f func()) clock.Timer {
 	c.mu.Lock()

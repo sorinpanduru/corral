@@ -141,7 +141,8 @@ func elementAt(doc []byte, p, limit int) (Element, int, error) {
 	return Element{key: doc[ks:ke], typ: t, val: doc[vs : vs+size : vs+size]}, vs + size, nil
 }
 
-// payloadSize returns the payload length of an element of type t at the start
+// payloadSize returns (all bounds are written as l > len(b)-k so nothing can
+// wrap on 32-bit platforms) the payload length of an element of type t at the start
 // of b (b runs to the document terminator).
 func payloadSize(t Type, b []byte) (int, error) {
 	if n, ok := fixedSize(t); ok {
@@ -159,11 +160,11 @@ func payloadSize(t Type, b []byte) (int, error) {
 	switch t {
 	case TypeString, TypeJavaScript, TypeSymbol, TypeDBPointer:
 		l, ok := i32()
-		if !ok || l < 1 || 4+l > len(b) || b[3+l] != 0 {
+		if !ok || l < 1 || l > len(b)-4 || b[3+l] != 0 {
 			return 0, ErrMalformed
 		}
 		if t == TypeDBPointer {
-			if 4+l+12 > len(b) {
+			if l > len(b)-16 {
 				return 0, ErrMalformed
 			}
 			return 4 + l + 12, nil
@@ -177,7 +178,7 @@ func payloadSize(t Type, b []byte) (int, error) {
 		return l, nil
 	case TypeBinary:
 		l, ok := i32()
-		if !ok || l < 0 || 5+l > len(b) {
+		if !ok || l < 0 || l > len(b)-5 {
 			return 0, ErrMalformed
 		}
 		return 5 + l, nil
