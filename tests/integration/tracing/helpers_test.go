@@ -86,7 +86,7 @@ func restoreGlobals(t *testing.T) {
 		otel.SetErrorHandler(oldH)
 		otel.SetTracerProvider(oldTP)
 		otel.SetLogger(logr.Discard())
-		grpclog.SetLoggerV2(grpclog.NewLoggerV2(io.Discard, io.Discard, io.Discard))
+		grpcLog.set(grpclog.NewLoggerV2(io.Discard, io.Discard, io.Discard))
 	})
 }
 
@@ -179,7 +179,12 @@ func boot(t *testing.T, o opts) *harness {
 		hd = logging.WithTraceCorrelation(hd)
 	}
 	factory := logging.NewFactory(hd)
-	logbridge.Install(factory, lv, h.clk.Now)
+	// Same wiring as logbridge.Install, minus grpclog.SetLoggerV2 (see main_test.go).
+	otel.SetErrorHandler(logbridge.NewOTelErrorHandler(factory, h.clk.Now))
+	otel.SetLogger(logr.New(logbridge.NewOTelLogSink(factory, h.clk.Now)))
+	grpcLog.set(logbridge.NewGRPCLogger(factory, lv, h.clk.Now))
+	slog.SetDefault(slog.New(logbridge.NewSlogDefaultHandler(factory, lv, h.clk.Now)))
+	log.SetOutput(logbridge.NewStdLogWriter(factory, lv, h.clk.Now))
 
 	lg, err := factory.Logger(logging.Tracing)
 	if err != nil {
