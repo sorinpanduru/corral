@@ -1,3 +1,3 @@
-module example.test/fixture
+module fixture
 
 go 1.26

@@ -5,7 +5,7 @@ import (
 	"context"
 	"fmt"
 
-	"example.test/fixture/internal/domain/helper"
+	"fixture/internal/domain/helper"
 )
 
 // Describe is synthetic.

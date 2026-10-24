@@ -5,7 +5,7 @@ package bad
 import (
 	"log/slog"
 
-	"example.test/fixture/internal/infra/thing"
+	"fixture/internal/infra/thing"
 )
 
 // Log is synthetic.

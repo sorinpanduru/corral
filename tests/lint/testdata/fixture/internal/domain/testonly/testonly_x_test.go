@@ -4,7 +4,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"example.test/fixture/internal/infra/thing"
+	"fixture/internal/infra/thing"
 )
 
 func TestXExempt(t *testing.T) { slog.Info(thing.Name) }
