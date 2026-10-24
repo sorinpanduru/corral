@@ -71,6 +71,14 @@ func FuzzLoad(f *testing.F) {
 			t.Fatal("two loads of identical inputs differ")
 		}
 
+		// --check-config changes the mode only: same errors, same result.
+		cc := configload.Load(reg(t), configload.Inputs{Args: append(append([]string{}, args...), "--check-config"), Env: env, ReadFile: mk().Read})
+		if out1.Mode == loader.ModeRun && cc.Mode == loader.ModeCheckConfig {
+			if !reflect.DeepEqual(out1.Errors, cc.Errors) || !reflect.DeepEqual(out1.Result, cc.Result) {
+				t.Fatal("--check-config changed the errors or the loader result")
+			}
+		}
+
 		// Groups in order; groups 2 and 4 sorted by setting.
 		last := 0
 		var lastSetting string

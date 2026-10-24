@@ -20,7 +20,6 @@ import (
 	"github.com/sorinpanduru/corral/internal/app/settings"
 	"github.com/sorinpanduru/corral/internal/infra/config"
 	"github.com/sorinpanduru/corral/internal/infra/config/registry"
-	"github.com/sorinpanduru/corral/internal/infra/config/source"
 	"github.com/sorinpanduru/corral/internal/infra/config/types"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logging"
 	"github.com/sorinpanduru/corral/internal/testkit/memfs"
@@ -164,8 +163,6 @@ func pemFS(tb testing.TB) *memfs.FS {
 	fs.Put("/pem/client.key", k)
 	return fs
 }
-
-var _ = source.MaxPEMFileBytes
 
 // onlyTGroup is a registry that lacks the SPEC-001 tracing settings.
 func onlyTGroup(tb testing.TB) *registry.Registry {

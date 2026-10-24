@@ -11,15 +11,18 @@ import (
 	"github.com/sorinpanduru/corral/internal/testkit/markerscan"
 )
 
-// configRecord asserts out holds exactly one component=config record with the
-// wanted setting at error level, and that "component" appears exactly once on
-// its line (never a logger without component, never a doubled one).
+// configRecord asserts out holds exactly one component=config ERROR record with
+// the wanted setting, and that "component" appears exactly once on its line
+// (never a logger without component, never a doubled one). Other config
+// records (the FR-20 info record, FR-8 and FR-41 warnings) are not errors and
+// are not counted (SPEC-003: a successful configuration emits "configuration
+// loaded" through the config logger).
 func configRecord(t *testing.T, h *harness, wantSetting string) map[string]any {
 	t.Helper()
 	var found []map[string]any
 	for _, l := range h.out.lines() {
 		jr := jsonRecordsNoFail([]string{l})
-		if len(jr) == 1 && str(jr[0], "component") == string(logging.Config) {
+		if len(jr) == 1 && str(jr[0], "component") == string(logging.Config) && str(jr[0], "level") == "ERROR" {
 			found = append(found, jr[0])
 			if n := strings.Count(l, `"component"`); n != 1 {
 				t.Errorf("config record carries %d component keys, want exactly 1", n)
@@ -27,7 +30,7 @@ func configRecord(t *testing.T, h *harness, wantSetting string) map[string]any {
 		}
 	}
 	if len(found) != 1 {
-		t.Fatalf("component=config records = %d, want exactly 1 (error logged once)", len(found))
+		t.Fatalf("component=config ERROR records = %d, want exactly 1 (error logged once)", len(found))
 	}
 	r := found[0]
 	if str(r, "level") != "ERROR" {
@@ -71,8 +74,8 @@ func TestConfigErrorBootstrapLogger(t *testing.T) { // AC-21, FR-27
 				before: func(context.Context) { hooks.Add(1) },
 			})
 			code := h.wait()
-			if code == 0 {
-				t.Fatalf("exit code = 0, want non-zero")
+			if code != 2 {
+				t.Fatalf("exit code = %d, want 2 (FR-24: configuration error)", code)
 			}
 			configRecord(t, h, tc.setting)
 			if h.startedCalls() != 0 || hooks.Load() != 0 {
@@ -87,10 +90,13 @@ func TestConfigErrorBootstrapLogger(t *testing.T) { // AC-21, FR-27
 	}
 }
 
-// FR-27, ADR-0006 step 3: with tracing enabled, an invalid OTEL_* value is
-// logged once through Factory.Logger(logging.Config): the configured format is
-// honoured (text here), component=config appears exactly once, no value echo.
-func TestConfigErrorFactoryLoggerAfterHandlerBuilt(t *testing.T) { // AC-21, FR-27
+// SPEC-003 FR-19 / FR-29 (behaviour change, AC-5, AC-6): with tracing enabled,
+// an invalid OTEL_* value is a configuration error on the failure path. It is
+// logged once through the bootstrap logger, which is JSON even when
+// log.format=text is requested; component=config appears exactly once, the
+// setting is the variable name, and no value is echoed. (Before SPEC-003 this
+// record honoured the configured format.)
+func TestConfigErrorOTELBootstrapJSONEvenWithTextFormat(t *testing.T) { // AC-21, FR-27, SPEC-003 AC-5
 	m := marker(t, "otelmark")
 	sc := markerscan.New()
 	sc.AddMarker(t, m)
@@ -100,39 +106,31 @@ func TestConfigErrorFactoryLoggerAfterHandlerBuilt(t *testing.T) { // AC-21, FR-
 		env:    map[string]string{"OTEL_EXPORTER_OTLP_PROTOCOL": m},
 		before: func(context.Context) { hooks.Add(1) },
 	})
-	if code := h.wait(); code == 0 {
-		t.Fatalf("exit code = 0, want non-zero")
+	if code := h.wait(); code != 2 {
+		t.Fatalf("exit code = %d, want 2 (FR-24)", code)
 	}
 	if h.startedCalls() != 0 || hooks.Load() != 0 {
 		t.Errorf("later startup steps ran after an OTEL_* error")
 	}
-	// Text format: the line is not JSON but carries exactly one component=config
-	// and the offending variable name as the setting.
-	var cfg []string
+	r := configRecord(t, h, "OTEL_EXPORTER_OTLP_PROTOCOL") // JSON: parsed by jsonRecordsNoFail
+	if _, ok := r["error"]; !ok {
+		t.Errorf("record has no error class attribute")
+	}
 	for _, l := range h.out.lines() {
 		if strings.Contains(l, "component=config") {
-			cfg = append(cfg, l)
+			t.Errorf("a text-format config record was written; the failure path is JSON only")
 		}
-	}
-	if len(cfg) != 1 {
-		t.Fatalf("component=config lines = %d, want exactly 1; lines=%d", len(cfg), len(h.out.lines()))
-	}
-	if n := strings.Count(cfg[0], "component="); n != 1 {
-		t.Errorf("config line has %d component attributes, want 1", n)
-	}
-	if !strings.Contains(cfg[0], "setting=OTEL_EXPORTER_OTLP_PROTOCOL") {
-		t.Errorf("config line does not name the offending variable as setting")
 	}
 	sc.Add(markerscan.SourceStdout, h.out.bytes())
 	sc.AssertClean(t)
 
-	// The same text-format request in JSON (default format) is JSON.
+	// The same in the default format.
 	h2 := run(t, runOpts{
 		args: []string{"-tracing.enabled=true", "-admin.listen=" + reserveAddr(t)},
 		env:  map[string]string{"OTEL_TRACES_SAMPLER": "jaeger_remote"},
 	})
-	if code := h2.wait(); code == 0 {
-		t.Fatalf("exit code = 0, want non-zero")
+	if code := h2.wait(); code != 2 {
+		t.Fatalf("exit code = %d, want 2", code)
 	}
 	configRecord(t, h2, "OTEL_TRACES_SAMPLER")
 }
@@ -147,8 +145,12 @@ func TestInvalidOTELIgnoredWhenTracingOff(t *testing.T) { // AC-21, FR-27
 	if code := h.stop(); code != 0 {
 		t.Errorf("exit code = %d, want 0", code)
 	}
-	if n := len(byComponent(h.out.records(t), logging.Config)); n != 0 {
-		t.Errorf("config records = %d with tracing off, want 0", n)
+	// No config warning or error: with tracing off the OTEL_* values are not
+	// validated. (The FR-20 info record "configuration loaded" is expected.)
+	for _, r := range byComponent(h.out.records(t), logging.Config) {
+		if lv := str(r, "level"); lv == "WARN" || lv == "ERROR" {
+			t.Errorf("config %s record with tracing off", lv)
+		}
 	}
 }
 
@@ -182,8 +184,8 @@ func TestBindFailureEADDRINUSE(t *testing.T) { // AC-30, FR-35
 		args:   []string{"-admin.listen=" + addr},
 		before: func(context.Context) { hooks.Add(1) },
 	})
-	if code := h.wait(); code == 0 {
-		t.Fatalf("exit code = 0, want non-zero")
+	if code := h.wait(); code != 1 {
+		t.Fatalf("exit code = %d, want 1 (FR-24: bind failure stays exit 1)", code)
 	}
 	r := configRecord(t, h, "admin.listen")
 	out := string(h.out.bytes())

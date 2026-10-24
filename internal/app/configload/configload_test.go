@@ -1,14 +1,15 @@
 package configload_test
 
 import (
+	"errors"
 	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/sorinpanduru/corral/internal/app/configload"
 	"github.com/sorinpanduru/corral/internal/app/settings"
+	"github.com/sorinpanduru/corral/internal/infra/config"
 	"github.com/sorinpanduru/corral/internal/infra/config/loader"
 	"github.com/sorinpanduru/corral/internal/infra/config/source"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logging"
@@ -367,21 +368,43 @@ func TestLoad_IgnoresProcessGlobals(t *testing.T) {
 	requireNames(t, out)
 }
 
-// A registry without the tracing settings is a programming error, reported as
-// an error outcome and never a panic.
-func TestLoad_RegistryWithoutTracingSettings(t *testing.T) {
+// Programming errors (a registry without the tracing settings, a nil file
+// reader) are not configuration errors: they come back in Outcome.Err, a
+// non-config error, never in Outcome.Errors, so the runtime maps them to exit
+// 1 and never to the FR-11 records or exit 2.
+func TestLoad_ProgrammingErrorsAreSeparate(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
 			t.Fatalf("panicked: %v", r)
 		}
 	}()
-	r := reg(t)
-	_ = r
-	only := onlyTGroup(t)
-	out := configload.Load(only, configload.Inputs{})
-	if len(out.Errors) == 0 {
-		t.Fatal("no error for a registry without tracing.enabled and tracing.sample_ratio")
+	cases := map[string]configload.Outcome{
+		"registry without tracing settings": configload.Load(onlyTGroup(t), configload.Inputs{ReadFile: memfs.New().Read}),
+		"nil file reader":                   configload.Load(reg(t), configload.Inputs{Args: []string{"--tracing.enabled=true"}}),
+	}
+	for name, out := range cases {
+		t.Run(name, func(t *testing.T) {
+			if out.Err == nil {
+				t.Fatal("Outcome.Err is nil")
+			}
+			var ce *config.Error
+			if errors.As(out.Err, &ce) {
+				t.Errorf("a programming error is a *config.Error (setting %q)", ce.Setting)
+			}
+			if len(out.Errors) != 0 {
+				t.Errorf("programming error also reported as %d configuration errors", len(out.Errors))
+			}
+		})
+	}
+	// Ordinary outcomes, valid or not, have no programming error.
+	if out := run(t, []string{"--log.level=bad"}, nil, nil); out.Err != nil || len(out.Errors) != 1 {
+		t.Errorf("config error outcome: Err=%v, %d errors", out.Err, len(out.Errors))
+	}
+	if out := run(t, nil, nil, nil); out.Err != nil {
+		t.Errorf("valid outcome has Err=%v", out.Err)
+	}
+	// Help and version never need the reader.
+	if out := configload.Load(reg(t), configload.Inputs{Args: []string{"--help"}}); out.Err != nil || out.Mode != loader.ModeHelp {
+		t.Errorf("help with a nil reader: Err=%v mode=%v", out.Err, out.Mode)
 	}
 }
-
-var _ = time.Second

@@ -152,14 +152,17 @@ func TestAC30_AddressInUse(t *testing.T) {
 	if code := p.waitExit(); code == 0 {
 		t.Fatalf("exit code = 0, want non-zero")
 	}
+	// SPEC-003: a valid configuration also emits the FR-20 info record
+	// ("configuration loaded") through the config logger before the bind
+	// fails, so only error-level config records are counted here.
 	var cfg []map[string]any
 	for _, r := range p.records() {
-		if str(r, "component") == "config" {
+		if str(r, "component") == "config" && str(r, "level") == "ERROR" {
 			cfg = append(cfg, r)
 		}
 	}
 	if len(cfg) != 1 || str(cfg[0], "setting") != "admin.listen" {
-		t.Fatalf("want exactly one component=config record with setting=admin.listen, got %d", len(cfg))
+		t.Fatalf("want exactly one component=config ERROR record with setting=admin.listen, got %d", len(cfg))
 	}
 	if got := str(cfg[0], "corral.error.detail"); got != "EADDRINUSE" {
 		t.Errorf("corral.error.detail = %q, want EADDRINUSE", got)

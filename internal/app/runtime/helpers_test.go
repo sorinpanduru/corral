@@ -3,8 +3,9 @@ package runtime_test
 // Test helpers for the T18 runtime suite. Synthetic data only, loopback only.
 // API expected (plans/SPEC-001.md T18):
 //
-//	runtime.Run(ctx, args []string, env tracing.LookupEnv, stdout io.Writer, hooks Hooks) int
-//	runtime.Hooks{BeforeLastStep func(ctx context.Context); Started func(Handles)}
+//	runtime.Run(ctx, in Inputs, hooks Hooks) int   (SPEC-003 T12; was Run(ctx, args, env, stdout, hooks))
+//	runtime.Inputs{Args, Env []string; ReadFile; Stdout; HUP; Version; Registry; Now}
+//	runtime.Hooks{BeforeLastStep, BeforeLogger, BeforeCheckConfigExit func(ctx context.Context); Started func(Handles)}
 //	runtime.Handles{AdminAddr net.Addr; TracerProvider trace.TracerProvider; Gatherer prometheus.Gatherer}
 
 import (
@@ -18,12 +19,16 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	corralrt "github.com/sorinpanduru/corral/internal/app/runtime"
+	"github.com/sorinpanduru/corral/internal/infra/config/registry"
+	"github.com/sorinpanduru/corral/internal/infra/config/source"
+	"github.com/sorinpanduru/corral/internal/infra/osfile"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logging"
 )
 
@@ -173,6 +178,7 @@ type harness struct {
 	started      chan corralrt.Handles
 	hooks        corralrt.Hooks // the hooks given to Run (Started wrapped)
 	startedCalls func() int
+	hup          chan os.Signal // the SIGHUP channel given to Run
 }
 
 type runOpts struct {
@@ -182,6 +188,25 @@ type runOpts struct {
 	stopping       func(ctx context.Context)
 	cancelInBefore bool     // cancel the Run context inside BeforeLastStep
 	out            *syncBuf // optional, so hooks can read it before run returns
+
+	// SPEC-003 T12 inputs and hooks.
+	beforeLogger func(ctx context.Context)
+	beforeCheck  func(ctx context.Context)
+	readFile     source.ReadFile // nil: osfile.Read
+	version      string          // empty: "test"
+	registry     *registry.Registry
+	now          func() time.Time
+	hup          chan os.Signal // nil: a buffered channel is created
+}
+
+// envEntries turns a map into sorted KEY=VALUE entries (an environment snapshot).
+func envEntries(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k, v := range m {
+		out = append(out, k+"="+v)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func run(tb testing.TB, o runOpts) *harness {
@@ -208,6 +233,16 @@ func run(tb testing.TB, o runOpts) *harness {
 		tb: tb, cancel: cancel, done: make(chan int, 1),
 		out: o.out, started: make(chan corralrt.Handles, 1),
 	}
+	if o.hup == nil {
+		o.hup = make(chan os.Signal, 64)
+	}
+	h.hup = o.hup
+	if o.readFile == nil {
+		o.readFile = osfile.Read
+	}
+	if o.version == "" {
+		o.version = "test"
+	}
 	var mu sync.Mutex
 	calls := 0
 	h.startedCalls = func() int { mu.Lock(); defer mu.Unlock(); return calls }
@@ -220,7 +255,9 @@ func run(tb testing.TB, o runOpts) *harness {
 				cancel()
 			}
 		},
-		Stopping: o.stopping,
+		Stopping:              o.stopping,
+		BeforeLogger:          o.beforeLogger,
+		BeforeCheckConfigExit: o.beforeCheck,
 		Started: func(hd corralrt.Handles) {
 			mu.Lock()
 			calls++
@@ -231,8 +268,11 @@ func run(tb testing.TB, o runOpts) *harness {
 			}
 		},
 	}
-	env := envMap(o.env)
-	go func() { h.done <- corralrt.Run(ctx, o.args, env, h.out, hooks) }()
+	in := corralrt.Inputs{
+		Args: o.args, Env: envEntries(o.env), ReadFile: o.readFile, Stdout: h.out,
+		HUP: o.hup, Version: o.version, Registry: o.registry, Now: o.now,
+	}
+	go func() { h.done <- corralrt.Run(ctx, in, hooks) }()
 	tb.Cleanup(func() {
 		cancel()
 		select {
