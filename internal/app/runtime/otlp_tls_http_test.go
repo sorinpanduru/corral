@@ -19,6 +19,8 @@ import (
 )
 
 // t23Certs writes a synthetic self-signed certificate and key into t.TempDir().
+const t23PathMarker = "t23pathmark-Kd4Ws9"
+
 func t23Certs(t *testing.T) (cert, key string) {
 	t.Helper()
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -38,7 +40,12 @@ func t23Certs(t *testing.T) (cert, key string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir := t.TempDir()
+	// The directory name carries a marker so tests can prove paths are never
+	// logged (AC-40).
+	dir := filepath.Join(t.TempDir(), t23PathMarker)
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	cert, key = filepath.Join(dir, "ca.crt"), filepath.Join(dir, "client.k")
 	if err := os.WriteFile(cert, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
 		t.Fatal(err)

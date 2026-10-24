@@ -29,7 +29,10 @@ func TLSIgnoredSettings(cfg EnvConfig, env LookupEnv) []string {
 	return tlsNamesForHTTP(env)
 }
 
-func tlsNamesForHTTP(env LookupEnv) []string {
+// effectiveEndpointIsHTTP reports whether the effective traces endpoint
+// (_TRACES_ over general, trimmed, scheme case-insensitive) uses http://. When
+// true, FR-41 requires a no-TLS transport whatever the INSECURE variables say.
+func effectiveEndpointIsHTTP(env LookupEnv) bool {
 	val := func(name string) string {
 		v, _ := env(name)
 		return strings.TrimSpace(v)
@@ -38,13 +41,17 @@ func tlsNamesForHTTP(env LookupEnv) []string {
 	if ep == "" {
 		ep = val(otlpPrefix + "ENDPOINT")
 	}
-	if len(ep) < len("http://") || !strings.EqualFold(ep[:len("http://")], "http://") {
+	return len(ep) >= len("http://") && strings.EqualFold(ep[:len("http://")], "http://")
+}
+
+func tlsNamesForHTTP(env LookupEnv) []string {
+	if !effectiveEndpointIsHTTP(env) {
 		return nil
 	}
 	var names []string
 	for _, prefix := range []string{otlpPrefix, otlpTracesPrefix} {
 		for _, s := range tlsMaterialSuffixes {
-			if val(prefix+s) != "" {
+			if v, _ := env(prefix + s); strings.TrimSpace(v) != "" {
 				names = append(names, prefix+s)
 			}
 		}

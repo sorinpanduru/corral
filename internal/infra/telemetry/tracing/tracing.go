@@ -120,9 +120,9 @@ func Start(ctx context.Context, o Options) (*Tracing, error) {
 
 func newOTLP(ctx context.Context, p Protocol, env LookupEnv) (sdktrace.SpanExporter, error) {
 	// The exporters read OTEL_* from the process environment. For an http://
-	// endpoint with TLS material, explicit options override the TLS the SDK
+	// endpoint, explicit options override the TLS the SDK
 	// would build from that environment (Amendment 2: plaintext, FR-20).
-	plain := env != nil && len(tlsNamesForHTTP(env)) > 0
+	plain := env != nil && effectiveEndpointIsHTTP(env)
 	if p == ProtocolGRPC {
 		var opts []otlptracegrpc.Option
 		if plain {

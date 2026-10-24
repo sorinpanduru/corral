@@ -165,6 +165,7 @@ func TestT23A2_WarnShapeAndSettingNames(t *testing.T) {
 		{"traces-client", map[string]string{"TRACES_CLIENT_CERTIFICATE": cert, "TRACES_CLIENT_KEY": key}},
 		{"ca+client", map[string]string{"CERTIFICATE": cert, "CLIENT_CERTIFICATE": cert, "CLIENT_KEY": key}},
 		{"general-ca+traces-client", map[string]string{"CERTIFICATE": cert, "TRACES_CLIENT_CERTIFICATE": cert, "TRACES_CLIENT_KEY": key}},
+		{"both-ca", map[string]string{"CERTIFICATE": cert, "TRACES_CERTIFICATE": cert}}, // AC-40: one record, both names
 		{"all-six", map[string]string{
 			"CERTIFICATE": cert, "TRACES_CERTIFICATE": cert,
 			"CLIENT_CERTIFICATE": cert, "CLIENT_KEY": key,
@@ -198,17 +199,156 @@ func TestT23A2_WarnShapeAndSettingNames(t *testing.T) {
 				if w["setting"] != want {
 					t.Errorf("setting = %q, want %q", w["setting"], want)
 				}
+				// AC-40, FR-41: the record precedes the startup-complete record.
+				warnAt, doneAt := -1, -1
+				for i, rec := range r.recs {
+					if rec["component"] == "config" && rec["level"] == "WARN" {
+						warnAt = i
+					}
+					if rec["component"] == "lifecycle" && rec["msg"] == "corral startup complete" {
+						doneAt = i
+					}
+				}
+				if doneAt < 0 {
+					t.Errorf("no lifecycle startup-complete record found")
+				} else if warnAt > doneAt {
+					t.Errorf("FR-41 record (index %d) does not precede startup-complete (index %d)", warnAt, doneAt)
+				}
 				for k := range w {
 					if !allowed[k] {
 						t.Errorf("unexpected attribute %q on the WARN record", k)
 					}
 				}
 				for _, l := range r.lines {
-					if strings.Contains(l, cert) || strings.Contains(l, key) || strings.Contains(l, "BEGIN CERTIFICATE") || strings.Contains(l, "PRIVATE KEY") {
+					if strings.Contains(l, t23PathMarker) || strings.Contains(l, "-----BEGIN") || strings.Contains(l, cert) || strings.Contains(l, key) || strings.Contains(l, "BEGIN CERTIFICATE") || strings.Contains(l, "PRIVATE KEY") {
 						t.Errorf("log line contains a TLS file path or PEM content (FR-24)")
 					}
 				}
 			})
 		}
+	}
+}
+
+// AC-40, FR-41: OTEL_EXPORTER_OTLP_INSECURE=false (and the _TRACES_ variant)
+// with an http:// endpoint and NO TLS variable: spans still arrive in
+// plaintext and no FR-41 record is emitted.
+func TestT23A2_InsecureFalseHTTPNoTLSVars(t *testing.T) {
+	for _, proto := range []string{"http/protobuf", "grpc"} {
+		for _, iv := range []string{"INSECURE", "TRACES_INSECURE"} {
+			t.Run(proto+"/"+iv, func(t *testing.T) {
+				r := t23Run(t, proto, nil, func(hp string) map[string]string {
+					return map[string]string{t23Pre + "ENDPOINT": "http://" + hp, t23Pre + iv: "false"}
+				})
+				if len(r.col.Spans()) == 0 {
+					t.Errorf("plaintext collector received no span with INSECURE=false on an http:// endpoint")
+				}
+				if len(r.warns) != 0 {
+					t.Errorf("FR-41 records = %d, want 0 (no TLS variable set)", len(r.warns))
+				}
+			})
+		}
+	}
+}
+
+// AC-40 (and FR-41 last bullets): no FR-41 record with tracing off or with
+// OTEL_TRACES_EXPORTER=none, even with an http:// endpoint and valid TLS
+// variables.
+func TestT23A2_NoWarnWhenTracingOffOrExporterNone(t *testing.T) {
+	cert, _ := t23Certs(t)
+	for name, c := range map[string]struct {
+		args []string
+		env  map[string]string
+	}{
+		"tracing-disabled": {[]string{}, nil},
+		"tracing-off-flag": {[]string{"-tracing.enabled=false"}, nil},
+		"sdk-disabled":     {[]string{"-tracing.enabled=true"}, map[string]string{"OTEL_SDK_DISABLED": "true"}},
+		"exporter-none":    {[]string{"-tracing.enabled=true"}, map[string]string{"OTEL_TRACES_EXPORTER": "none"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := map[string]string{
+				t23Pre + "ENDPOINT":    "http://127.0.0.1:4318",
+				t23Pre + "CERTIFICATE": cert,
+			}
+			for k, v := range c.env {
+				env[k] = v
+			}
+			h := run(t, runOpts{args: append([]string{"-admin.listen=" + reserveAddr(t)}, c.args...), env: env})
+			h.waitStarted()
+			if code := h.stop(); code != 0 {
+				t.Errorf("exit code = %d, want 0", code)
+			}
+			for _, rec := range h.out.records(t) {
+				if rec["component"] == "config" && rec["level"] == "WARN" {
+					t.Errorf("unexpected FR-41 record: %v", rec["msg"])
+				}
+			}
+		})
+	}
+}
+
+// AC-40 precedence: general endpoint http://, _TRACES_ endpoint https:// to a
+// TLS collector, CA that the collector's certificate chains to: spans arrive
+// over TLS and no FR-41 record is emitted. Both protocols. The testkit
+// collector is plaintext only, so a local TLS collector is used.
+func TestT23A2_HTTPSTracesEndpointDeliversOverTLS(t *testing.T) {
+	for _, proto := range []string{"http/protobuf", "grpc"} {
+		for _, certVar := range []string{"CERTIFICATE", "TRACES_CERTIFICATE"} {
+			t.Run(proto+"/"+certVar, func(t *testing.T) {
+				tc := startTLSCollector(t)
+				hp := tc.HTTPAddr
+				if proto == "grpc" {
+					hp = tc.GRPCAddr
+				}
+				traces := "https://" + hp
+				if proto == "http/protobuf" {
+					traces += "/v1/traces"
+				}
+				h := run(t, runOpts{
+					args: []string{"-tracing.enabled=true", "-admin.listen=" + reserveAddr(t)},
+					env: map[string]string{
+						t23Pre + "PROTOCOL":        proto,
+						t23Pre + "ENDPOINT":        "http://127.0.0.1:1",
+						t23Pre + "TRACES_ENDPOINT": traces,
+						t23Pre + certVar:           tc.CAFile,
+					},
+				})
+				hd := h.waitStarted()
+				_, sp := hd.TracerProvider.Tracer("t23").Start(context.Background(), "t23-span")
+				sp.End()
+				if code := h.stop(); code != 0 {
+					t.Errorf("exit code = %d, want 0", code)
+				}
+				if tc.Spans() == 0 {
+					t.Errorf("TLS collector received no span")
+				}
+				for _, rec := range h.out.records(t) {
+					if rec["component"] == "config" && rec["level"] == "WARN" {
+						t.Errorf("unexpected FR-41 record with an https:// effective endpoint")
+					}
+				}
+			})
+		}
+	}
+}
+
+// AC-40 precedence, other direction: general https:// (unreachable), _TRACES_
+// http:// to the plaintext collector, CA set: plaintext delivery plus the record.
+func TestT23A2_TracesHTTPOverridesGeneralHTTPS(t *testing.T) {
+	cert, _ := t23Certs(t)
+	for _, proto := range []string{"http/protobuf", "grpc"} {
+		t.Run(proto, func(t *testing.T) {
+			r := t23Run(t, proto, nil, func(hp string) map[string]string {
+				u := "http://" + hp
+				if proto == "http/protobuf" {
+					u += "/v1/traces"
+				}
+				return map[string]string{
+					t23Pre + "ENDPOINT":        "https://127.0.0.1:1",
+					t23Pre + "TRACES_ENDPOINT": u,
+					t23Pre + "CERTIFICATE":     cert,
+				}
+			})
+			r.requirePlaintextAndOneWarn(t)
+		})
 	}
 }

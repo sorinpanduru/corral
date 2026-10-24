@@ -16,12 +16,17 @@ in that case, with one WARN and no config error.
 lookup: it returns the sorted names of the set TLS variables when the effective
 traces endpoint (_TRACES_ over general, scheme case-insensitive) is http://.
 Because the SDK reads the process environment directly and cannot be given a
-filtered one, `newOTLP` passes explicit options that override the env-derived
+filtered one, `newOTLP` passes, whenever the effective traces endpoint is http:// (whether
+or not TLS variables are set), explicit options that override the env-derived
 TLS (http: nil TLS config plus insecure; grpc: insecure transport credentials
 plus insecure), including against OTEL_EXPORTER_OTLP_INSECURE=false. The
 runtime logs the WARN (component=config, constant message, `setting` names
 only) before the lifecycle records. FR-27 validation in Resolve is unchanged
 and runs first.
+
+`newOTLP` decides from the injected LookupEnv while the SDK reads the process
+environment; production passes os.LookupEnv, so they agree. Only the WARN is
+conditional on TLS variables being set.
 
 ## Consequences
 

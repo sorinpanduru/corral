@@ -51,3 +51,27 @@ func TestTLSIgnoredSettings_NamesSortedCaseInsensitiveScheme(t *testing.T) {
 		}
 	}
 }
+
+func TestEffectiveEndpointIsHTTP(t *testing.T) {
+	const p = "OTEL_EXPORTER_OTLP_"
+	cases := []struct {
+		name string
+		env  map[string]string
+		want bool
+	}{
+		{"general-http", map[string]string{p + "ENDPOINT": "http://h:1"}, true},
+		{"upper", map[string]string{p + "ENDPOINT": " HTTP://h:1 "}, true},
+		{"traces-https-wins", map[string]string{p + "ENDPOINT": "http://h", p + "TRACES_ENDPOINT": "https://h"}, false},
+		{"traces-http-wins", map[string]string{p + "ENDPOINT": "https://h", p + "TRACES_ENDPOINT": "http://h"}, true},
+		{"blank-traces-falls-back", map[string]string{p + "ENDPOINT": "http://h", p + "TRACES_ENDPOINT": "  "}, true},
+		{"insecure-false-still-http", map[string]string{p + "ENDPOINT": "http://h", p + "INSECURE": "false"}, true},
+		{"none", map[string]string{}, false},
+		{"no-scheme", map[string]string{p + "ENDPOINT": "h:1"}, false},
+	}
+	for _, c := range cases {
+		env := func(k string) (string, bool) { v, ok := c.env[k]; return v, ok }
+		if got := effectiveEndpointIsHTTP(env); got != c.want {
+			t.Errorf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+}
