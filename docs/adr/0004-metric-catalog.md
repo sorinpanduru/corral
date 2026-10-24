@@ -40,6 +40,23 @@ label names and allowed label values, and a constructor that cannot create a
   FR-29 class enum and values of `error_detail` within the detail enum. The
   spec writer is amending AC-8's wording to use these names.
 
+- Amendment after T7 review (decided by Orchestrator under Owner's standing
+  instruction, 2026-10-24):
+  - Label names come from an allowlist exposed as
+    `metrics.AllowedLabelNames()`, currently exactly `command`,
+    `error_class` and `error_detail`. Feature specs extend it by amending
+    SPEC-001. The forbidden-name list stays as a second line of defence.
+  - Label values must match `^[a-z0-9_]+$`, except `error_detail`, whose
+    values must be in `errclass.Details()` (which contains upper-case
+    errno names such as `EADDRINUSE`).
+  - The factory caches the collectors it creates and refuses a foreign
+    collector already registered under the same name.
+  - Returned metric handles are narrow corral wrappers; they expose no
+    exemplar interfaces and not the underlying collector.
+  - The catalog is deep-copied so callers cannot mutate the factory's view.
+  - `/metrics` (T17) keeps `promhttp` OpenMetrics exemplars off, so
+    exemplars are never served.
+
 ## Consequences
 
 - Feature specs add metrics by editing `catalog.json` (and amending their

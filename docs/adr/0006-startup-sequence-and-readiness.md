@@ -20,13 +20,25 @@ including `OTEL_*` values when tracing is enabled, must stop startup (FR-27).
 
 Startup order in `internal/app/runtime`:
 
-1. Parse and validate logical settings. Errors go to a bootstrap JSON logger
-   on stdout with `component=config` (FR-27).
-2. Resolve whether tracing is enabled and validate all honoured/validated
-   `OTEL_*` variables (only if enabled).
-3. Build the configured slog handler; `slog.SetDefault`; install the
-   otel, grpclog and default-logger bridges (FR-28). grpclog is installed
-   before any gRPC code runs.
+0. Parse and validate logical settings. Errors are logged with
+   `config.LogError` via `logging.BootstrapLogger` (JSON on stdout,
+   `component=config`, FR-27). Stdlib only: no grpc, otel or other
+   third-party code runs in this step, so nothing can write to stderr.
+1. Build the configured slog handler and the logging factory from the
+   settings.
+2. `logbridge.Install(factory, level, now)`: otel error handler and logger,
+   grpclog, `slog.Default()` and std `log` bridges (FR-28), directly on the
+   configured handler and level. This runs before any grpc, otel, tracing or
+   admin-listener code, because grpc requires `grpclog.SetLoggerV2` before
+   any other grpc call and the otel/grpc defaults write to stderr until it
+   runs. No later handler or level switch is needed.
+3. Resolve whether tracing is enabled and validate all honoured/validated
+   `OTEL_*` variables (only if enabled; pure env parsing). Errors are logged
+   with `config.LogError` via `Factory.Logger(logging.Config)` (FR-27).
+
+Steps 0–3 decided by Orchestrator under Owner's standing instruction,
+2026-10-24.
+
 4. Emit the `lifecycle` *starting* record.
 5. Lint the embedded metric catalog; build the private Prometheus registry
    and register catalog metrics (including

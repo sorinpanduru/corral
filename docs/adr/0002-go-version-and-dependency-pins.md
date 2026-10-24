@@ -37,10 +37,14 @@ version set, and its exporters pull in gRPC and the OTLP protobuf module.
   required by that bump. This deviates from "versions chosen by OTel" for
   security reasons only. The bump is re-checked (and dropped if OTel's own
   selection reaches or exceeds it) when OTel is upgraded.
-- `github.com/prometheus/client_golang`: latest stable v1.x release available
-  when the dependency is first added (T7), with `collectors`, `promhttp` and
-  `testutil/promlint` packages. Record the exact version in this ADR when
-  added. No pre-releases.
+- `github.com/prometheus/client_golang` `v1.25.0` (added by T7), with
+  `collectors`, `promhttp` and `testutil/promlint` packages. No
+  pre-releases. It brings `github.com/prometheus/client_model` `v0.6.3` and
+  the transitive `github.com/prometheus/common` `v0.72.0`,
+  `github.com/prometheus/procfs` `v0.22.0`, `github.com/beorn7/perks`,
+  `github.com/munnerz/goautoneg`, and `github.com/kylelemons/godebug`
+  (test-only), at the versions client_golang v1.25.0 selects (recorded by
+  Orchestrator, 2026-10-24).
 - `golang.org/x/tools` `v0.52.0` (added by T4, for `go/packages` in the
   constant-message check, `internal/testkit/constmsg`); test-only usage. No
   non-test package outside `internal/testkit` may import it (enforced by
