@@ -1,8 +1,8 @@
 # SPEC-001: Observability conventions (logging, metrics, tracing)
 
-Status: approved (Owner, 2026-10-24); Amendment 1 approved (Owner, 2026-10-24)
+Status: approved (Owner, 2026-10-24); Amendment 1 approved (Owner, 2026-10-24); Amendment 2 approved (Owner, 2026-10-24)
 Owner: Sorin Panduru
-Last updated: 2026-10-24 (Amendment 1)
+Last updated: 2026-10-24 (Amendment 2)
 
 ## Goal
 
@@ -100,7 +100,8 @@ at the end of the list.
   Loggers are obtained only through a factory that requires a component from
   this set. Records that report an error carry an `error` attribute produced
   as described in FR-29. Records about a configuration setting carry a
-  `setting` attribute holding the setting or variable *name*, never its value.
+  `setting` attribute holding the setting or variable *name* (or, for the
+  FR-41 record, the list of names FR-41 defines), never its value.
   Log attribute keys and messages follow FR-39.
 - **FR-8:** When tracing is enabled and a record is emitted with a valid span
   context in its `context.Context`, the record carries `trace_id` and
@@ -240,11 +241,17 @@ at the end of the list.
     `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_KEY`,
     `OTEL_EXPORTER_OTLP_COMPRESSION`, `OTEL_EXPORTER_OTLP_INSECURE`, and their
     `_TRACES_` variants.
-    - These go to the Go OTLP exporters with standard SDK semantics.
+    - These go to the Go OTLP exporters with standard SDK semantics, except
+      that when the effective traces endpoint uses the `http://` scheme, the
+      exporter's effective transport uses no TLS: corral overrides any TLS
+      configuration the SDK derives from the certificate and key variables
+      and from `OTEL_EXPORTER_OTLP_INSECURE` /
+      `OTEL_EXPORTER_OTLP_TRACES_INSECURE` (FR-41).
     - To satisfy FR-27, corral first validates them when tracing is on:
       certificate and key paths must be readable and parse as PEM,
       compression must be `gzip` or `none`, and insecure must be `true` or
-      `false` (case-insensitive).
+      `false` (case-insensitive). This validation applies whatever the
+      endpoint scheme (FR-41).
     - File contents are never logged (FR-24).
   - Other `OTEL_*` variables are not validated by corral, and the SDK may still
     apply its own defaults. corral does not set explicit span limits. The OTel
@@ -608,6 +615,59 @@ at the end of the list.
     `revokePrivilegesFromRole`, `grantRolesToRole`, `revokeRolesFromRole`,
     `rolesInfo`, `authenticate`, `saslStart`, `saslContinue`, `getnonce`,
     `logout`).
+- **FR-41:** TLS settings with a plaintext (`http://`) OTLP endpoint. This
+  applies when tracing is on and an OTLP exporter is started (FR-20), for
+  both the `http/protobuf` and the `grpc` protocol.
+  - In FR-41, a variable is *set* when its value is non-empty after removing
+    leading and trailing whitespace (the same rule the SDK applies). An
+    endpoint variable that is not set is treated as absent.
+  - The *effective traces endpoint* is `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`
+    when set, otherwise `OTEL_EXPORTER_OTLP_ENDPOINT` when set. Its scheme is
+    compared after trimming leading and trailing whitespace, and
+    case-insensitively.
+  - The *TLS variables* are `OTEL_EXPORTER_OTLP_CERTIFICATE`,
+    `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_KEY`,
+    `OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE`,
+    `OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE` and
+    `OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY`.
+  - When the effective traces endpoint uses the `http://` scheme:
+    - the exporter's effective transport uses no TLS: no CA pool, no client
+      certificate and no TLS credentials. corral overrides any TLS
+      configuration the SDK derives from the TLS variables and from
+      `OTEL_EXPORTER_OTLP_INSECURE` / `OTEL_EXPORTER_OTLP_TRACES_INSECURE`
+      (including `false`);
+    - this is not a config error: startup continues normally and is not
+      fatal;
+    - FR-27 validation of the TLS variables still applies (FR-20): a set TLS
+      variable whose file is unreadable or not valid PEM is fatal at startup.
+      In that case startup fails with the FR-27 error and no FR-41 record is
+      emitted.
+  - If, in that case, at least one TLS variable is set and startup is not
+    stopped by FR-27, corral emits exactly one FR-41 record during startup,
+    subject to the configured log level (FR-6), before the `lifecycle`
+    startup-complete record:
+    - level warn, `component=config`;
+    - the fixed message
+      `OTLP TLS settings ignored because the traces endpoint uses http://`;
+    - a `setting` attribute holding the names of the TLS variables that are
+      set, sorted in ascending byte order and joined with `,` (no spaces);
+    - no other attributes than `time`, `level`, `msg`, `component` and
+      `setting`.
+
+    The record never contains the variable values. Those values are file
+    paths, and FR-7 and FR-27 allow only setting names, never values, in
+    configuration records. It never contains file contents (FR-24) or the
+    endpoint URL.
+  - If no TLS variable is set, no FR-41 record is emitted.
+  - When the effective traces endpoint does not use the `http://` scheme
+    (including `https://`), or neither endpoint variable is set (SDK default
+    endpoint), FR-20 applies unchanged and no FR-41 record is emitted.
+  - When tracing is off, or `OTEL_TRACES_EXPORTER=none`, no FR-41 record is
+    emitted.
+  - Out of scope for FR-41, and left to SDK semantics: TLS variables combined
+    with `OTEL_EXPORTER_OTLP_INSECURE=true` (or the `_TRACES_` variant) on an
+    `https://` or default endpoint, and TLS variables with a gRPC `unix://`
+    endpoint (see the Amendment 2 decisions-log row).
 
 (FR-32 is listed under Tracing, next to FR-22.)
 
@@ -677,6 +737,10 @@ declares it).
   an empty host in `admin.listen`, an unsupported `OTEL_TRACES_EXPORTER` or
   `OTEL_TRACES_SAMPLER`, and any invalid honoured or validated `OTEL_*` value
   when tracing is enabled.
+- **TLS variables set with an `http://` OTLP traces endpoint:** not a config
+  error. The connection is plaintext, the TLS material is not used, and one
+  warn record names the ignored variables (FR-41). Unreadable or non-PEM TLS
+  files are still fatal (FR-27).
 - **Admin listener cannot bind at startup:** startup fails (FR-35).
 - **OTLP collector unreachable or slow:** the export queue fills, and further
   spans are dropped and counted in `corral_tracing_spans_dropped_total`.
@@ -954,7 +1018,7 @@ attribute rules but are subject to FR-24.
     including when a registered readiness-check fake reports ready; the fake
     records that it was not consulted;
   - every response has `Content-Type: text/plain; charset=utf-8`.
-- **AC-33** (harness for AC-18 and AC-38): The marker-scan harness captures
+- **AC-33** (harness for AC-18, AC-38 and AC-40): The marker-scan harness captures
   stdout, stderr, `/metrics` output, `/readyz` bodies, and the span payloads a
   test collector receives (span names, attributes, events, status
   descriptions, resource attributes). Transport-level request headers received
@@ -1027,6 +1091,58 @@ attribute rules but are subject to FR-24.
 
   No marker, in any encoding the harness scans, appears in stdout, stderr,
   `/metrics`, `/readyz` bodies or exported span payloads.
+- **AC-40** (FR-20, FR-24, FR-27, FR-41): Integration of the tracing
+  bootstrap, with tracing on, `log.level=info`, a plaintext (non-TLS) test
+  collector reached through an `http://` endpoint, and synthetic test PEM
+  files (a generated test CA certificate, client certificate and client key)
+  stored under paths that contain a marker. The AC-33 harness scans stdout
+  and stderr.
+  - Run all 8 combinations (2 × 2 × 2) of:
+    - protocol `http/protobuf` and protocol `grpc`;
+    - variable form, where the TLS variables and the endpoint vary together:
+      both in the general form (`OTEL_EXPORTER_OTLP_*`), or both in the
+      `_TRACES_` form (`OTEL_EXPORTER_OTLP_TRACES_*`);
+    - TLS material as a CA certificate only, and as a client certificate plus
+      client key.
+  - In each combination:
+    - the bootstrap starts with no config error and does not exit;
+    - test spans arrive at the plaintext test collector;
+    - exactly one FR-41 record (level warn, `component=config`, the FR-41
+      message) is emitted, before the `lifecycle` startup-complete record
+      where the test runs the full startup sequence;
+    - its `setting` equals the expected sorted, comma-joined names (for
+      example `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE,OTEL_EXPORTER_OTLP_CLIENT_KEY`);
+    - the path marker, in any encoding the harness scans, and the text
+      `-----BEGIN` appear nowhere in stdout or stderr.
+  - Endpoint precedence:
+    - with `OTEL_EXPORTER_OTLP_ENDPOINT` set to an unreachable `https://`
+      endpoint, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` set to the plaintext
+      collector's `http://` endpoint, and a CA certificate set, spans arrive at
+      the plaintext collector and the FR-41 record is emitted;
+    - with `OTEL_EXPORTER_OTLP_ENDPOINT` set to an `http://` endpoint,
+      `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` set to a TLS test collector's
+      `https://` endpoint, and a CA certificate that the collector's
+      certificate chains to, spans arrive over TLS at that collector and no
+      FR-41 record is emitted. This is checked for both protocols.
+  - With both `OTEL_EXPORTER_OTLP_CERTIFICATE` and
+    `OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE` set and an `http://` endpoint,
+    exactly one FR-41 record is emitted, and its `setting` lists both names.
+  - An endpoint scheme written `HTTP://` behaves like `http://`.
+  - With `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` set to whitespace only and
+    `OTEL_EXPORTER_OTLP_ENDPOINT` set to the plaintext collector's `http://`
+    endpoint, with a CA certificate set, spans arrive at the plaintext
+    collector and the FR-41 record is emitted.
+  - With an `http://` endpoint, a CA certificate set and
+    `OTEL_EXPORTER_OTLP_INSECURE=false`, the connection is still plaintext and
+    spans arrive.
+  - With an `http://` endpoint and no TLS variable set, spans arrive and no
+    FR-41 record is emitted.
+  - Unit: with an `http://` endpoint and tracing on, a non-PEM file in each of
+    the six TLS variables is rejected under FR-27, with `setting` naming that
+    variable and no value echoed, and no FR-41 record is emitted. With
+    tracing off, or with `OTEL_TRACES_EXPORTER=none`, an `http://` endpoint
+    with valid TLS variables produces no FR-41 record. With no endpoint
+    variable set and a valid CA certificate set, no FR-41 record is emitted.
 
 ### Part B: convention checks every feature spec inherits, re-runs and extends
 
@@ -1118,7 +1234,12 @@ They are not part of SPEC-001's acceptance gate.
 
 - FR-6: format and level are read only once at startup.
 - FR-20: `OTEL_EXPORTER_OTLP_TIMEOUT`, `_INSECURE` and the client certificate
-  and key variables are passed to the exporter configuration.
+  and key variables are passed to the exporter configuration, except that
+  when the effective traces endpoint uses `http://`, the exporter's effective
+  transport uses no TLS: corral overrides any TLS configuration the SDK
+  derives from the certificate and key variables and from
+  `OTEL_EXPORTER_OTLP_INSECURE` / `OTEL_EXPORTER_OTLP_TRACES_INSECURE`
+  (FR-41).
 - FR-24: TLS private key material, certificate file contents and the session
   `uid` never reach any logger, attribute or response (no code path passes
   them to one).
@@ -1177,3 +1298,4 @@ None.
 | 2026-10-24 | Exemplars are not used in v1 (OD-4). | Owner decision. |
 | 2026-10-24 | Auth-success records are logged at debug only, the same as handshake and hello records (OD-5). | Owner decision. |
 | 2026-10-24 | Amendment 1: (1) metric label names for errors are `error_class` and `error_detail` (snake_case per FR-10); the span/log attribute stays `corral.error.detail` (FR-11, FR-29, AC-8). (2) Component `thirdparty` added to the FR-7 set; Go standard `log` package records and third-party `slog.Default()` calls are routed with component `thirdparty` and a fixed constant message, never the third-party text (FR-7, FR-28, FR-39, AC-5, AC-26). (3) `/readyz` adds reasons `unknown` (503, a check reported a reason outside the defined set) and `shutting_down` (503, from the start of graceful shutdown); bodies are `<reason>\n` / `ok\n` with `Content-Type: text/plain; charset=utf-8`; before startup completes it returns 503 `starting` without consulting registered checks (FR-18, AC-13, AC-31). (4) `thirdparty` records keep the source's level (std `log` records are info) and are rate-limited per source (std `log` bridge, `slog.Default()` bridge) and level, at most 1 per 30s with `suppressed_count` (FR-28, AC-26). (5) Graceful shutdown starts when corral emits the `lifecycle` shutting-down record; `/readyz` returns 503 `shutting_down` from then (FR-18, AC-31). (6) Feature specs add readiness reasons by amending this spec, as for FR-12 and FR-40 (FR-18). Points 4 to 6 close gaps found while drafting and were relayed by the Orchestrator. | Amendment 1, 2026-10-24, requested by the Orchestrator under the Owner's standing instruction (2026-10-24). Drafted in `specs/drafts/` by the spec-writer, which may not edit approved specs. Approved and promoted to `specs/` by the Owner, 2026-10-24. |
+| 2026-10-24 | Amendment 2: when the effective OTLP traces endpoint (`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, else `OTEL_EXPORTER_OTLP_ENDPOINT`) uses `http://`, the exporter's effective transport uses no TLS for both `http/protobuf` and `grpc`: corral overrides any TLS configuration the SDK derives from the certificate, client-certificate and client-key variables (general and `_TRACES_`) and from `OTEL_EXPORTER_OTLP_INSECURE` / `_TRACES_INSECURE`. Startup continues normally (not a config error, not fatal), and exactly one FR-41 warn record (subject to FR-6) is emitted with `component=config`, a fixed constant message, and `setting` listing the names of the ignored variables. Variable values (file paths) are not logged, because FR-7/FR-27 allow only names in configuration records; file contents stay banned (FR-24). FR-27 PEM/readability validation still applies; when it fails, startup fails and no FR-41 record is emitted. "Set" means non-empty after trimming whitespace, as in the SDK. `https://` and no-endpoint defaults are unchanged (FR-7, FR-20, FR-41, AC-33, AC-40, Verified by review). Deliberately out of scope and left SDK-defined: TLS variables with `INSECURE=true` on an `https://` or default endpoint, and TLS variables with a gRPC `unix://` endpoint. Protocol behaviour there is known to diverge, and any startup failure there is reported through the existing startup error rules (FR-27, FR-29); no new behaviour is added. The Owner declined two further proposals for now, and they are not added: a warning when auth headers are sent over a plaintext endpoint, and a wider FR-30 resource-attribute ban list. | Owner decision, 2026-10-24, answering an escalated ambiguity: Go OTel SDK v1.47 behaves inconsistently with TLS settings and an `http://` endpoint (otlptracehttp refuses to start; otlptracegrpc silently uses TLS). Drafted in `specs/drafts/` by the spec-writer; approved and promoted to `specs/` by the Owner, 2026-10-24. |
