@@ -18,7 +18,7 @@ Requires Go (see `go.mod`).
 
 - `make build` builds `bin/corral`.
 - `make test` runs `go vet` and the unit and integration tests.
-- `make test-functional` runs the binary-level tests (builds first); available once the functional suite lands (T18).
+- `make test-functional` runs the binary-level tests (builds first).
 
 ## Running
 
@@ -29,6 +29,8 @@ make build
 
 `SIGINT` or `SIGTERM` triggers a graceful shutdown. See the operations guide
 below for settings and exit codes.
+
+The admin listener has no authentication or TLS; read Security and operational warnings before binding a non-loopback address.
 
 ## Documentation
 

@@ -15,6 +15,8 @@ make build
 Send `SIGINT` or `SIGTERM` for a graceful shutdown (see "Startup and
 shutdown").
 
+The admin listener has no authentication or TLS; read Security and operational warnings before binding a non-loopback address.
+
 ## Startup and shutdown
 
 Startup order:
