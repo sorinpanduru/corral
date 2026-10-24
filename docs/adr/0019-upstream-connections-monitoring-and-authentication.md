@@ -78,10 +78,13 @@ client.
   stepping, and returns `scram.ErrIterations` when the count is out of
   range:
   - below 4096 (RFC 7677 minimum);
-  - **above an upper bound** (constant `scram.MaxIterations`), so that a malicious or misconfigured upstream
-    cannot make corral run an unbounded PBKDF2. The implementer states
-    the bound and its reason here when T6 lands: "The upper bound is
-    <N> iterations, because <reason>." (placeholder).
+  - **above an upper bound** (the unexported constant `maxIterations` in
+    `internal/infra/upstreamconn/scram`), so that a malicious or
+    misconfigured upstream cannot make corral run an unbounded PBKDF2. The
+    upper bound is 1,000,000 iterations, because that is far above the
+    MongoDB default of 15,000 for SCRAM-SHA-256 and above any realistic
+    deployment, while still bounding the CPU a hostile or misconfigured
+    upstream can force per authentication.
 - Conversation on the wire (in `upstreamconn`): `saslStart` (mechanism
   `SCRAM-SHA-256`, `options: {skipEmptyExchange: true}`), then
   `saslContinue` until `done`.
