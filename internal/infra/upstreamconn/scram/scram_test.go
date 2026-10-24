@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	xscram "github.com/xdg-go/scram"
+	"github.com/xdg-go/stringprep"
 
 	"github.com/sorinpanduru/corral/internal/infra/upstreamconn/scram"
 )
@@ -36,7 +37,14 @@ func newCreds(t testing.TB, name, password string, iters int) creds {
 // password, as MongoDB does.
 func (c creds) server(t testing.TB) *xscram.Server {
 	t.Helper()
-	lc, err := xscram.SHA256.NewClient(c.name, c.password, "")
+	// Driver semantics (MongoDB): only the password is SASLprepped; the
+	// username is used exactly as given. So the stored credentials are derived
+	// from the prepped password with an unprepped client.
+	prepped, err := stringprep.SASLprep.Prepare(c.password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lc, err := xscram.SHA256.NewClientUnprepped(c.name, prepped, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -466,5 +474,79 @@ func TestMisuse_NoPanic(t *testing.T) {
 	}
 	if _, _, err := conv.Step([]byte("v=AAAA")); err == nil || !isSentinel(err) {
 		t.Fatalf("Step after done: %v", err)
+	}
+}
+
+// Driver semantics (FR-22): the username is NOT SASLprepped. A name with a
+// no-break space or a soft hyphen (which SASLprep would map to a space or to
+// nothing) authenticates exactly as given.
+func TestUsernameIsNotPrepped_FR22(t *testing.T) {
+	for _, name := range []string{"a\u00a0b", "soft\u00adhyphen", "\u00a0lead", "trail\u00ad", "ctl\x07name", "\u2003em-space"} {
+		t.Run(fmt.Sprintf("%q", name), func(t *testing.T) {
+			c := newCreds(t, name, "synthetic-pass-1", 4096)
+			cl, err := scram.NewClient([]byte(name), []byte(c.password))
+			if err != nil {
+				t.Fatalf("NewClient refused a username that must be used as given: %v", err)
+			}
+			if done, err := run(t, cl.NewConversation(), c.server(t)); err != nil || !done {
+				t.Fatalf("done=%v err=%v", done, err)
+			}
+		})
+	}
+	// The prepped spelling is a different user: the server (exact lookup)
+	// rejects it, proving the client did not alter the name.
+	c := newCreds(t, "a\u00a0b", "synthetic-pass-1", 4096)
+	cl, _ := scram.NewClient([]byte("a b"), []byte(c.password))
+	if _, err := run(t, cl.NewConversation(), c.server(t)); err == nil {
+		t.Fatal("a username equal to the prepped form authenticated as the unprepped one")
+	}
+}
+
+// The password is prepped: NBSP maps to a space, a soft hyphen to nothing.
+func TestPasswordIsPrepped_FR22(t *testing.T) {
+	for in, stored := range map[string]string{
+		"pass\u00a0word":   "pass word",
+		"pass\u00adword":   "password",
+		"\u2003lead\u00a0": " lead ",
+	} {
+		c := newCreds(t, "svc-user", stored, 4096)
+		cl, err := scram.NewClient([]byte(c.name), []byte(in))
+		if err != nil {
+			t.Fatalf("%q: %v", in, err)
+		}
+		if done, err := run(t, cl.NewConversation(), c.server(t)); err != nil || !done {
+			t.Fatalf("%q: done=%v err=%v", in, done, err)
+		}
+	}
+}
+
+// Only the password can fail SASLprep now; a prohibited character in the
+// username is not an error.
+func TestSASLprepAppliesToPasswordOnly_FR22(t *testing.T) {
+	if _, err := scram.NewClient([]byte("user\x07name"), []byte("ok-pass")); err != nil {
+		t.Fatalf("username with a control character refused: %v", err)
+	}
+	if _, err := scram.NewClient([]byte("svc-user"), []byte("bad\x07pass")); err != scram.ErrSASLprep {
+		t.Fatalf("prohibited password character: %v, want ErrSASLprep", err)
+	}
+}
+
+// An upper cap on the server's iteration count: absurd values are refused
+// with ErrIterations, before any key derivation (so the test is instant). The
+// exact cap is the implementer's constant; these values are far above any
+// sensible one.
+func TestIterationsAboveCap_FR22(t *testing.T) {
+	for _, n := range []int{1_000_001, 100_000_000, 1 << 30, 2147483647} { // 1,000,001: just above the implementer's 1,000,000 cap
+		conv, nonce := started(t)
+		_, _, err := conv.Step([]byte(fmt.Sprintf("r=%ssrv,s=%s,i=%d", nonce, b64(16), n)))
+		if err != scram.ErrIterations {
+			t.Fatalf("iterations %d: got %v, want ErrIterations", n, err)
+		}
+	}
+	// A realistic count (MongoDB's default for SCRAM-SHA-256 is 15000) is fine.
+	c := newCreds(t, "svc-user", "synthetic-pass-1", 15000)
+	cl, _ := scram.NewClient([]byte(c.name), []byte(c.password))
+	if done, err := run(t, cl.NewConversation(), c.server(t)); err != nil || !done {
+		t.Fatalf("15000 iterations: done=%v err=%v", done, err)
 	}
 }
