@@ -20,8 +20,8 @@ func NewRegistry() *prometheus.Registry {
 }
 
 // Counter is a catalog-created counter. It deliberately exposes only Inc and
-// Add (plus Collector, so tests can read it), so it cannot attach exemplars
-// (FR-11): it does not implement prometheus.ExemplarAdder.
+// Add: it implements neither prometheus.Collector nor prometheus.Metric nor
+// prometheus.ExemplarAdder (FR-11).
 type Counter struct{ c prometheus.Counter }
 
 // Inc adds 1.
@@ -29,12 +29,6 @@ func (c *Counter) Inc() { c.c.Inc() }
 
 // Add adds v (must be >= 0).
 func (c *Counter) Add(v float64) { c.c.Add(v) }
-
-// Describe implements prometheus.Collector.
-func (c *Counter) Describe(ch chan<- *prometheus.Desc) { c.c.Describe(ch) }
-
-// Collect implements prometheus.Collector.
-func (c *Counter) Collect(ch chan<- prometheus.Metric) { c.c.Collect(ch) }
 
 // Gauge is a catalog-created gauge exposing only Set, Inc, Dec, Add and Sub.
 type Gauge struct{ g prometheus.Gauge }
@@ -53,12 +47,6 @@ func (g *Gauge) Add(v float64) { g.g.Add(v) }
 
 // Sub subtracts v.
 func (g *Gauge) Sub(v float64) { g.g.Sub(v) }
-
-// Describe implements prometheus.Collector.
-func (g *Gauge) Describe(ch chan<- *prometheus.Desc) { g.g.Describe(ch) }
-
-// Collect implements prometheus.Collector.
-func (g *Gauge) Collect(ch chan<- prometheus.Metric) { g.g.Collect(ch) }
 
 // Histogram is a catalog-created histogram exposing only Observe. It does not
 // implement prometheus.ExemplarObserver.

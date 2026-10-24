@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/errclass"
+	"github.com/sorinpanduru/corral/internal/infra/telemetry/sanitize"
 )
 
 // Label names carrying the FR-29 error class and detail (decision D4).
@@ -56,6 +57,34 @@ var allowedLabelNames = []string{"command", LabelErrorClass, LabelErrorDetail}
 
 // AllowedLabelNames returns a copy of the label name allowlist.
 func AllowedLabelNames() []string { return slices.Clone(allowedLabelNames) }
+
+// forbiddenTokens are whole underscore-separated tokens (or token prefixes,
+// see forbiddenLabel) that may never appear in a label name (FR-11). This is
+// a second line of defence that applies even to allowlisted names.
+var forbiddenTokens = []string{
+	"address", "ip", "host", "port", "id", "lsid", "session", "cursor", "request",
+	"connection", "appname", "database", "db", "namespace", "collection",
+	"code", "codename",
+}
+
+var forbiddenTokenPrefixes = []string{"driver", "user", "trace", "span"}
+
+func forbiddenLabel(name string) bool {
+	if name == "app_name" {
+		return true
+	}
+	for _, tok := range strings.Split(name, "_") {
+		if slices.Contains(forbiddenTokens, tok) {
+			return true
+		}
+		for _, p := range forbiddenTokenPrefixes {
+			if strings.HasPrefix(tok, p) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 var valueRE = regexp.MustCompile(`^[a-z0-9_]+$`)
 
@@ -161,6 +190,9 @@ func lintLabel(metric string, l LabelDef, duplicate bool) []Problem {
 	if l.Name == "le" || l.Name == "quantile" {
 		add("label name is reserved and must not be declared (FR-13)")
 	}
+	if forbiddenLabel(l.Name) {
+		add("forbidden label name (FR-11)")
+	}
 	if !slices.Contains(allowedLabelNames, l.Name) {
 		add("label name is not in the allowlist (FR-11)")
 	}
@@ -181,6 +213,10 @@ func lintLabel(metric string, l LabelDef, duplicate bool) []Problem {
 		case LabelErrorDetail:
 			if !detailHas(v) {
 				add("value %q is outside the FR-29 error detail enum", v)
+			}
+		case "command":
+			if v != sanitize.OtherCommand && !slices.Contains(sanitize.CommandAllowlist(), v) {
+				add("value %q is not in the command allowlist (FR-12)", v)
 			}
 		default:
 			if !valueRE.MatchString(v) {
