@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,6 +30,12 @@ const (
 	SettingAdminListen    = "admin.listen"
 	SettingTracingEnabled = "tracing.enabled"
 	SettingSampleRatio    = "tracing.sample_ratio"
+
+	// SettingUnknown names errors for unknown or malformed settings and flags.
+	// The supplied name is never echoed (it may be a mistyped secret).
+	SettingUnknown = "unknown"
+	// SettingArgument names errors for positional command-line arguments.
+	SettingArgument = "argument"
 )
 
 // Settings is the validated set of logical settings. It is comparable.
@@ -114,6 +121,9 @@ func Parse(raw map[string]string) (Settings, error) {
 			err = errUnknown
 		}
 		if err != nil {
+			if err == errUnknown {
+				k = SettingUnknown // never echo an unknown key
+			}
 			return Settings{}, NewError(k, err)
 		}
 	}
@@ -139,7 +149,8 @@ func parseRatio(v string) (float64, error) {
 }
 
 // validateListen requires host:port with a non-empty host and port 0..65535
-// (FR-16). Errors never echo the address.
+// (FR-16). The host is an IP literal or a syntactically valid DNS hostname.
+// Errors never echo the address.
 func validateListen(v string) error {
 	host, port, err := net.SplitHostPort(v)
 	if err != nil || host == "" {
@@ -148,21 +159,59 @@ func validateListen(v string) error {
 	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
 		return errBadListen
 	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return nil
+	}
+	if !validHostname(host) {
+		return errBadListen
+	}
 	return nil
+}
+
+// validHostname: letters, digits, '-' and '.'; labels 1..63 chars without a
+// leading or trailing '-'; total <= 253; the last label must not look numeric
+// (rejects "0", "127.1" and "0x0", which resolvers read as addresses).
+func validHostname(h string) bool {
+	h = strings.TrimSuffix(h, ".")
+	if h == "" || len(h) > 253 {
+		return false
+	}
+	labels := strings.Split(h, ".")
+	for _, l := range labels {
+		if len(l) < 1 || len(l) > 63 || l[0] == '-' || l[len(l)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(l); i++ {
+			c := l[i]
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	last := strings.ToLower(labels[len(labels)-1])
+	if strings.Trim(last, "0123456789") == "" {
+		return false
+	}
+	if strings.HasPrefix(last, "0x") && strings.Trim(last[2:], "0123456789abcdef") == "" {
+		return false
+	}
+	return true
 }
 
 // logMsg is the constant message of the FR-27 error record.
 const logMsg = "invalid configuration"
 
-// LogError writes the FR-27 record: component=config, setting, the errclass
-// attributes and a constant message. It never uses err.Error() and never
-// echoes a value. A nil err logs nothing.
+// LogError writes the FR-27 record: setting, the errclass attributes and a
+// constant message at ERROR level. The logger must already carry
+// component=config (the bootstrap logger and the logging factory do); LogError
+// does not add it. It never uses err.Error() and never echoes a value. A nil
+// err logs nothing.
 func LogError(l *slog.Logger, err error) {
 	if err == nil {
 		return
 	}
-	attrs := []slog.Attr{slog.String(attr.Component, string(logging.Config))}
-	var ce interface{ ConfigSetting() string }
+	var attrs []slog.Attr
+	var ce errclass.ConfigError
 	if errors.As(err, &ce) {
 		attrs = append(attrs, slog.String(attr.Setting, ce.ConfigSetting()))
 	}
@@ -175,20 +224,21 @@ var knownSettings = map[string]struct{}{
 	SettingTracingEnabled: {}, SettingSampleRatio: {},
 }
 
-// FromArgs is the interim loader (ADR-0003, D1): -name=value flags named like
-// the logical settings. Values are passed through unvalidated. Unknown,
-// valueless and repeated flags are config errors naming the flag only.
+// FromArgs is the interim loader (ADR-0003, D1): -name=value or --name=value
+// flags named like the logical settings. Values are passed through
+// unvalidated. Unknown or malformed flags give SettingUnknown, positional
+// arguments SettingArgument, and a known flag with no value or repeated names
+// that flag. "--" is not an end-of-flags marker. Supplied text is never echoed.
 func FromArgs(args []string) (map[string]string, error) {
 	out := make(map[string]string, len(args))
 	for _, a := range args {
 		if !strings.HasPrefix(a, "-") {
-			// Never name or echo a positional argument.
-			return nil, NewError("argument", errPositionalArg)
+			return nil, NewError(SettingArgument, errPositionalArg)
 		}
 		body := strings.TrimPrefix(strings.TrimPrefix(a, "-"), "-")
 		name, val, hasVal := strings.Cut(body, "=")
 		if _, ok := knownSettings[name]; !ok {
-			return nil, NewError(name, errUnknown)
+			return nil, NewError(SettingUnknown, errUnknown)
 		}
 		if !hasVal {
 			return nil, NewError(name, errMissingValue)
