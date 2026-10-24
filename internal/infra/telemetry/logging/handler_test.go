@@ -15,7 +15,7 @@ import (
 func newLogger(t *testing.T, f logging.Format, lvl slog.Leveler, c logging.Component) (*slog.Logger, *syncBuffer) {
 	t.Helper()
 	var buf syncBuffer
-	fac := logging.NewFactory(logging.NewHandler(&buf, f, lvl))
+	fac := logging.NewFactory(checked(t, logging.NewHandler(&buf, f, lvl), false))
 	l, err := fac.Logger(c)
 	if err != nil {
 		t.Fatalf("Logger(%q): %v", c, err)
@@ -142,7 +142,7 @@ func (w *blockingWriter) Write(p []byte) (int, error) {
 // logging call.
 func TestWritesAreSynchronousAndBlocking(t *testing.T) {
 	w := &blockingWriter{release: make(chan struct{})}
-	fac := logging.NewFactory(logging.NewHandler(w, logging.FormatJSON, slog.LevelInfo))
+	fac := logging.NewFactory(checked(t, logging.NewHandler(w, logging.FormatJSON, slog.LevelInfo), false))
 	l, err := fac.Logger(logging.Lifecycle)
 	if err != nil {
 		t.Fatal(err)

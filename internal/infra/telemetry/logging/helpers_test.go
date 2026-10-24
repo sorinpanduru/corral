@@ -2,13 +2,53 @@ package logging_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/sorinpanduru/corral/internal/testkit/logcheck"
 )
+
+// fanout sends every record to both handlers, so the suite's real output
+// handler is exercised unchanged while logcheck validates the record.
+type fanout struct{ out, check slog.Handler }
+
+// Enabled is true whenever either side is enabled, so records below the output
+// level still reach logcheck; only out.Handle is level-gated.
+func (f fanout) Enabled(ctx context.Context, l slog.Level) bool {
+	return f.check.Enabled(ctx, l) || f.out.Enabled(ctx, l)
+}
+func (f fanout) Handle(ctx context.Context, r slog.Record) error {
+	if err := f.check.Handle(ctx, r.Clone()); err != nil {
+		return err
+	}
+	if !f.out.Enabled(ctx, r.Level) {
+		return nil
+	}
+	return f.out.Handle(ctx, r)
+}
+func (f fanout) WithAttrs(as []slog.Attr) slog.Handler {
+	return fanout{out: f.out.WithAttrs(as), check: f.check.WithAttrs(as)}
+}
+func (f fanout) WithGroup(n string) slog.Handler {
+	return fanout{out: f.out.WithGroup(n), check: f.check.WithGroup(n)}
+}
+
+// checked wires the AC-5 logcheck handler beside out. Set behindCorrelation
+// when the result is wrapped by logging.WithTraceCorrelation.
+func checked(t testing.TB, out slog.Handler, behindCorrelation bool) slog.Handler {
+	t.Helper()
+	var opts []logcheck.Option
+	if behindCorrelation {
+		opts = append(opts, logcheck.BehindCorrelation())
+	}
+	return fanout{out: out, check: logcheck.New(t, opts...)}
+}
 
 // syncBuffer is a goroutine-safe buffer used as a log sink.
 type syncBuffer struct {
