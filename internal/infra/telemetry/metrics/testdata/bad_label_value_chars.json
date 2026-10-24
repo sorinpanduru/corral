@@ -1,0 +1,1 @@
+{"metrics": [{"name": "corral_things_total", "type": "counter", "help": "Synthetic.", "labels": [{"name": "command", "values": ["find-one"]}]}]}

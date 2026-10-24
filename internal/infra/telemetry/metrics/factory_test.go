@@ -24,7 +24,7 @@ func fullCatalog(t *testing.T) *metrics.Catalog {
 		metricSpec{Name: "corral_ops_total", Type: "counter", Help: "Ops.",
 			Labels: []labelSpec{{Name: "command", Values: []string{"find", "hello", "other"}}}},
 		metricSpec{Name: "corral_slots", Type: "gauge", Help: "Slots.",
-			Labels: []labelSpec{{Name: "state", Values: []string{"idle", "busy"}}}},
+			Labels: []labelSpec{{Name: "command", Values: []string{"find", "hello"}}}},
 		metricSpec{Name: "corral_rtt_seconds", Type: "histogram", Help: "Round trip.",
 			Labels: []labelSpec{{Name: "command", Values: []string{"find", "hello", "other"}}}},
 		metricSpec{Name: "corral_failures_total", Type: "counter", Help: "Failures.",
@@ -203,7 +203,7 @@ func TestFactoryVectorsAcceptDeclaredValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g, err := gv.WithLabelValues("idle")
+	g, err := gv.WithLabelValues("find")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,13 +267,45 @@ func TestFactoryVectorsRefuseUndeclaredValues(t *testing.T) {
 	}
 }
 
-// FR-11: no exemplars are attached, whatever the caller does through the
-// factory-produced metrics.
-func TestFactoryNeverAttachesExemplars(t *testing.T) {
+// FR-11 (D): exemplars are unreachable by construction. Nothing the factory
+// hands out implements ExemplarAdder or ExemplarObserver.
+func TestFactoryValuesCannotAttachExemplars(t *testing.T) {
 	f, reg := newFactory(t)
-	c, _ := f.Counter("corral_events_total")
+	check := func(name string, v any) {
+		t.Helper()
+		if _, ok := v.(prometheus.ExemplarAdder); ok {
+			t.Errorf("%s implements prometheus.ExemplarAdder", name)
+		}
+		if _, ok := v.(prometheus.ExemplarObserver); ok {
+			t.Errorf("%s implements prometheus.ExemplarObserver", name)
+		}
+	}
+	c, err := f.Counter("corral_events_total")
+	must(t, err)
+	check("Counter", c)
+	g, err := f.Gauge("corral_depth")
+	must(t, err)
+	check("Gauge", g)
+	h, err := f.Histogram("corral_wait_seconds")
+	must(t, err)
+	check("Histogram", h)
+	cv, err := f.CounterVec("corral_ops_total")
+	must(t, err)
+	cc, err := cv.WithLabelValues("find")
+	must(t, err)
+	check("CounterVec child", cc)
+	gv, err := f.GaugeVec("corral_slots")
+	must(t, err)
+	gg, err := gv.WithLabelValues("find")
+	must(t, err)
+	check("GaugeVec child", gg)
+	hv, err := f.HistogramVec("corral_rtt_seconds")
+	must(t, err)
+	ho, err := hv.WithLabelValues("find")
+	must(t, err)
+	check("HistogramVec child", ho)
+
 	c.Inc()
-	h, _ := f.Histogram("corral_wait_seconds")
 	h.Observe(1)
 	fams := familyNames(t, reg)
 	if ex := fams["corral_events_total"].GetMetric()[0].GetCounter().GetExemplar(); ex != nil {
@@ -283,6 +315,121 @@ func TestFactoryNeverAttachesExemplars(t *testing.T) {
 		if b.GetExemplar() != nil {
 			t.Errorf("histogram bucket has exemplar")
 		}
+	}
+}
+
+// Idempotence: RegisterAll followed by the constructors yields the same
+// collector; increments through both handles accumulate in one series.
+func TestRegisterAllThenCounterIsIdempotent(t *testing.T) {
+	c, err := metrics.LoadCatalog()
+	must(t, err)
+	reg := metrics.NewRegistry()
+	f, err := metrics.NewFactory(reg, c)
+	must(t, err)
+	must(t, metrics.RegisterAll(f))
+	h1, err := f.Counter(metrics.NameTracingSpansDropped)
+	if err != nil {
+		t.Fatalf("Counter after RegisterAll: %v", err)
+	}
+	h2, err := f.Counter(metrics.NameTracingSpansDropped)
+	if err != nil {
+		t.Fatalf("second Counter: %v", err)
+	}
+	h1.Inc()
+	h2.Add(2)
+	must(t, metrics.RegisterAll(f)) // repeated RegisterAll is also fine
+	fam := familyNames(t, reg)[metrics.NameTracingSpansDropped]
+	if len(fam.GetMetric()) != 1 {
+		t.Fatalf("%d series, want 1", len(fam.GetMetric()))
+	}
+	if got := fam.GetMetric()[0].GetCounter().GetValue(); got != 3 {
+		t.Fatalf("value = %v, want 3 (both handles share one collector)", got)
+	}
+}
+
+func TestVectorConstructorsAreIdempotent(t *testing.T) {
+	f, reg := newFactory(t)
+	v1, err := f.CounterVec("corral_ops_total")
+	must(t, err)
+	v2, err := f.CounterVec("corral_ops_total")
+	if err != nil {
+		t.Fatalf("second CounterVec: %v", err)
+	}
+	a, err := v1.WithLabelValues("find")
+	must(t, err)
+	b, err := v2.WithLabelValues("find")
+	must(t, err)
+	a.Inc()
+	b.Add(2)
+	fam := familyNames(t, reg)["corral_ops_total"]
+	if len(fam.GetMetric()) != 1 {
+		t.Fatalf("%d series, want 1", len(fam.GetMetric()))
+	}
+	if got := fam.GetMetric()[0].GetCounter().GetValue(); got != 3 {
+		t.Fatalf("value = %v, want 3", got)
+	}
+	g1, err := f.Gauge("corral_depth")
+	must(t, err)
+	g2, err := f.Gauge("corral_depth")
+	if err != nil {
+		t.Fatalf("second Gauge: %v", err)
+	}
+	g1.Set(5)
+	if got := testutil.ToFloat64(g2); got != 5 {
+		t.Fatalf("gauge handles do not share state: %v", got)
+	}
+}
+
+// A foreign collector with the same name on the registry makes the factory
+// constructor fail rather than silently adopt or replace it.
+func TestFactoryErrorsOnForeignCollisions(t *testing.T) {
+	f, reg := newFactory(t)
+	must(t, reg.Register(prometheus.NewGauge(prometheus.GaugeOpts{Name: "corral_events_total", Help: "Events."})))
+	if _, err := f.Counter("corral_events_total"); err == nil {
+		t.Fatal("Counter succeeded despite a foreign collector with the same name")
+	}
+	must(t, reg.Register(prometheus.NewCounterVec(
+		prometheus.CounterOpts{Name: "corral_ops_total", Help: "Ops."}, []string{"other"})))
+	if _, err := f.CounterVec("corral_ops_total"); err == nil {
+		t.Fatal("CounterVec succeeded despite a foreign collector with the same name")
+	}
+	if err := metrics.RegisterAll(f); err == nil {
+		t.Fatal("RegisterAll succeeded despite foreign collisions")
+	}
+}
+
+// The factory works from a private copy of the catalog: later mutation of the
+// caller's *Catalog does not change what it accepts.
+func TestFactoryCopiesCatalog(t *testing.T) {
+	cat := fullCatalog(t)
+	reg := prometheus.NewRegistry()
+	f, err := metrics.NewFactory(reg, cat)
+	must(t, err)
+	for i := range cat.Metrics {
+		if cat.Metrics[i].Name == "corral_ops_total" {
+			cat.Metrics[i].Labels[0].Values[0] = "evil"
+			cat.Metrics[i].Labels[0].Values = append(cat.Metrics[i].Labels[0].Values, "evil2")
+			cat.Metrics[i].Labels[0].Name = "client_address"
+		}
+		if cat.Metrics[i].Name == "corral_events_total" {
+			cat.Metrics[i].Name = "corral_renamed_total"
+		}
+	}
+	cv, err := f.CounterVec("corral_ops_total")
+	must(t, err)
+	if _, err := cv.WithLabelValues("find"); err != nil {
+		t.Errorf("original value refused after catalog mutation: %v", err)
+	}
+	for _, v := range []string{"evil", "evil2"} {
+		if _, err := cv.WithLabelValues(v); err == nil {
+			t.Errorf("mutated value %q accepted", v)
+		}
+	}
+	if _, err := f.Counter("corral_renamed_total"); err == nil {
+		t.Error("renamed catalog entry accepted")
+	}
+	if _, err := f.Counter("corral_events_total"); err != nil {
+		t.Errorf("original name refused after catalog mutation: %v", err)
 	}
 }
 

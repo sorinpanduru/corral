@@ -1,6 +1,8 @@
 package metrics_test
 
 import (
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -31,7 +33,11 @@ func TestLintBadCatalogs(t *testing.T) {
 		{"bad_label_forbidden_appname.json", "app_name", "FR-11 forbidden label"},
 		{"bad_label_forbidden_collection.json", "collection", "FR-11 forbidden label"},
 		{"bad_label_forbidden_code.json", "code_name", "FR-11 forbidden label"},
-		{"bad_label_empty_values.json", "state", "FR-11/FR-31 label needs enumerated values"},
+		{"bad_label_empty_values.json", "command", "FR-11/FR-31 label needs enumerated values"},
+		{"bad_label_value_empty.json", "command", "D: label value must be non-empty"},
+		{"bad_label_value_uppercase.json", "Find", "D: label value must match ^[a-z0-9_]+$"},
+		{"bad_label_value_chars.json", "find-one", "D: label value must match ^[a-z0-9_]+$"},
+		{"bad_label_not_allowlisted.json", "db_name", "D: label name allowlist"},
 		{"bad_label_le.json", "le", "FR-13 le not declarable"},
 		{"bad_label_quantile.json", "quantile", "FR-13 quantile not declarable"},
 		{"bad_error_class_values.json", "bogus_class", "FR-29 class enum"},
@@ -65,10 +71,7 @@ func TestLintSeriesCapIgnoresBuckets(t *testing.T) {
 	c := parse(t, metricSpec{
 		Name: "corral_op_seconds", Type: "histogram", Help: "h",
 		Buckets: []float64{.001, .01, .1, 1, 10, 60},
-		Labels: []labelSpec{
-			{Name: "a", Values: seq("a", 10)},
-			{Name: "b", Values: seq("b", 10)},
-		},
+		Labels:  []labelSpec{{Name: "command", Values: seq("c", 100)}},
 	})
 	if ps := metrics.Lint(c); len(ps) != 0 {
 		t.Fatalf("unexpected problems:\n%s", problemText(ps))
@@ -96,7 +99,9 @@ func TestLintAcceptsValidCatalog(t *testing.T) {
 // FR-10: the non-base unit suffix ban covers the plan's list.
 func TestLintNonBaseUnitSuffixes(t *testing.T) {
 	for _, s := range []string{"ms", "milliseconds", "us", "microseconds", "ns", "nanoseconds",
-		"minutes", "hours", "kb", "mb", "gb", "kib", "mib", "gib", "kilobytes", "megabytes", "percent"} {
+		"minutes", "hours", "kb", "mb", "gb", "kib", "mib", "gib", "kilobytes", "megabytes", "percent",
+		"millis", "sec", "secs", "minute", "hour", "day", "days", "bits", "bit",
+		"millisecond", "microsecond", "nanosecond", "kilobyte", "megabyte", "gigabyte"} {
 		t.Run(s, func(t *testing.T) {
 			name := "corral_thing_" + s
 			ps := metrics.Lint(parse(t, metricSpec{Name: name, Type: "gauge", Help: "h"}))
@@ -130,7 +135,7 @@ func TestLintForbiddenLabels(t *testing.T) {
 
 // FR-11: ordinary bounded labels are not flagged as forbidden.
 func TestLintAllowsOrdinaryLabels(t *testing.T) {
-	for _, l := range []string{"command", "state", "result", "outcome", "pool", "error_class"} {
+	for _, l := range []string{"command", "error_class"} {
 		t.Run(l, func(t *testing.T) {
 			c := parse(t, metricSpec{Name: "corral_x_total", Type: "counter", Help: "h",
 				Labels: []labelSpec{{Name: l, Values: []string{"timeout"}}}})
@@ -222,4 +227,75 @@ func detailValues() []string {
 		out = append(out, string(d))
 	}
 	return out
+}
+
+// D: label names are an allowlist. Exactly command, error_class, error_detail.
+func TestAllowedLabelNames(t *testing.T) {
+	got := append([]string(nil), metrics.AllowedLabelNames()...)
+	sort.Strings(got)
+	want := []string{"command", "error_class", "error_detail"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("AllowedLabelNames() = %v, want %v", got, want)
+	}
+	// The returned slice must be a copy.
+	a := metrics.AllowedLabelNames()
+	a[0] = "evil"
+	for _, n := range metrics.AllowedLabelNames() {
+		if n == "evil" {
+			t.Fatal("AllowedLabelNames exposes internal state")
+		}
+	}
+}
+
+// D: any label name outside the allowlist is rejected, including near-misses
+// of forbidden names that a deny-list would miss.
+func TestLintRejectsNonAllowlistedLabelNames(t *testing.T) {
+	for _, l := range []string{
+		"db_name", "database_name", "collection_name", "coll", "ns", "error_code", "err_code",
+		"client_addr", "peer", "remote_addr", "upstream", "server", "hostname", "app", "application",
+		"client_app_name", "role", "error", "error_type", "err_class", "detail",
+		"connection_state", "session_state", "state", "result", "pool", "a",
+	} {
+		t.Run(l, func(t *testing.T) {
+			c := parse(t, metricSpec{Name: "corral_x_total", Type: "counter", Help: "h",
+				Labels: []labelSpec{{Name: l, Values: []string{"v"}}}})
+			if txt := problemText(metrics.Lint(c)); !strings.Contains(txt, l) {
+				t.Fatalf("label %q not rejected:\n%s", l, txt)
+			}
+		})
+	}
+}
+
+// D: label values are non-empty and match ^[a-z0-9_]+$ (error_detail is
+// governed by the FR-29 detail enum instead).
+func TestLintLabelValueCharset(t *testing.T) {
+	for _, v := range []string{"find", "a_1", "0", "other", "snake_case_9"} {
+		c := parse(t, metricSpec{Name: "corral_x_total", Type: "counter", Help: "h",
+			Labels: []labelSpec{{Name: "command", Values: []string{v}}}})
+		if ps := metrics.Lint(c); len(ps) != 0 {
+			t.Errorf("value %q rejected:\n%s", v, problemText(ps))
+		}
+	}
+	for _, v := range []string{"", "Find", "FIND", "find-one", "a b", "find.x", "find\n", "caf\u00e9", "a/b", "{x}", "a\"b"} {
+		c := parse(t, metricSpec{Name: "corral_x_total", Type: "counter", Help: "h",
+			Labels: []labelSpec{{Name: "command", Values: []string{"find", v}}}})
+		if ps := metrics.Lint(c); len(ps) == 0 {
+			t.Errorf("value %q accepted", v)
+		}
+	}
+}
+
+// D: error_detail keeps its uppercase errno values (enum-governed), while
+// non-enum values are rejected even when they match the charset.
+func TestLintErrorDetailUppercaseAllowedButEnumBound(t *testing.T) {
+	ok := parse(t, metricSpec{Name: "corral_e_total", Type: "counter", Help: "h",
+		Labels: []labelSpec{{Name: "error_detail", Values: []string{"ECONNREFUSED", "EADDRINUSE"}}}})
+	if ps := metrics.Lint(ok); len(ps) != 0 {
+		t.Fatalf("errno detail rejected:\n%s", problemText(ps))
+	}
+	bad := parse(t, metricSpec{Name: "corral_e_total", Type: "counter", Help: "h",
+		Labels: []labelSpec{{Name: "error_detail", Values: []string{"not_in_enum"}}}})
+	if ps := metrics.Lint(bad); len(ps) == 0 {
+		t.Fatal("charset-valid but non-enum detail accepted")
+	}
 }

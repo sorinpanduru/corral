@@ -211,7 +211,7 @@ func populate(t *testing.T, f *metrics.Factory) {
 	cc.Inc()
 	gv, err := f.GaugeVec("corral_slots")
 	must(t, err)
-	gg, err := gv.WithLabelValues("idle")
+	gg, err := gv.WithLabelValues("find")
 	must(t, err)
 	gg.Set(2)
 	hv, err := f.HistogramVec("corral_rtt_seconds")
