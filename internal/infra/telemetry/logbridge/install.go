@@ -17,7 +17,8 @@ func installOTel(f *logging.Factory, now func() time.Time) {
 	otel.SetLogger(logr.New(NewOTelLogSink(f, now)))
 }
 
-// probeLevel is a V level no grpc code uses; the delegate records it so that
+// probeLevel is a V level no grpc code uses (it must never be a level grpc
+// itself passes to V, or the probe would misfire); the delegate records it so that
 // installGRPC can tell whether the grpclog global still holds the delegate.
 const probeLevel = -1 << 30
 

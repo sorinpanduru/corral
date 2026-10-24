@@ -8,9 +8,11 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"runtime/debug"
 	"time"
 
@@ -33,16 +35,13 @@ const (
 	msgShuttingDown    = "corral shutting down"
 	msgStartupFailed   = "corral startup failed"
 	msgShutdownFailed  = "corral shutdown step failed"
+	msgServeFailed     = "admin listener serve failed"
 	msgPanic           = "recovered panic in runtime goroutine"
 )
 
 const tracingShutdownTimeout = 5 * time.Second
 
-// shutdownDrain is a short pause between the "shutting down" record and the
-// admin server shutdown. net/http's Shutdown drops a request whose head
-// completes after Shutdown began, so without it a probe racing the record
-// would see a closed connection instead of 503 shutting_down.
-const shutdownDrain = 250 * time.Millisecond
+const adminShutdownTimeout = 5 * time.Second
 
 // Exit codes.
 const (
@@ -57,6 +56,9 @@ type Hooks struct {
 	BeforeLastStep func(ctx context.Context)
 	// Started runs after the startup-complete record.
 	Started func(Handles)
+	// Stopping runs after the "shutting down" record and before the admin
+	// server shuts down.
+	Stopping func(ctx context.Context)
 }
 
 // Handles expose running components to Started.
@@ -67,10 +69,14 @@ type Handles struct {
 }
 
 // Run starts corral and blocks until ctx is cancelled or startup fails. It
-// returns the process exit code: 0 after a graceful shutdown, non-zero on any
-// startup failure.
+// returns the process exit code: 0 after a graceful shutdown (including a
+// cancel during startup), non-zero on any startup or serve failure.
+//
+// Shutdown bound: after the "shutting down" record and the Stopping hook, the
+// admin server gets at most adminShutdownTimeout and tracing at most
+// tracingShutdownTimeout, so the whole shutdown takes about 10 s at worst.
 func Run(ctx context.Context, args []string, env tracing.LookupEnv, stdout io.Writer, hooks Hooks) int {
-	// Step 0: settings (stdlib-only logging until the factory exists).
+	// ADR-0006 step 0: settings (stdlib-only logging until the factory exists).
 	raw, err := config.FromArgs(args)
 	var settings config.Settings
 	if err == nil {
@@ -81,9 +87,14 @@ func Run(ctx context.Context, args []string, env tracing.LookupEnv, stdout io.Wr
 		return exitFailure
 	}
 
+	// Resolve is pure environment parsing; it runs before the handler is built
+	// so trace correlation is wrapped only when tracing is really on. Its error
+	// is logged after Install (step 3).
+	enabled, tcfg, resolveErr := tracing.Resolve(settings, env)
+
 	// Step 1: logging factory.
 	var h slog.Handler = logging.NewHandler(stdout, settings.LogFormat, settings.LogLevel)
-	if settings.TracingEnabled {
+	if resolveErr == nil && enabled {
 		h = logging.WithTraceCorrelation(h)
 	}
 	factory := logging.NewFactory(h)
@@ -94,10 +105,9 @@ func Run(ctx context.Context, args []string, env tracing.LookupEnv, stdout io.Wr
 	cfgLog := mustLogger(factory, logging.Config)
 	life := mustLogger(factory, logging.Lifecycle)
 
-	// Step 3: tracing environment.
-	enabled, tcfg, err := tracing.Resolve(settings, env)
-	if err != nil {
-		config.LogError(cfgLog, err)
+	// Step 3: tracing environment validation result.
+	if resolveErr != nil {
+		config.LogError(cfgLog, resolveErr)
 		return exitFailure
 	}
 
@@ -119,62 +129,81 @@ func Run(ctx context.Context, args []string, env tracing.LookupEnv, stdout io.Wr
 		return exitFailure
 	}
 
-	// Step 7: tracing.
-	tr, err := tracing.Start(ctx, tracing.Options{
-		Settings: settings,
-		Env:      env,
-		Config:   tcfg,
-		Enabled:  enabled,
-		Metrics:  mf,
-		Logger:   mustLogger(factory, logging.Tracing),
-	})
-	if err != nil {
-		logFailure(life, err)
-		return exitFailure
-	}
-
-	// Step 8: admin listener.
+	// Step 7: admin listener, bound and serving (not yet ready).
 	admin := adminhttp.New(adminhttp.Options{
 		Addr:     settings.AdminListen,
 		Gatherer: reg,
 		ErrorLog: logbridge.NewHTTPErrorLog(factory, time.Now),
 	})
 	if err := admin.Listen(); err != nil {
-		// Only the constant config.Error text is logged, never the cause.
-		config.LogError(cfgLog, config.NewError(config.SettingAdminListen, errBind))
-		shutdownTracing(life, tr)
+		// The error is a config.Error: constant text, the net error only as
+		// the hidden cause for errclass detail (never the address).
+		config.LogError(cfgLog, err)
 		return exitFailure
 	}
-	serveDone := make(chan struct{})
+	serveErr := make(chan error, 1)
 	go func() {
-		defer close(serveDone)
 		defer recoverPanic(life)
-		_ = admin.Serve()
+		if err := admin.Serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+		}
 	}()
 
-	// Step 9: last step, then ready.
+	// Step 8: hold point for tests, then tracing as the last step.
 	if hooks.BeforeLastStep != nil {
 		hooks.BeforeLastStep(ctx)
 	}
-	admin.MarkStarted()
-	life.Info(msgStartupComplete)
-	if hooks.Started != nil {
-		hooks.Started(Handles{AdminAddr: admin.Addr(), TracerProvider: tr.TracerProvider(), Gatherer: reg})
+	var tr *tracing.Tracing
+	code := exitOK
+	if ctx.Err() == nil {
+		tr, err = tracing.Start(ctx, tracing.Options{
+			Settings: settings,
+			Env:      env,
+			Config:   tcfg,
+			Enabled:  enabled,
+			Metrics:  mf,
+			Logger:   mustLogger(factory, logging.Tracing),
+		})
+		if err != nil {
+			logFailure(life, err)
+			shutdownAdmin(life, admin)
+			return exitFailure
+		}
+
+		// Step 9: ready.
+		admin.MarkStarted()
+		life.Info(msgStartupComplete)
+		if hooks.Started != nil {
+			hooks.Started(Handles{AdminAddr: admin.Addr(), TracerProvider: tr.TracerProvider(), Gatherer: reg})
+		}
+
+		select {
+		case <-ctx.Done():
+		case err := <-serveErr:
+			logServe(life, err)
+			code = exitFailure
+		}
 	}
 
-	// Shutdown.
-	<-ctx.Done()
+	// Shutdown: MarkStopping immediately before the record (D6).
 	admin.MarkStopping()
 	life.Info(msgShuttingDown)
-	time.Sleep(shutdownDrain)
-	sctx, cancel := context.WithTimeout(context.Background(), tracingShutdownTimeout)
-	if err := admin.Shutdown(sctx); err != nil {
-		logShutdown(life, err)
+	if hooks.Stopping != nil {
+		hooks.Stopping(ctx)
 	}
-	cancel()
-	<-serveDone
-	shutdownTracing(life, tr)
-	return exitOK
+	shutdownAdmin(life, admin)
+	if tr != nil {
+		shutdownTracing(life, tr)
+	}
+	return code
+}
+
+func shutdownAdmin(l *slog.Logger, admin *adminhttp.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), adminShutdownTimeout)
+	defer cancel()
+	if err := admin.Shutdown(ctx); err != nil {
+		logShutdown(l, err)
+	}
 }
 
 func shutdownTracing(l *slog.Logger, tr *tracing.Tracing) {
@@ -185,10 +214,14 @@ func shutdownTracing(l *slog.Logger, tr *tracing.Tracing) {
 	}
 }
 
+func logServe(l *slog.Logger, err error) {
+	l.LogAttrs(context.Background(), slog.LevelError, msgServeFailed, errclass.LogAttrs(err)...)
+}
+
 func mustLogger(f *logging.Factory, c logging.Component) *slog.Logger {
 	l, err := f.Logger(c)
 	if err != nil { // unreachable: components are constants from the fixed set
-		return slog.New(f.Handler())
+		panic("runtime: component outside the fixed set")
 	}
 	return l
 }
