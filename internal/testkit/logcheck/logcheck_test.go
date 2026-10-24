@@ -36,9 +36,12 @@ func (f *fakeTB) record(m string) {
 func (f *fakeTB) Error(args ...any)                 { f.record(fmt.Sprint(args...)) }
 func (f *fakeTB) Errorf(format string, args ...any) { f.record(fmt.Sprintf(format, args...)) }
 func (f *fakeTB) Fatal(args ...any)                 { f.record(fmt.Sprint(args...)); runtime.Goexit() }
-func (f *fakeTB) Fatalf(format string, args ...any) { f.record(fmt.Sprintf(format, args...)); runtime.Goexit() }
-func (f *fakeTB) Fail()                             { f.record("fail") }
-func (f *fakeTB) FailNow()                          { f.record("failnow"); runtime.Goexit() }
+func (f *fakeTB) Fatalf(format string, args ...any) {
+	f.record(fmt.Sprintf(format, args...))
+	runtime.Goexit()
+}
+func (f *fakeTB) Fail()    { f.record("fail") }
+func (f *fakeTB) FailNow() { f.record("failnow"); runtime.Goexit() }
 func (f *fakeTB) Failed() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
