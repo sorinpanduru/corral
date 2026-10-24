@@ -31,7 +31,7 @@ func syntheticSpanContext(sampled, remote bool) trace.SpanContext {
 func correlationLogger(t *testing.T, f logging.Format) (*slog.Logger, *syncBuffer) {
 	t.Helper()
 	var buf syncBuffer
-	h := logging.WithTraceCorrelation(logging.NewHandler(&buf, f, slog.LevelDebug))
+	h := logging.WithTraceCorrelation(checked(t, logging.NewHandler(&buf, f, slog.LevelDebug), true))
 	l, err := logging.NewFactory(h).Logger(logging.Tracing)
 	if err != nil {
 		t.Fatal(err)
