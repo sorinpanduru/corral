@@ -1,0 +1,1 @@
+{"metrics":[{"name":"corral_op_seconds_total","type":"histogram","help":"Histogram with _total.","labels":[]}]}

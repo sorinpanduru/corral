@@ -1,0 +1,1 @@
+{"metrics":[{"name":"corral_errors_total","type":"counter","help":"Error class outside enum.","labels":[{"name":"error_class","values":["timeout","bogus_class"]}]}]}

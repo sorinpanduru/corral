@@ -1,0 +1,1 @@
+{"metrics":[{"name":"corral_things_total","type":"counter","help":"Label without values.","labels":[{"name":"state","values":[]}]}]}

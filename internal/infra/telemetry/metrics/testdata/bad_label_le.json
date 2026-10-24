@@ -1,0 +1,1 @@
+{"metrics":[{"name":"corral_op_seconds","type":"histogram","help":"le declared as label.","labels":[{"name":"le","values":["1"]}]}]}
