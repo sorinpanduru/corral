@@ -1,8 +1,8 @@
 # SPEC-002: Proxy core (wire listener, handshake, multiplexing pool, upstream)
 
-Status: approved (Owner, 2026-10-24; revision 5); Amendment 1 approved (Owner, 2026-10-24)
+Status: approved (Owner, 2026-10-24; revision 5); Amendment 1 approved (Owner, 2026-10-24); Amendment 2 approved (Owner, 2026-10-24)
 Owner: Sorin Panduru
-Last updated: 2026-10-24 (Amendment 1)
+Last updated: 2026-10-24 (Amendment 2)
 
 ## Goal
 
@@ -108,7 +108,9 @@ the connection string pointing at corral.
   corral reads to make a decision (FR-9, FR-60): the command name (first
   key), `$db`, `lsid`, `txnNumber`, `autocommit`, `startTransaction`, and
   for `aggregate` the `pipeline` field, and for `getMore` the `collection`
-  field (Amendment 1).
+  field (Amendment 1). *(Amendment 2)* The command name is included for the
+  duplicate check inside the body. It is excluded from the comparison with
+  kind-1 section identifiers (FR-60).
 
 ## Functional requirements
 
@@ -239,12 +241,26 @@ the connection string pointing at corral.
       (bit 1) set, and the document `{$err, code: 352, codeName:
       "UnsupportedOpQueryCommand", ok: 0}` with a fixed `$err` text (detail
       `unsupported_opcode`). The client connection stays open.
+    - *(Amendment 2, R-1)* This includes an OP_QUERY whose command (first
+      key, or first key inside `$query`) is an FR-23 auth command or an FR-33
+      blocked command. Over OP_QUERY those get the 352 reply above, not 18,
+      115 or 13: the only command corral accepts over OP_QUERY is the
+      handshake.
+      - The command is still never forwarded.
+      - It is not counted in `corral_client_auth_rejected_total` or
+        `corral_commands_blocked_total`, and it produces the 352 accounting
+        below.
+      - FR-61 steps 3 and 4 apply only to OP_MSG.
     - *(Amendment 1, G-3)* This 352 refusal keeps the connection open, so it
       is **not** counted in `corral_protocol_errors_total`, which counts only
       protocol errors that close a connection. It is counted as a request
       with outcome `proxy_error`, and in `corral_request_errors_total` with
       `error_class="protocol"` (FR-48). Its `command` label comes from the
       query document's first key, mapped per SPEC-001 FR-12.
+      *(Amendment 2)* When the query document is wrapped in `$query`, the
+      label comes from the first key inside `$query`. This is the same key
+      that decides handshake status and R-1, so `{$query: {saslStart: 1}}`
+      is labelled `saslStart`.
 - **FR-9:** Fields corral reads. corral reads only the following fields of
   the messages it handles. Everything else is opaque bytes that corral does
   not decode, interpret, keep beyond the exchange, or emit (SPEC-001 FR-24).
@@ -498,6 +514,8 @@ the connection string pointing at corral.
     upstream. Each attempt is counted (FR-48) and logged per FR-49.
   - Access to the wire listener is controlled by network placement and,
     optionally, mutual TLS (FR-44).
+  - *(Amendment 2, R-1)* This applies to OP_MSG. Over OP_QUERY these
+    commands get the FR-8 352 reply.
 - **FR-24:** Credential handling.
   - `upstream.auth.username` and `upstream.auth.password` are SPEC-003
     secret settings: they are supplied only through their environment
@@ -594,6 +612,13 @@ the connection string pointing at corral.
     `code`, the host is marked exactly as for a forwarded reply (FR-35), and
     the barrier counts as failed. In single-`mongos` mode the FR-35
     single-`mongos` rule applies.
+    - *(Amendment 2, R-5)* "Exactly as for a forwarded reply" includes the
+      `upstream target marked not primary` warn record (rate-limited, FR-49),
+      with `db.response.status_code` and `corral.db.response.code_name` from
+      the ping reply.
+    - The `upstream barrier failed` record is emitted as well; the two
+      records report different things (the host state and the barrier
+      outcome).
   - **Client disconnect during a barrier.** This does not count as "in
     flight" under FR-41, because nothing is owed to the client. The barrier
     runs to completion, and on success the connection returns to the pool.
@@ -631,6 +656,8 @@ the connection string pointing at corral.
     - *(Amendment 1, G-14)* To keep this check from being bypassed, an
       `aggregate` whose `pipeline` arrives in a kind-1 section, and any
       message whose inspected fields are duplicated, is refused per FR-60.
+    - *(Amendment 2, R-1)* This applies to OP_MSG. Over OP_QUERY these
+      commands get the FR-8 352 reply.
   - Every other command, apart from FR-13 to FR-23, is forwarded unchanged.
     This includes commands whose result describes corral's upstream
     connection or identity rather than the client's (`connectionStatus`,
@@ -809,6 +836,29 @@ the connection string pointing at corral.
     effort: corral detects a close only when the peer's close is observable
     on the socket. An undetected close is handled by the in-flight rule once
     the request has been forwarded.
+  - *(Amendment 2, R-3)* **Closed mid-message.** If the client closes or
+    resets the connection after corral has read at least the first byte of a
+    message and before the whole message has been read:
+    - the message counts as one request in `corral_requests_total` with
+      `outcome="proxy_error"`. Its `command` label is the SPEC-001 FR-12
+      label if the command name had been read, otherwise `other`;
+    - it is counted once in `corral_request_errors_total` with class
+      `network`, and its detail is classified per SPEC-001 FR-29 (for
+      example `eof` or `ECONNRESET`);
+    - it is not a protocol error, so it is not counted in
+      `corral_protocol_errors_total`;
+    - the close reason is `client_closed`;
+    - it is observed once in `corral_request_duration_seconds` under the
+      same `command` label. The duration runs from the first byte read to
+      the moment corral detects the close, as for any request that ends
+      with the connection closing;
+    - if part of the message had already been streamed upstream, the
+      FR-38 hold-back means the upstream never receives the complete
+      message. That upstream connection is discarded
+      (`reason=client_abandoned`). If the message had no lease, nothing is
+      sent upstream.
+    - A close between messages (no byte of a next message read) is not a
+      request.
 - **FR-42:** A panic recovered while handling one client connection closes
   that client connection and discards any upstream connection it held. Other
   connections and the process continue. It is reported per SPEC-001 FR-29
@@ -920,7 +970,8 @@ the connection string pointing at corral.
 
   The upstream is not sent `endSessions` or `killCursors` for clients'
   sessions or cursors; those belong to the clients. A second SIGTERM or
-  SIGINT during shutdown is handled by FR-63 (Amendment 1).
+  SIGINT during shutdown, including during step 1, is handled by FR-63
+  (Amendments 1 and 2).
 
 ### Observability (extends SPEC-001)
 
@@ -1000,16 +1051,17 @@ the connection string pointing at corral.
     FR-60 refusal of duplicated inspected fields and of a `pipeline` sent as
     a document sequence;
   - *(Amendment 1)* that a second SIGTERM or SIGINT during shutdown ends the
-    drain at once (FR-63).
+    drain at once (FR-63);
+  - *(Amendment 2)* that it also cuts `proxy.shutdown.listener_close_delay`
+    short when it arrives during that delay (FR-63).
 
 ### Required amendment to SPEC-001
 
-- **FR-52:** SPEC-002 cannot be approved until SPEC-001 Amendment 3 has been
-  approved and promoted. Amendment 3 contains everything listed in
-  Interfaces, "SPEC-001 amendments requested by this spec". The Owner approved
-  the package content on 2026-10-24 (Q12). The additions made since then are
-  listed in the Amendment 3 decisions log for Owner approval of the text. The
-  draft is at `specs/drafts/SPEC-001-observability-conventions.md`.
+- **FR-52:** SPEC-002 depends on SPEC-001 Amendment 3, which contains
+  everything listed in Interfaces, "SPEC-001 amendments requested by this
+  spec". *(Amendment 2)* SPEC-001 Amendment 3 was approved by the Owner and
+  promoted to `specs/SPEC-001-observability-conventions.md` on 2026-10-24,
+  so this precondition is met.
 
 ### Testability
 
@@ -1136,6 +1188,10 @@ the connection string pointing at corral.
     Nesting deeper than 1024 levels is invalid.
     - Levels are counted with the top-level document as level 1. Each nested
       document or array adds one level, and arrays count like documents.
+    - *(Amendment 2, R-6)* Each document in a kind-1 section is a top-level
+      document, and is counted from level 1 on its own. The same applies to
+      each OP_QUERY document. The body and the sections do not add to each
+      other's depth.
     - The server's `maxBSONDepth` defaults to 200 and can be configured
       from 21 to 999, so 1024 never refuses anything any server
       configuration accepts. It only bounds corral's parser.
@@ -1147,9 +1203,18 @@ the connection string pointing at corral.
   - **Inspected-field integrity.** Each of these is a client protocol error
     with detail `malformed_message`, and the connection is closed:
     - an inspected field (Terms) that appears more than once at the top
-      level of the body;
-    - a kind-1 section whose identifier equals an inspected field's name
-      (for example `pipeline` on an `aggregate`).
+      level of the body. *(Amendment 2, R-6)* This includes the command name:
+      a body whose first key appears again later at the top level, such as
+      `{find: "a", …, find: "b"}`, is refused;
+    - a kind-1 section whose identifier equals the name of an inspected
+      field other than the command name (for example `pipeline` on an
+      `aggregate`, or `$db`, `lsid`, `txnNumber`).
+
+    *(Amendment 2, A-Q1, Owner decision "skip")* Kind-1 section identifiers
+    are not compared with the command name. There is no bypass here, because
+    the server always takes the command from the first key of the body. Not
+    comparing also avoids holding an unbounded command name for the
+    comparison.
 
     Rationale: the server could otherwise read a different value than the
     one corral inspected, for example a second `pipeline` starting with
@@ -1176,9 +1241,11 @@ the connection string pointing at corral.
      2. repeated `client`: 186 (FR-16);
      3. never reached or incompatible: 6 (FR-19);
      4. otherwise, the FR-14 reply.
-  3. **Client auth commands** (FR-23): 18 or 115.
-  4. **Blocked commands** (FR-33): 13.
-  5. **Non-handshake OP_QUERY** (FR-8): 352.
+  3. **Client auth commands** (FR-23): 18 or 115. OP_MSG only (Amendment 2,
+     R-1).
+  4. **Blocked commands** (FR-33): 13. OP_MSG only (Amendment 2, R-1).
+  5. **Non-handshake OP_QUERY** (FR-8): 352. This includes OP_QUERY auth and
+     blocked commands (Amendment 2, R-1).
   6. **Fail-fast states** (FR-56): 6.
   7. **Queue full** (FR-27): 262. Otherwise the message waits for a lease or
      is leased.
@@ -1203,6 +1270,13 @@ the connection string pointing at corral.
     the drain at once, as if `proxy.shutdown.drain_timeout` had elapsed
     (FR-47 step 4). Steps 4 and 5 then run, including the SPEC-001 FR-34
     tracing flush bound, and the process exits 0.
+  - *(Amendment 2, R-4)* If the second signal arrives during FR-47 step 1
+    (`proxy.shutdown.listener_close_delay`), the rest of the delay is
+    skipped as well. corral closes the listener at once (step 2), then
+    closes every client connection and discards their upstream connections
+    (step 4, with no drain), then runs step 5.
+    - Exchanges in progress are cut off as at the end of a drain.
+    - The same single record is emitted, and the process exits 0.
   - corral emits one warn record with `component=lifecycle` and the fixed
     message `shutdown forced by second signal`. Further signals are ignored.
 - **FR-64:** Test hooks (G-11).
@@ -1218,6 +1292,25 @@ the connection string pointing at corral.
     FR-8 does not report them.
   - The probe server binds to loopback only, and exposes counts and
     constants, never message bytes.
+  - *(Amendment 2, R-2)* **Normative hook interface** (from ADR-0014 and
+    ADR-0022; JSON field names inside `/conns` stay with ADR-0022):
+
+    | Variable | Effect in the `corraltest` build |
+    |---|---|
+    | `CORRALTEST_HOLD_DIR` | Directory for hold files and `probe.addr`. Holds take effect only when this and `CORRALTEST_HOLD_AT` are both set. |
+    | `CORRALTEST_HOLD_AT` | Comma-separated hold points. At each selected point corral creates `<dir>/held-<point>` and waits, for at most 30 s, until `<dir>/release-<point>` exists. Points: `laststep` (before binding the wire listener), `shutdown_delay` (start of `listener_close_delay`), `shutdown_listener_closed` (after FR-47 step 2), `shutdown_step3` (before idle connections are closed in step 3), `shutdown_drain` (keeps the drain open as if an exchange were in progress), `shutdown_drain_expired` (before step 4), `shutdown_pool_close` (before step 5). The SPEC-003 points `logger` and `checkconfig` keep their files `<dir>/held` and `<dir>/release` (ADR-0014). Unknown point names hold nothing. |
+    | `CORRALTEST_POOL_ORDER=roundrobin` | The pool hands out idle connections in round-robin order. The default is most-recently-used. |
+    | `CORRALTEST_PANIC_COMMAND=<name>` | The client handler panics after classifying a message whose command name equals `<name>`. |
+    | `CORRALTEST_PROBE_LISTEN=<loopback host:port>` | Starts the probe HTTP server on a loopback address only, and writes its bound address to `<CORRALTEST_HOLD_DIR>/probe.addr`. |
+    | `CORRALTEST_REGISTRY` | SPEC-003 test registry option (ADR-0014). Not used by SPEC-002. |
+
+    | Probe endpoint | Returns |
+    |---|---|
+    | `GET /conns` | JSON with, for each open client connection ID: the bytes read for the current message before a lease, the maximum bytes read before a lease, and the peak bytes held for one reply. Counts only. |
+    | `GET /constants` | `{"L": 65536, "K": 65536}`. |
+
+    `CORRALTEST_REQUIRE_DOCKER` is read by the test harness, not by corral,
+    and is not a hook.
 - **FR-65:** Operator documentation file (G-10). The FR-51 statements are in
   `docs/operations/proxy.md`. The FR-38 request buffer limit L and the FR-58
   reply chunk K are both 65,536 bytes; this is normative, and the document
@@ -1299,10 +1392,10 @@ Every row has a SPEC-001 FR-29 class and detail (Amendment 3):
 | authentication state failing | 6 | `HostUnreachable` | `upstream_auth_failed` | `server` | yes |
 | upstream incompatible | 6 | `HostUnreachable` | `upstream_incompatible` | `config` | yes |
 | shutting down | 91 | `ShutdownInProgress` | `shutting_down` | `rejected` | yes |
-| `saslStart`, `saslContinue`, `authenticate` | 18 | `AuthenticationFailed` | `client_auth_unsupported` | `rejected` | no |
-| `getnonce`, `logout` | 115 | `CommandNotSupported` | `client_auth_unsupported` | `rejected` | no |
-| blocked command (FR-33) | 13 | `Unauthorized` | `command_blocked` | `rejected` | no |
-| non-handshake OP_QUERY | 352 | `UnsupportedOpQueryCommand` | `unsupported_opcode` | `protocol` | no |
+| `saslStart`, `saslContinue`, `authenticate` (OP_MSG) | 18 | `AuthenticationFailed` | `client_auth_unsupported` | `rejected` | no |
+| `getnonce`, `logout` (OP_MSG) | 115 | `CommandNotSupported` | `client_auth_unsupported` | `rejected` | no |
+| blocked command (FR-33, OP_MSG) | 13 | `Unauthorized` | `command_blocked` | `rejected` | no |
+| non-handshake OP_QUERY, including auth and blocked commands (Amendment 2, R-1) | 352 | `UnsupportedOpQueryCommand` | `unsupported_opcode` | `protocol` | no |
 | repeated client metadata | 186 | `ClientMetadataCannotBeMutated` | `handshake_rejected` | `rejected` | no |
 | `loadBalanced: true` handshake | 72 | `InvalidOptions` | `handshake_rejected` | `rejected` | no |
 
@@ -1378,10 +1471,14 @@ Definitions:
   - `server_error`: an upstream reply with `ok: 0` was delivered.
   - `proxy_error`: a synthesized error (or, for `moreToCome`, a refusal
     under FR-59), or the client connection was closed during the exchange
-    (FR-38, FR-40, FR-57).
+    (FR-38, FR-40, FR-41 mid-message, FR-57).
 - `corral_request_duration_seconds` runs from the moment the first byte of
   the request is read to the moment the reply has been fully written, or for
-  `moreToCome`, to the end of the barrier.
+  `moreToCome`, to the end of the barrier. *(Amendment 2)* For a request
+  that ends with the connection closing (FR-38, FR-40, FR-41 mid-message,
+  FR-57, and protocol errors after the first byte), it runs until the close
+  is detected or performed. Every request counted in `corral_requests_total`
+  is observed exactly once.
 - `corral_requests_dropped_total` counts `moreToCome` messages that were
   refused (FR-59).
 - *(Amendment 1, G-4)* `corral_request_errors_total{error_class}` is
@@ -1417,6 +1514,13 @@ Definitions:
   Connections closed before any message byte is read (limit exceeded, TLS
   failure, idle timeout, client close) are not requests. This makes the
   AC-39 equality checkable.
+- *(Amendment 2, R-3)* **Client closes mid-message.** One request with
+  `outcome="proxy_error"`, labelled with the command name if read,
+  otherwise `other`. It counts once in `corral_request_errors_total` with
+  class `network`, and the close reason is `client_closed`. It is not counted
+  in `corral_protocol_errors_total`. It is observed once in
+  `corral_request_duration_seconds`, ending when the close is detected
+  (FR-41).
 - *(Amendment 1, G-3)* `corral_protocol_errors_total` counts only protocol
   errors that close a connection (client side) or discard it (upstream
   side, including FR-62 unsolicited data). The 352 refusal (FR-8) is not
@@ -1467,10 +1571,10 @@ declares its enumeration. Records carrying `error` also carry
 | `upstream` | error | `upstream incompatible` | `reason` (incompatibility reasons), `server.address`, `server.port` | on transition only |
 | `upstream` | info | `upstream available` | none | on transition only |
 | `upstream` | info | `upstream primary changed` | `server.address`, `server.port` | |
-| `upstream` | warn | `upstream target marked not primary` | `error` (`server`), `corral.error.detail` (`other`), `server.address`, `server.port`, `db.response.status_code`, `corral.db.response.code_name` (from the forwarded upstream reply, so SPEC-001 FR-23 allows them) | rate-limited; an error record reporting the upstream's error |
+| `upstream` | warn | `upstream target marked not primary` | `error` (`server`), `corral.error.detail` (`other`), `server.address`, `server.port`, `db.response.status_code`, `corral.db.response.code_name` (from the forwarded upstream reply or, per Amendment 2 R-5, from the barrier `ping` reply, so SPEC-001 FR-23 allows them) | rate-limited; an error record reporting the upstream's error |
 | `upstream` | warn | `upstream protocol error` | `error`, `corral.error.detail`, `server.address`, `server.port` | rate-limited; also used for FR-62 unsolicited data |
 | `upstream` | warn | `upstream barrier failed` | `error`, `corral.error.detail`, `server.address`, `server.port` | rate-limited |
-| `lifecycle` | warn | `shutdown forced by second signal` | none | FR-63 (Amendment 1); once per process |
+| `lifecycle` | warn | `shutdown forced by second signal` | none | FR-63 (Amendments 1 and 2); once per process |
 
 ### SPEC-001 amendments requested by this spec (SPEC-001 Amendment 3; package approved by the Owner, 2026-10-24)
 
@@ -1512,7 +1616,8 @@ package and need Owner approval of the Amendment 3 text.
 
 Amendment 1 of this spec needs no further SPEC-001 change. It adds no
 metric, label, error detail, readiness reason or log key. Its one new
-record uses the existing `lifecycle` component.
+record uses the existing `lifecycle` component. Amendment 2 needs no SPEC-001
+change either; it adds no new signal.
 
 ## Behavior on failure
 
@@ -1521,11 +1626,11 @@ record uses the existing `lifecycle` component.
 | Invalid or missing setting, secret on the command line, cross-setting rule broken, unreadable PEM | n/a | exit 2 with SPEC-003 records, before binding anything (FR-55) |
 | Wire listener cannot bind | n/a | exit 1, `setting=proxy.listen` (FR-1) |
 | Malformed frame, bad length, OP_COMPRESSED, legacy opcode, bad flags or checksum, invalid body, deciding field beyond the buffer | connection closed, no reply | counts; rate-limited warn (FR-5 to FR-7, FR-38) |
-| Duplicated inspected field, or a kind-1 section named like an inspected field (Amendment 1) | connection closed, no reply | nothing forwarded when detected before a lease; otherwise the upstream connection is discarded and never receives the complete message; `malformed_message` (FR-38, FR-60) |
+| Duplicated inspected field (including the command name), or a kind-1 section named like an inspected field other than the command name (Amendments 1 and 2) | connection closed, no reply | nothing forwarded when detected before a lease; otherwise the upstream connection is discarded and never receives the complete message; `malformed_message` (FR-38, FR-60) |
 | Malformed OP_QUERY (Amendment 1) | connection closed, no reply | `malformed_message` (FR-8) |
-| Non-handshake OP_QUERY | OP_REPLY `QueryFailure`, code 352 | connection stays open; not a protocol-error count (FR-8) |
-| Client sends auth command | error 18 / 115 | not forwarded; counts; rate-limited warn (FR-23) |
-| Client sends a blocked admin command | error 13 | not forwarded; counts; rate-limited warn (FR-33) |
+| Non-handshake OP_QUERY, including auth and blocked commands (Amendment 2) | OP_REPLY `QueryFailure`, code 352 | connection stays open; not a protocol-error count (FR-8) |
+| Client sends auth command over OP_MSG | error 18 / 115 | not forwarded; counts; rate-limited warn (FR-23) |
+| Client sends a blocked admin command over OP_MSG | error 13 | not forwarded; counts; rate-limited warn (FR-33) |
 | Pool full, wait exceeds `pool.checkout_timeout` | error 262 + labels | request read to its end and discarded; checkout span in error (FR-27, FR-38, FR-39) |
 | Wait queue full | error 262 + labels, at once | (FR-27, FR-39) |
 | Upstream never reached, auth failing, or incompatible | error 6 + labels at once; handshakes fail only when never reached or incompatible | readiness 503 with reason (FR-19, FR-56, FR-46) |
@@ -1536,11 +1641,12 @@ record uses the existing `lifecycle` component.
 | Unsolicited bytes or close on an idle pool connection (Amendment 1) | nothing | connection discarded; the checkout uses another connection (FR-62) |
 | Client stalls mid-message or reads a reply too slowly | client connection closed after `proxy.client_io_timeout` | lease returned or upstream connection discarded (FR-57) |
 | Client disconnects mid-exchange | n/a | upstream connection discarded, or the request is removed from the queue (best effort) (FR-41); a barrier still completes (FR-29) |
-| Barrier `ping` fails after a `moreToCome` message | nothing | upstream connection discarded; client connection open (FR-29) |
+| Client closes mid-message (Amendment 2) | n/a | one `proxy_error` request, class `network`, `reason=client_closed`; a partly streamed upstream connection is discarded (FR-41) |
+| Barrier `ping` fails after a `moreToCome` message | nothing | upstream connection discarded; client connection open; a not-primary code in the ping reply also marks the host and logs it (FR-29) |
 | `moreToCome` message refused | nothing | dropped and counted (FR-59) |
 | Panic in a connection handler | that client connection closed | recovered; other clients unaffected (FR-42) |
 | Graceful shutdown | in-flight exchanges finish; late messages get error 91; connections closed | FR-47 |
-| Second SIGTERM/SIGINT during shutdown (Amendment 1) | remaining connections closed | drain ends at once; exit 0 (FR-63) |
+| Second SIGTERM/SIGINT during shutdown (Amendments 1 and 2) | remaining connections closed | rest of `listener_close_delay` skipped, drain ends at once; exit 0 (FR-63) |
 | Client TLS handshake fails, stalls, or no client certificate under mutual TLS | connection closed | counts; rate-limited warn (FR-44) |
 
 corral itself never retries a request upstream. Retries are left to the
@@ -1635,9 +1741,11 @@ drivers, which the error codes and labels enable.
     sessions, which bind cursors to an `lsid`;
   - a `pipeline` sent in a kind-1 section, and duplicated inspected fields
     that make corral read a different value than the server. These were
-    bypasses of the FR-33 block; FR-60 now **refuses** them (connection
-    closed, `malformed_message`). This conservative handling is marked for
-    Owner confirmation.
+    bypasses of the FR-33 block, and FR-60 **refuses** them (connection
+    closed, `malformed_message`; confirmed by the Owner as OPEN-A1). A kind-1
+    section named like the command name is not refused (Amendment 2, A-Q1).
+    It is not a bypass, because the server takes the command from the body's
+    first key.
 
   The mitigation for the remaining routes is the FR-51 least-privilege
   guidance for the service user, and keeping session and cursor IDs out of
@@ -2260,12 +2368,97 @@ Added by Amendment 1:
   - each of these counts as one `corral_requests_total{command="aggregate",outcome="proxy_error"}`,
     and an HTTP `GET` counts as one with `command="other"`.
 
+Added by Amendment 2:
+
+- **AC-50** (FR-8, FR-23, FR-33, FR-61; R-1): Twin (raw-socket client).
+  - Each of these OP_QUERY messages on `admin.$cmd` gets an OP_REPLY with
+    `QueryFailure` set and code 352:
+    - `{saslStart: 1, …}`;
+    - `{getnonce: 1}`;
+    - `{currentOp: 1}`;
+    - `{$query: {killOp: 1, op: 1}}`.
+  - For each, the twin receives nothing, and the connection stays open.
+  - The `command` labels are `saslStart`, `other` (`getnonce` is not
+    allowlisted), `other` (`currentOp`), and `other` (`killOp`, taken from
+    the first key inside `$query`). A `$query`-wrapped `{saslStart: 1}` is
+    labelled `saslStart`.
+  - `corral_client_auth_rejected_total` and `corral_commands_blocked_total`
+    are unchanged.
+  - `corral_requests_total{outcome="proxy_error"}` and
+    `corral_request_errors_total{error_class="protocol"}` each increase by
+    one per message.
+- **AC-51** (FR-64; R-2): Functional, with the `corraltest` build:
+  - **Hold points:** with `CORRALTEST_HOLD_DIR` set and `CORRALTEST_HOLD_AT`
+    listing each FR-64 point in turn, corral creates `held-<point>` at that
+    point and proceeds only after `release-<point>` exists. Without the
+    release file, it proceeds after at most 30 s.
+  - **Unknown point:** `CORRALTEST_HOLD_AT=nosuchpoint` holds nothing.
+  - **Probe:** with `CORRALTEST_PROBE_LISTEN=127.0.0.1:0`:
+    - `probe.addr` holds a loopback address;
+    - `GET /constants` returns exactly `{"L": 65536, "K": 65536}`;
+    - `GET /conns` lists each open client connection ID with the three
+      counts, and contains no message bytes (marker check).
+  - **Pool order and panic:** `CORRALTEST_POOL_ORDER=roundrobin` and
+    `CORRALTEST_PANIC_COMMAND` behave as FR-64 states. These are also used by
+    AC-16 and AC-22.
+- **AC-52** (FR-41, FR-48; R-3): Twin (raw-socket client):
+  - **Command name read:** a client sends a header and the first 100 bytes of
+    a `find` body (enough for the command name), then closes. The results:
+    - `corral_requests_total{command="find",outcome="proxy_error"}` and
+      `corral_request_errors_total{error_class="network"}` each increase by
+      1;
+    - `corral_protocol_errors_total` is unchanged;
+    - the close is counted with `reason="client_closed"`;
+    - `corral_request_duration_seconds{command="find"}` gains exactly one
+      observation.
+  - **Command name not read:** a client sends 8 bytes of a header, then
+    closes. The request is counted with `command="other"`.
+  - **Partly streamed:** a client sends most of a 5 MB `insert` with a pool
+    connection free, then resets the connection. The twin's upstream
+    connection is closed with `reason=client_abandoned`, and the twin never
+    receives a complete message.
+- **AC-53** (FR-63; R-4): Twin, using the `corraltest` build with
+  `proxy.shutdown.listener_close_delay=60s` and
+  `CORRALTEST_HOLD_AT=shutdown_pool_close`:
+  - after SIGTERM, a new client connection is still accepted;
+  - a raw client starts an exchange whose reply the twin holds;
+  - a second SIGTERM 1 s later skips the rest of the delay;
+  - while corral is held at `shutdown_pool_close` (after the listener has
+    closed and client connections have been closed), a new connection
+    attempt is refused, and the held client connection has been closed with
+    no reply;
+  - after `release-shutdown_pool_close` is created, the process exits 0
+    well before the 60 s delay would have ended (within the SPEC-001 FR-34
+    flush bound plus a tolerance);
+  - exactly one `shutdown forced by second signal` record is emitted.
+- **AC-54** (FR-29, FR-49; R-5): Twin, replica-set mode:
+  - a barrier `ping` reply with code 10107 produces both an `upstream target
+    marked not primary` record, with `db.response.status_code="10107"`, and
+    an `upstream barrier failed` record;
+  - in a separate run, a ping reply with code 91 produces both records, with
+    `db.response.status_code="91"`.
+
+  Both records are subject to their rate limits, so each run starts with a
+  fresh limiter.
+- **AC-55** (FR-60; A-Q1, R-6): Twin (raw-socket client).
+  - **Kind-1 nesting:**
+    - an `insert` whose body is shallow but whose single kind-1 `documents`
+      document is nested 1025 levels (counted from that document as level
+      1) gets `malformed_message`;
+    - the same document nested exactly 1024 levels is forwarded.
+  - **Duplicate command name:** `{find: "a", filter: {}, find: "b", $db: …}`
+    gets `malformed_message`, and the twin receives nothing.
+  - **Kind-1 named like the command:** a `find` command with a kind-1 section
+    whose identifier is `find` is not refused by corral. It is forwarded to
+    the twin, and the twin's reply is returned to the client unchanged.
+
 ## Open questions
 
 Must be empty before approval.
 
-None. OPEN-A1 to OPEN-A5 (Amendment 1) were resolved by the Owner on
-2026-10-24; see the Decisions log.
+None for Amendment 2. A-Q1 was decided by the Owner ("skip"). R-1 to R-6
+carry the spec-writer's recommended defaults, which the Owner approves or
+overrides with the text (Decisions log).
 
 ## Decisions log
 
@@ -2306,3 +2499,6 @@ part of Q1 (standalone) and Q5 (cross-client commands), and refined Q11/Q9
 | 2026-10-24 | **Amendment 1**, gap fixes G-1 to G-20 (except G-16, a SPEC-003 matter) found while deriving acceptance tests. These are spec-writer resolutions; items OPEN-A1 to OPEN-A5 need Owner confirmation, and the rest the Owner may override when approving the text: <br>**G-1:** per-opcode minimum `messageLength` (OP_MSG 26, OP_QUERY 34, others 16); lengths are signed, and negative or too short is `malformed_message` (FR-5). <br>**G-2:** a fixed order of framing checks decides the detail; checksum is reported last (FR-5). <br>**G-3:** OP_QUERY structural validation (`malformed_message`); a 352 refusal is not a protocol-error count but is a `proxy_error` request with class `protocol` (FR-8, Metrics). <br>**G-4:** `corral_request_errors_total` is one per `proxy_error` request, by class; `accepted_total` includes over-limit and TLS-failed connections; `connect_errors_total` includes auth failures, with `auth_failures_total` as the subset (planner defaults adopted). <br>**G-5:** handshake, auth and blocked command names match case-sensitively; other spellings are ordinary commands (FR-13). <br>**G-6/G-7:** FR-61 order of handling; a refused first handshake still counts as first (planner default P9); within a handshake: 72, then 186, then 6; local refusals come before fail-fast. <br>**G-8:** "reached" means a successful compatible `hello` check, whatever the auth outcome; with auth failing since startup, handshakes succeed and requests get 6 / `upstream_auth_failed` (FR-19). <br>**G-9:** readiness follows the monitoring view; pool connection failures act only through immediate checks, and pool auth failures still count (FR-46). <br>**G-10:** L = K = 65,536 bytes (L includes the header), normative; operator document `docs/operations/proxy.md` (FR-38, FR-58, FR-65). <br>**G-11:** hooks only in the `corraltest` build, enabled by `CORRALTEST_*` variables per ADR-0014 and ADR-0022 (FR-64). <br>**G-12:** a not-primary code in the barrier ping reply marks the host; a client disconnect during a barrier is not "in flight" (FR-29, FR-41). <br>**G-13:** single-`mongos`: only top-level 91 / 11600 mark the target (FR-35). <br>**G-14:** residual exposure list extended (session and cursor IDs under the shared identity); bypasses of the FR-33 block (kind-1 `pipeline`, duplicated inspected fields) are refused (FR-60). <br>**G-15:** the connection limit is checked before the TLS handshake; the TLS handshake is bounded by `proxy.client_io_timeout` (planner P8) (FR-2, FR-44, FR-57). <br>**G-17:** unsolicited bytes or a close on an idle pool connection: connection discarded, request moved to another connection (FR-62). <br>**G-18:** a second signal ends the drain at once and exits 0, with one `lifecycle` warn record (FR-63). <br>**G-19:** full recursive structural BSON validation of the body and kind-1 documents (planner P3); no UTF-8 check on values; nesting limit 1024 levels, with the top-level document as level 1 and arrays counting like documents. This is above any server's `maxBSONDepth` (default 200, configurable 21–999), so corral never refuses what a server would accept (FR-60; changed from 256 by the challenge review, M1). <br>**G-20:** codes inside `writeErrors[]` do not mark the host (FR-9, FR-35). <br>No SPEC-001 change is needed. ACs AC-37 to AC-48 added; AC-19, AC-28 and AC-35 updated. | Gaps raised while deriving acceptance tests from approved revision 5, relayed by the Orchestrator, 2026-10-24. Approved and promoted by the Owner, 2026-10-24 (see the approval row). |
 | 2026-10-24 | Amendment 1, challenge-review fixes. These are spec-writer resolutions, not new product decisions; OPEN-A1 to OPEN-A5 are unchanged: <br>**M1:** the FR-60 nesting limit is 1024 (top-level document = level 1, arrays count like documents), above any server `maxBSONDepth` setting; AC-44 (1025 refused, 1024 forwarded, about 8 KiB within L), the resource bounds and the G-19 entry are updated. <br>**S1:** the general "kind-1 identifier duplicates a body key" check is dropped (unbounded memory, and the server rejects it anyway). Only identifiers equal to an inspected field's name are refused, and FR-9 now reads only inspected names. <br>**S2:** FR-60 says nothing is forwarded when detected before a lease (always the case within L); otherwise FR-38 applies. AC-44 states that its messages are within L. <br>**S3:** FR-38 requires validation before writing upstream, and holds back the final byte(s), including any checksum, until every check has passed, so a failing message never reaches the upstream complete; AC-49 added. <br>**S4:** a client protocol error or I/O timeout that closes the connection after a message's first byte counts as one `proxy_error` request, labelled with its command if known, else `other`, and once in `corral_request_errors_total`. <br>**S5:** AC-42 adds a barrier-ping 91 case in replica-set mode. | Challenge review REQUEST_CHANGES on Amendment 1, relayed by the Orchestrator, 2026-10-24. |
 | 2026-10-24 | Amendment 1 approved by the Owner and promoted, with OPEN-A1 = close the connection (malformed_message) for duplicated inspected fields or an inspected field sent as a kind-1 section, and OPEN-A2..A5 as proposed (single-mongos marks only on top-level 91/11600; second signal exits 0; handshake order 72→186→6 and a refused first handshake counts; client disconnect does not abort a barrier). | Owner approval, 2026-10-24. |
+| 2026-10-24 | **Amendment 2.** <br>**A-Q1 (Owner decision "skip"):** FR-60 does not compare kind-1 section identifiers with the command name. That comparison would need unbounded memory and closes no bypass, because the server takes the command from the body's first key. A duplicated command name inside the body is still refused (FR-60, Terms, AC-55). <br>Recommended defaults, for Owner approval with the text: <br>**R-1:** an OP_QUERY whose command is an auth command or a blocked command gets the FR-8 352 OP_REPLY (`QueryFailure`), not 18, 115 or 13. OP_QUERY carries only the handshake, so FR-61 steps 3 and 4 apply to OP_MSG only. These refusals are not counted in the auth-rejected or blocked counters (FR-8, FR-23, FR-33, FR-61, AC-50). <br>**R-2:** the `corraltest` hook variables (`CORRALTEST_HOLD_DIR`, `CORRALTEST_HOLD_AT` with its points, `CORRALTEST_POOL_ORDER`, `CORRALTEST_PANIC_COMMAND`, `CORRALTEST_PROBE_LISTEN`) and the probe endpoints `/conns` and `/constants` are now normative in FR-64, taken from ADR-0014, ADR-0022 and `plans/SPEC-002.md`; JSON field names inside `/conns` stay with ADR-0022 (AC-51). <br>**R-3:** a client that closes mid-message after the first byte produces one `proxy_error` request (command label if read, else `other`), class `network` with the classified detail, close reason `client_closed`, and no protocol-error count. A partly streamed upstream connection is discarded with `client_abandoned` and never receives the complete message (FR-41, Metrics, AC-52). <br>**R-4:** a second signal during `listener_close_delay` skips the rest of the delay and the drain: listener closed at once, all client connections closed, step 5, one record, exit 0 (FR-63, AC-53). <br>**R-5:** a not-primary code in the barrier ping reply emits the `upstream target marked not primary` record (with that reply's code) as well as `upstream barrier failed` (FR-29, log table, AC-54). <br>**R-6:** each kind-1 document (and each OP_QUERY document) counts nesting from level 1 on its own; a duplicated first key such as `{find: "a", find: "b"}` is a duplicated inspected field (FR-60, AC-55). <br>**Also:** the stale FR-52 sentence pointing at the SPEC-001 Amendment 3 draft is replaced, since Amendment 3 is approved and promoted. No SPEC-001 change is needed. AC-50 to AC-55 added. | Owner decision on A-Q1 and Orchestrator request for R-1 to R-6, 2026-10-24. Promotion awaits Owner approval of the text. |
+| 2026-10-24 | Amendment 2, challenge-review fixes (spec-writer resolutions, no new product decision): <br>**M1:** AC-53 is now a twin test on the `corraltest` build. It holds at `shutdown_pool_close` to assert that new connections are refused and the held exchange was closed, then releases the hold and checks exit 0 and the single record. <br>**S1:** a `$query`-wrapped OP_QUERY takes its `command` label from the first key inside `$query`, the same key used for handshake detection and R-1 (FR-8 G-3 note, AC-50). <br>**S2:** every counted request is observed once in `corral_request_duration_seconds`; for requests ending in a close (including a mid-message client close), the duration ends when the close is detected or performed (Metrics definitions, FR-41, AC-52). <br>**S3:** AC-54 adds a ping-reply 91 case. <br>**S4:** AC-55 says the twin's reply is returned unchanged. | Challenge review of Amendment 2, relayed by the Orchestrator, 2026-10-24. |
+| 2026-10-24 | Amendment 2 (incl. challenge-review fixes M1, S1–S4) approved by the Owner and promoted; R-1 to R-6 resolutions confirmed. | Owner approval, 2026-10-24. |
