@@ -17,6 +17,7 @@ import (
 
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/metrics"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/tracing/spanqueue"
+	"github.com/sorinpanduru/corral/internal/testkit/fakeclock"
 )
 
 // Expected API (from plans/SPEC-001.md T12):
@@ -80,6 +81,8 @@ type fakeExporter struct {
 	err           error
 	gate          chan struct{} // if non-nil, ExportSpans blocks until closed or ctx done
 	entered       chan struct{} // signalled (non-blocking) on each ExportSpans entry
+	delay         time.Duration // per-export processing time (slow exporter)
+	cancelled     atomic.Int32  // exports whose ctx was cancelled/expired while blocked
 }
 
 func newExporter() *fakeExporter {
@@ -120,6 +123,15 @@ func (e *fakeExporter) ExportSpans(ctx context.Context, spans []trace.ReadOnlySp
 		select {
 		case <-gate:
 		case <-ctx.Done():
+			e.cancelled.Add(1)
+			return ctx.Err()
+		}
+	}
+	if e.delay > 0 {
+		select {
+		case <-time.After(e.delay):
+		case <-ctx.Done():
+			e.cancelled.Add(1)
 			return ctx.Err()
 		}
 	}
@@ -382,16 +394,36 @@ func TestBatchSizeTriggersExport_FR37(t *testing.T) {
 	}
 }
 
-// FR-37: spans queued but below batch size are exported once ScheduleDelay
-// elapses (real time; bounds are generous).
-func TestScheduleDelayExports_FR37(t *testing.T) {
+// FR-37: with an injected manual ticker, spans below batch size are not
+// exported without a tick and are exported after one. The ticker is created
+// with the configured ScheduleDelay.
+func TestScheduleDelayExportsOnTick_FR37(t *testing.T) {
 	exp := newExporter()
-	p := start(t, exp, cfg(10, 10, 600*time.Millisecond), &fakeCounter{})
-	p.OnEnd(sampled("only"))
-	if exp.Received() != 0 {
-		t.Fatal("exported before the schedule delay")
+	tick := make(chan time.Time)
+	var gotDelay atomic.Int64
+	nt := func(d time.Duration) (<-chan time.Time, func()) {
+		gotDelay.Store(int64(d))
+		return tick, func() {}
 	}
-	eventually(t, "export after schedule delay", func() bool { return exp.Received() == 1 })
+	clk := fakeclock.New(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	p := spanqueue.New(exp, cfg(10, 10, 5*time.Second), &fakeCounter{}, spanqueue.WithTicker(nt))
+	t.Cleanup(func() { exp.release(); _ = p.Shutdown(flushCtx(t)) })
+
+	p.OnEnd(sampled("only"))
+	time.Sleep(100 * time.Millisecond)
+	if exp.Received() != 0 {
+		t.Fatal("exported without a tick")
+	}
+	if d := time.Duration(gotDelay.Load()); d != 5*time.Second {
+		t.Fatalf("ticker created with %v, want ScheduleDelay 5s", d)
+	}
+	clk.Advance(5 * time.Second)
+	select {
+	case tick <- clk.Now():
+	case <-time.After(waitMax):
+		t.Fatal("worker not receiving ticks")
+	}
+	eventually(t, "export after tick", func() bool { return exp.Received() == 1 })
 }
 
 // FR-37: each export call is bounded by ExportTimeout.
@@ -656,5 +688,162 @@ func TestConcurrentOnEnd_Race(t *testing.T) {
 	}
 	if got := int(dc.Total()) + exp.Received(); got != int(ended.Load()) {
 		t.Fatalf("drops(%v)+received(%d)=%d, ended=%d", dc.Total(), exp.Received(), got, ended.Load())
+	}
+}
+
+// FR-34: exporter is NEVER released. Shutdown returns within the bound with a
+// non-nil error, shuts the exporter down exactly once, cancels the in-flight
+// export, and the worker exits.
+func TestShutdownNeverReleasedExporter_FR34(t *testing.T) {
+	runtime.GC()
+	before := runtime.NumGoroutine()
+
+	exp := newBlockedExporter()
+	dc := &fakeCounter{}
+	p := spanqueue.New(exp, cfg(10, 2, longDelay), dc)
+	for i := 0; i < 6; i++ {
+		p.OnEnd(sampled(fmt.Sprintf("s%d", i)))
+	}
+	select {
+	case <-exp.entered:
+	case <-time.After(waitMax):
+		t.Fatal("export never started")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	var err error
+	runBounded(t, 3*time.Second, "Shutdown", func() { err = p.Shutdown(ctx) })
+	if err == nil {
+		t.Fatal("Shutdown must return a non-nil error when the deadline is hit")
+	}
+	if n := exp.ShutdownCalls(); n != 1 {
+		t.Fatalf("exporter Shutdown calls=%d, want 1", n)
+	}
+	eventually(t, "in-flight export ctx cancelled", func() bool { return exp.cancelled.Load() >= 1 })
+	runBounded(t, time.Second, "ForceFlush after Shutdown", func() { _ = p.ForceFlush(context.Background()) })
+	eventually(t, "goroutines back to baseline", func() bool { return runtime.NumGoroutine() <= before })
+	if len(dc.Calls()) != 0 {
+		t.Fatalf("shutdown losses must not touch the counter: %v", dc.Calls())
+	}
+}
+
+// Race: OnEnd, Shutdown (x3) and ForceFlush concurrently, repeated. No panic
+// or hang, exactly one exporter Shutdown.
+func TestConcurrentOnEndShutdownForceFlush_Race(t *testing.T) {
+	for iter := 0; iter < 25; iter++ {
+		exp := newExporter()
+		p := spanqueue.New(exp, cfg(8, 4, time.Millisecond), &fakeCounter{})
+		var wg sync.WaitGroup
+		for w := 0; w < 4; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := 0; i < 200; i++ {
+					p.OnEnd(sampled("s"))
+				}
+			}()
+		}
+		for w := 0; w < 2; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				for i := 0; i < 5; i++ {
+					_ = p.ForceFlush(ctx)
+				}
+			}()
+		}
+		for w := 0; w < 3; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				time.Sleep(time.Millisecond)
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				_ = p.Shutdown(ctx)
+			}()
+		}
+		runBounded(t, 20*time.Second, "concurrent OnEnd/ForceFlush/Shutdown", wg.Wait)
+		if n := exp.ShutdownCalls(); n != 1 {
+			t.Fatalf("iter %d: exporter Shutdown calls=%d, want exactly 1", iter, n)
+		}
+	}
+}
+
+// FR-34: a second Shutdown whose own ctx expires before the first finishes
+// returns that ctx's error.
+func TestSecondShutdownReturnsOwnCtxErr_FR34(t *testing.T) {
+	exp := newBlockedExporter()
+	p := spanqueue.New(exp, cfg(10, 1, longDelay), &fakeCounter{})
+	t.Cleanup(func() { exp.release() })
+	p.OnEnd(sampled("stuck"))
+	select {
+	case <-exp.entered:
+	case <-time.After(waitMax):
+		t.Fatal("export never started")
+	}
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = p.Shutdown(ctx)
+	}()
+	time.Sleep(100 * time.Millisecond) // let the first Shutdown begin
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	var err error
+	runBounded(t, time.Second, "second Shutdown", func() { err = p.Shutdown(ctx) })
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second Shutdown err=%v, want context.DeadlineExceeded", err)
+	}
+	exp.release()
+	select {
+	case <-firstDone:
+	case <-time.After(waitMax):
+		t.Fatal("first Shutdown never finished")
+	}
+}
+
+// FR-34, FR-37 (decision): ForceFlush exports only the spans queued when it
+// was called. With a slow exporter and a producer that keeps enqueuing,
+// ForceFlush without a deadline returns within a bound, having exported the
+// snapshot.
+func TestForceFlushSnapshotOnly_FR34_FR37(t *testing.T) {
+	exp := newExporter()
+	exp.delay = 20 * time.Millisecond
+	p := start(t, exp, cfg(10000, 10, longDelay), &fakeCounter{})
+
+	const snapshot = 50
+	for i := 0; i < snapshot; i++ {
+		p.OnEnd(sampled(fmt.Sprintf("pre%d", i)))
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				p.OnEnd(sampled("live"))
+				time.Sleep(200 * time.Microsecond)
+			}
+		}
+	}()
+	defer func() { close(stop); wg.Wait() }()
+
+	time.Sleep(10 * time.Millisecond)
+	runBounded(t, 10*time.Second, "ForceFlush under continuous load", func() {
+		if err := p.ForceFlush(context.Background()); err != nil {
+			t.Errorf("ForceFlush: %v", err)
+		}
+	})
+	if got := exp.Received(); got < snapshot {
+		t.Fatalf("received=%d, want at least the %d spans queued before the flush", got, snapshot)
 	}
 }
