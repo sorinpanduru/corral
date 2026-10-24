@@ -15,7 +15,7 @@ func TestFactoryBindsComponent(t *testing.T) {
 	for _, c := range logging.Components() {
 		t.Run(string(c), func(t *testing.T) {
 			var buf syncBuffer
-			fac := logging.NewFactory(logging.NewHandler(&buf, logging.FormatJSON, slog.LevelInfo))
+			fac := logging.NewFactory(checked(t, logging.NewHandler(&buf, logging.FormatJSON, slog.LevelInfo), false))
 			l, err := fac.Logger(c)
 			if err != nil || l == nil {
 				t.Fatalf("Logger(%q) = %v, %v", c, l, err)
@@ -58,7 +58,7 @@ func TestFactoryComponentTopLevelOnce(t *testing.T) {
 // FR-7, AC-5 (factory part): components outside the fixed set are rejected.
 func TestFactoryRejectsUnknownComponent(t *testing.T) {
 	var buf syncBuffer
-	fac := logging.NewFactory(logging.NewHandler(&buf, logging.FormatJSON, slog.LevelInfo))
+	fac := logging.NewFactory(checked(t, logging.NewHandler(&buf, logging.FormatJSON, slog.LevelInfo), false))
 	for _, bad := range []string{"", "proxy", "CONFIG", "third_party", "admin-http", "unknown", marker(t, "cmp-")} {
 		l, err := fac.Logger(logging.Component(bad))
 		if err == nil {
@@ -83,7 +83,7 @@ func TestFactoryRejectsUnknownComponent(t *testing.T) {
 // FR-7: Factory.Handler returns the underlying handler.
 func TestFactoryHandlerNonNil(t *testing.T) {
 	var buf syncBuffer
-	fac := logging.NewFactory(logging.NewHandler(&buf, logging.FormatJSON, slog.LevelInfo))
+	fac := logging.NewFactory(checked(t, logging.NewHandler(&buf, logging.FormatJSON, slog.LevelInfo), false))
 	if fac.Handler() == nil {
 		t.Fatal("Handler() = nil")
 	}
