@@ -16,24 +16,41 @@ package otlpcollector_test
 //   options WithMode(Mode), WithHTTPRejectStatus(int), WithGRPCRejectCode(codes.Code);
 //   RecordedSpan{Name string; Attributes map[string]string; Events []RecordedEvent};
 //   RecordedEvent{Name string; Attributes map[string]string};
+//   RecordedSpan also has StatusCode (int32, the OTLP status code number, 2 = Error) and StatusMessage string;
+//   const MaxBodyBytes (4 MiB, untyped/int constant) caps HTTP bodies, also after gunzip;
 //   RequestInfo.Protocol is a string ("http" / "grpc"), ContentEncoding a string.
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"reflect"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	collectorpb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
+	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/grpc/codes"
 	_ "google.golang.org/grpc/encoding/gzip"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/sorinpanduru/corral/internal/testkit/otlpcollector"
 )
@@ -59,6 +76,7 @@ func stubs(res *resource.Resource) tracetest.SpanStubs {
 			Time:       now,
 			Attributes: []attribute.KeyValue{attribute.String("event.key", "event-value")},
 		}},
+		Status:   sdktrace.Status{Code: otelcodes.Error, Description: "synthetic status text"},
 		Resource: res,
 	}}
 }
@@ -181,6 +199,11 @@ func checkRecorded(t *testing.T, c *otlpcollector.Collector, proto string) {
 		s.Events[0].Attributes["event.key"] != "event-value" {
 		t.Errorf("span events = %+v", s.Events)
 	}
+	// Status is recorded: StatusCode is the OTLP status code number (2 = Error),
+	// StatusMessage the description.
+	if s.StatusCode != int32(tracev1.Status_STATUS_CODE_ERROR) || s.StatusMessage != "synthetic status text" {
+		t.Errorf("status = %q / %q", s.StatusCode, s.StatusMessage)
+	}
 	// AC-24, AC-27: resource attributes are exposed.
 	res := c.Resources()
 	if len(res) == 0 {
@@ -249,29 +272,45 @@ func TestHeadersRecorded(t *testing.T) { // AC-24
 }
 
 func TestRejectHTTP(t *testing.T) {
-	c := otlpcollector.Start(t, otlpcollector.WithMode(otlpcollector.ModeReject), otlpcollector.WithHTTPRejectStatus(503))
-	if err := export(newHTTPExp(t, c), 5*time.Second); err == nil {
-		t.Fatalf("export succeeded against rejecting collector")
-	}
-	if n := len(c.Spans()); n != 0 {
-		t.Errorf("rejected request recorded %d spans", n)
+	for _, st := range []int{503, 400} {
+		t.Run(fmt.Sprint(st), func(t *testing.T) {
+			c := otlpcollector.Start(t, otlpcollector.WithMode(otlpcollector.ModeReject), otlpcollector.WithHTTPRejectStatus(st))
+			err := export(newHTTPExp(t, c), 5*time.Second)
+			if err == nil {
+				t.Fatalf("export succeeded against rejecting collector")
+			}
+			// The configured status must reach the client. The exporter's
+			// error text does not reliably include it (retryable statuses
+			// are wrapped), so observe the raw response status.
+			if got := postRaw(t, c, bytes.NewReader(nil), ""); got != st {
+				t.Errorf("raw response status = %d, want configured %d", got, st)
+			}
+			if n := len(c.Spans()); n != 0 {
+				t.Errorf("rejected request recorded %d spans", n)
+			}
+		})
 	}
 }
 
 func TestRejectGRPC(t *testing.T) {
-	c := otlpcollector.Start(t, otlpcollector.WithMode(otlpcollector.ModeReject), otlpcollector.WithGRPCRejectCode(codes.Unavailable))
-	if err := export(newGRPCExp(t, c), 5*time.Second); err == nil {
-		t.Fatalf("export succeeded against rejecting collector")
-	}
-	if n := len(c.Spans()); n != 0 {
-		t.Errorf("rejected request recorded %d spans", n)
-	}
-}
-
-func TestRejectHTTP4xx(t *testing.T) {
-	c := otlpcollector.Start(t, otlpcollector.WithMode(otlpcollector.ModeReject), otlpcollector.WithHTTPRejectStatus(400))
-	if err := export(newHTTPExp(t, c), 5*time.Second); err == nil {
-		t.Fatalf("export succeeded against rejecting collector")
+	for _, code := range []codes.Code{codes.Unavailable, codes.PermissionDenied} {
+		t.Run(code.String(), func(t *testing.T) {
+			c := otlpcollector.Start(t, otlpcollector.WithMode(otlpcollector.ModeReject), otlpcollector.WithGRPCRejectCode(code))
+			err := export(newGRPCExp(t, c), 5*time.Second)
+			if err == nil {
+				t.Fatalf("export succeeded against rejecting collector")
+			}
+			got := codes.Unknown
+			if st, ok := status.FromError(err); ok {
+				got = st.Code()
+			}
+			if got != code && !strings.Contains(err.Error(), code.String()) {
+				t.Errorf("error %v does not carry configured code %v", err, code)
+			}
+			if n := len(c.Spans()); n != 0 {
+				t.Errorf("rejected request recorded %d spans", n)
+			}
+		})
 	}
 }
 
@@ -320,26 +359,279 @@ func TestUnresponsiveHoldsUntilClose(t *testing.T) { // AC-28
 	}
 }
 
-func TestUnresponsiveReleasedOnClose(t *testing.T) {
-	c := otlpcollector.Start(t, otlpcollector.WithMode(otlpcollector.ModeUnresponsive))
-	e := newHTTPExp(t, c, otlptracehttp.WithTimeout(30*time.Second))
-	errc := make(chan error, 1)
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		errc <- e.ExportSpans(ctx, stubs(nil).Snapshots())
-	}()
-	time.Sleep(300 * time.Millisecond)
-	select {
-	case err := <-errc:
-		t.Fatalf("export returned before Close: %v", err)
-	default:
+func waitRequests(t *testing.T, c *otlpcollector.Collector) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(c.Requests()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("request never reached the collector")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A request held in unresponsive mode must be failed (not implicitly
+// acknowledged) when the collector is closed, and Close must return promptly.
+func TestUnresponsiveInFlightFailsOnClose(t *testing.T) {
+	for name, mk := range map[string]func(*testing.T, *otlpcollector.Collector) exporter{
+		"http": func(t *testing.T, c *otlpcollector.Collector) exporter {
+			return newHTTPExp(t, c, otlptracehttp.WithTimeout(30*time.Second))
+		},
+		"grpc": func(t *testing.T, c *otlpcollector.Collector) exporter {
+			return newGRPCExp(t, c, otlptracegrpc.WithTimeout(30*time.Second))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := otlpcollector.Start(t, otlpcollector.WithMode(otlpcollector.ModeUnresponsive))
+			e := mk(t, c)
+			errc := make(chan error, 1)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				errc <- e.ExportSpans(ctx, stubs(nil).Snapshots())
+			}()
+			waitRequests(t, c)
+			select {
+			case err := <-errc:
+				t.Fatalf("export returned before Close: %v", err)
+			case <-time.After(200 * time.Millisecond):
+			}
+			done := make(chan struct{})
+			go func() { c.Close(); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("Close did not return promptly with a held request")
+			}
+			select {
+			case err := <-errc:
+				if err == nil {
+					t.Errorf("held request reported success after Close")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("held request not released by Close")
+			}
+			if n := len(c.Spans()); n != 0 {
+				t.Errorf("held request recorded %d spans", n)
+			}
+		})
+	}
+}
+
+func postRaw(t *testing.T, c *otlpcollector.Collector, body io.Reader, encoding string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, "http://"+hostPort(c.HTTPEndpoint())+"/v1/traces", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-protobuf")
+	if encoding != "" {
+		req.Header.Set("Content-Encoding", encoding)
+	}
+	cl := &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}
+	resp, err := cl.Do(req)
+	if err != nil {
+		// The server may close the connection after answering 413 while the
+		// client is still writing; treat as a distinct, reported failure.
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
+}
+
+func TestHTTPBodyOverLimitRejected(t *testing.T) { // security: bounded request size
+	c := otlpcollector.Start(t)
+	body := bytes.Repeat([]byte{0}, otlpcollector.MaxBodyBytes+1)
+	if got := postRaw(t, c, bytes.NewReader(body), ""); got != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413", got)
+	}
+	if n := len(c.Spans()); n != 0 {
+		t.Errorf("oversize body recorded %d spans", n)
+	}
+}
+
+func TestHTTPGzipBombRejectedWithBoundedMemory(t *testing.T) { // security
+	c := otlpcollector.Start(t)
+	var comp bytes.Buffer
+	zw := gzip.NewWriter(&comp)
+	chunk := make([]byte, 1<<20)
+	const expanded = 64 << 20 // far beyond MaxBodyBytes
+	for w := 0; w < expanded; w += len(chunk) {
+		if _, err := zw.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if comp.Len() > 1<<20 {
+		t.Fatalf("test bomb not small enough: %d bytes", comp.Len())
+	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	got := postRaw(t, c, bytes.NewReader(comp.Bytes()), "gzip")
+	runtime.ReadMemStats(&after)
+	if got != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413", got)
+	}
+	if n := len(c.Spans()); n != 0 {
+		t.Errorf("gzip bomb recorded %d spans", n)
+	}
+	// Decompression must be capped near MaxBodyBytes, not run to 64 MiB.
+	if d := after.TotalAlloc - before.TotalAlloc; d > 4*otlpcollector.MaxBodyBytes {
+		t.Errorf("allocated %d bytes handling the bomb, want <= %d", d, 4*otlpcollector.MaxBodyBytes)
+	}
+}
+
+func TestCloseWaitsForHandlersAndLeaksNoGoroutines(t *testing.T) {
+	settle := func(max int) int {
+		deadline := time.Now().Add(5 * time.Second)
+		n := runtime.NumGoroutine()
+		for n > max && time.Now().Before(deadline) {
+			time.Sleep(20 * time.Millisecond)
+			n = runtime.NumGoroutine()
+		}
+		return n
+	}
+	runtime.GC()
+	baseline := runtime.NumGoroutine()
+
+	c := otlpcollector.Start(t)
+	he, ge := newHTTPExp(t, c), newGRPCExp(t, c)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(2)
+		go func() { defer wg.Done(); _ = export(he, 5*time.Second) }()
+		go func() { defer wg.Done(); _ = export(ge, 5*time.Second) }()
 	}
 	c.Close()
-	select {
-	case <-errc:
-	case <-time.After(5 * time.Second):
-		t.Fatalf("held request not released by Close")
+	afterClose := len(c.Spans())
+	wg.Wait()
+	_ = he.Shutdown(context.Background())
+	_ = ge.Shutdown(context.Background())
+	time.Sleep(200 * time.Millisecond)
+	if n := len(c.Spans()); n != afterClose {
+		t.Errorf("spans recorded after Close returned: %d -> %d", afterClose, n)
+	}
+	// Small slack for runtime/grpc internals that exit asynchronously.
+	if n := settle(baseline + 2); n > baseline+2 {
+		t.Errorf("goroutines = %d after Close, baseline %d", n, baseline)
+	}
+}
+
+func mutateMap(v any) {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() != reflect.Map {
+		return
+	}
+	for _, k := range rv.MapKeys() {
+		rv.SetMapIndex(k, reflect.Value{})
+	}
+}
+
+func TestGettersReturnDeepCopies(t *testing.T) {
+	c := otlpcollector.Start(t)
+	if err := exportWithRes(t, newHTTPExp(t, c, otlptracehttp.WithHeaders(map[string]string{"x-synthetic": "v"}))); err != nil {
+		t.Fatal(err)
+	}
+	s1 := c.Spans()
+	s1[0].Name = "mutated"
+	s1[0].Attributes["synthetic.key"] = "mutated"
+	s1[0].Attributes["extra"] = "x"
+	s1[0].Events[0].Name = "mutated"
+	s1[0].Events[0].Attributes["event.key"] = "mutated"
+	s2 := c.Spans()
+	if len(s2) != 1 || s2[0].Name != "synthetic.span" || s2[0].Attributes["synthetic.key"] != "synthetic-value" ||
+		s2[0].Attributes["extra"] != "" || s2[0].Events[0].Name != "synthetic.event" ||
+		s2[0].Events[0].Attributes["event.key"] != "event-value" {
+		t.Errorf("Spans() not a deep copy: %+v", s2)
+	}
+
+	r1 := c.Resources()
+	r1[0]["service.name"] = "mutated"
+	delete(r1[0], "deployment.environment")
+	if r2 := c.Resources(); r2[0]["service.name"] != "corral-selftest" || r2[0]["deployment.environment"] != "synthetic" {
+		t.Errorf("Resources() not a deep copy: %v", r2)
+	}
+
+	q1 := c.Requests()
+	mutateMap(q1[0].Headers)
+	q1[0].ContentEncoding = "mutated"
+	q2 := c.Requests()
+	if q2[0].ContentEncoding == "mutated" || !strings.Contains(strings.ToLower(fmt.Sprint(q2[0].Headers)), "x-synthetic") {
+		t.Errorf("Requests() not a deep copy: %+v", q2[0])
+	}
+}
+
+// Attribute value forms (the contract for RecordedSpan.Attributes and
+// Resources): string as is; int "42"; bool "true"/"false"; double via
+// strconv.FormatFloat(v, 'g', -1, 64) ("1.5"); bytes standard base64 with
+// padding; array and kvlist as compact JSON of the natural types
+// (["a","b"], [1,2], {"k1":"v1","k2":2} with keys sorted).
+func TestNonStringAttributeForms(t *testing.T) {
+	str := func(v string) *commonpb.AnyValue {
+		return &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: v}}
+	}
+	num := func(v int64) *commonpb.AnyValue {
+		return &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: v}}
+	}
+	kv := func(k string, v *commonpb.AnyValue) *commonpb.KeyValue { return &commonpb.KeyValue{Key: k, Value: v} }
+	attrs := []*commonpb.KeyValue{
+		kv("a.int", num(42)),
+		kv("a.bool", &commonpb.AnyValue{Value: &commonpb.AnyValue_BoolValue{BoolValue: true}}),
+		kv("a.double", &commonpb.AnyValue{Value: &commonpb.AnyValue_DoubleValue{DoubleValue: 1.5}}),
+		kv("a.bytes", &commonpb.AnyValue{Value: &commonpb.AnyValue_BytesValue{BytesValue: []byte("synth")}}),
+		kv("a.array", &commonpb.AnyValue{Value: &commonpb.AnyValue_ArrayValue{ArrayValue: &commonpb.ArrayValue{Values: []*commonpb.AnyValue{str("a"), str("b")}}}}),
+		kv("a.intarray", &commonpb.AnyValue{Value: &commonpb.AnyValue_ArrayValue{ArrayValue: &commonpb.ArrayValue{Values: []*commonpb.AnyValue{num(1), num(2)}}}}),
+		kv("a.kvlist", &commonpb.AnyValue{Value: &commonpb.AnyValue_KvlistValue{KvlistValue: &commonpb.KeyValueList{Values: []*commonpb.KeyValue{kv("k2", num(2)), kv("k1", str("v1"))}}}}),
+		kv("a.str", str("plain")),
+	}
+	req := &collectorpb.ExportTraceServiceRequest{ResourceSpans: []*tracev1.ResourceSpans{{
+		Resource: &resourcepb.Resource{Attributes: []*commonpb.KeyValue{kv("r.int", num(7)), kv("service.name", str("corral-selftest"))}},
+		ScopeSpans: []*tracev1.ScopeSpans{{Spans: []*tracev1.Span{{
+			Name:              "typed.span",
+			TraceId:           bytes.Repeat([]byte{1}, 16),
+			SpanId:            bytes.Repeat([]byte{2}, 8),
+			StartTimeUnixNano: 1,
+			EndTimeUnixNano:   2,
+			Attributes:        attrs,
+			Status:            &tracev1.Status{Code: tracev1.Status_STATUS_CODE_ERROR, Message: "synthetic status text"},
+		}}}},
+	}}}
+	raw, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := otlpcollector.Start(t)
+	if got := postRaw(t, c, bytes.NewReader(raw), ""); got != http.StatusOK {
+		t.Fatalf("status = %d, want 200", got)
+	}
+	spans := c.Spans()
+	if len(spans) != 1 {
+		t.Fatalf("Spans() len = %d", len(spans))
+	}
+	want := map[string]string{
+		"a.int":      "42",
+		"a.bool":     "true",
+		"a.double":   "1.5",
+		"a.bytes":    base64.StdEncoding.EncodeToString([]byte("synth")),
+		"a.array":    `["a","b"]`,
+		"a.intarray": `[1,2]`,
+		"a.kvlist":   `{"k1":"v1","k2":2}`,
+		"a.str":      "plain",
+	}
+	for k, v := range want {
+		if got := spans[0].Attributes[k]; got != v {
+			t.Errorf("attribute %s = %q, want %q", k, got, v)
+		}
+	}
+	if spans[0].StatusCode != int32(tracev1.Status_STATUS_CODE_ERROR) || spans[0].StatusMessage != "synthetic status text" {
+		t.Errorf("status = %q / %q", spans[0].StatusCode, spans[0].StatusMessage)
+	}
+	if res := c.Resources(); len(res) == 0 || res[0]["r.int"] != "7" {
+		t.Errorf("resource attributes = %v", res)
 	}
 }
 
