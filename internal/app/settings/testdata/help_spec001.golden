@@ -1,0 +1,44 @@
+corral: MongoDB wire-protocol connection pooling proxy
+Usage: corral [--<setting>=<value> ...]
+
+admin.listen
+  flag:    --admin.listen=<value>
+  env:     CORRAL_ADMIN_LISTEN
+  type:    hostport
+  default: 127.0.0.1:9187
+  Admin HTTP listener address.
+
+log.format
+  flag:    --log.format=<value>
+  env:     CORRAL_LOG_FORMAT
+  type:    enum (json, text)
+  default: json
+  Log output format.
+
+log.level
+  flag:    --log.level=<value>
+  env:     CORRAL_LOG_LEVEL
+  type:    enum (debug, info, warn, error)
+  default: info
+  Minimum log level.
+
+tracing.enabled
+  flag:    --tracing.enabled=<value>
+  env:     CORRAL_TRACING_ENABLED
+  type:    bool
+  default: false
+  Enable OTLP tracing.
+
+tracing.sample_ratio
+  flag:    --tracing.sample_ratio=<value>
+  env:     CORRAL_TRACING_SAMPLE_RATIO
+  type:    float
+  default: 1.0
+  Trace sampling ratio.
+
+Control flags (no value allowed):
+  --help, -help, -h                print this help and exit
+  --version, -version              print the version and exit
+  --check-config, -check-config    validate the configuration and exit
+
+OTEL_* environment variables are honoured as described in the operator documentation.
