@@ -38,6 +38,17 @@ func TestMakefileRejectsUnsafeVersion(t *testing.T) {
 			t.Errorf("%s: the value was not rejected by the recipe check", name)
 		}
 	}
+	// `make -i` ignores recipe errors; the value must still not reach a shell
+	// command or a build.
+	for name, v := range map[string]string{
+		"multi-line": "1.0\n\"; echo INJECTED; echo \"",
+		"quote":      "x\"; echo INJECTED; echo \"",
+	} {
+		out, _ := run(v, "-i", "-s")
+		if strings.Contains(out, "INJECTED") {
+			t.Errorf("make -i, %s: the value was executed", name)
+		}
+	}
 	for _, v := range []string{"devel", "1.2.3-rc.1+x", "v0.9.0"} {
 		if out, err := run(v, "-n"); err != nil {
 			t.Errorf("VERSION %q rejected: %v\n%s", v, err, out)

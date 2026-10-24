@@ -126,7 +126,7 @@ func TestMakefileStampsVersion(t *testing.T) {
 			buildLine = l
 		}
 	}
-	if !strings.Contains(buildLine, "-ldflags") || !(strings.Contains(buildLine, "-X main.version=$(VERSION)") || strings.Contains(buildLine, "-X 'main.version=$(VERSION)'")) {
-		t.Errorf("the build recipe does not stamp main.version from $(VERSION)")
+	if !strings.Contains(buildLine, "-ldflags") || !(strings.Contains(buildLine, "-X main.version=$(VERSION)") || strings.Contains(buildLine, "-X 'main.version=$(VERSION)'") || strings.Contains(buildLine, "-X main.version=$$VERSION")) {
+		t.Errorf("the build recipe does not stamp main.version from VERSION")
 	}
 }
