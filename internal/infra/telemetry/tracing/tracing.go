@@ -77,7 +77,7 @@ func Start(ctx context.Context, o Options) (*Tracing, error) {
 			if o.Metrics == nil {
 				return nil, errNoMetrics
 			}
-			exp, err = newOTLP(ctx, cfg.Protocol)
+			exp, err = newOTLP(ctx, cfg.Protocol, o.Env)
 			if err != nil {
 				return nil, errStartExporter
 			}
@@ -118,12 +118,23 @@ func Start(ctx context.Context, o Options) (*Tracing, error) {
 	return &Tracing{enabled: true, tp: tp, sdk: tp, logger: o.Logger}, nil
 }
 
-func newOTLP(ctx context.Context, p Protocol) (sdktrace.SpanExporter, error) {
-	// The exporters read OTEL_EXPORTER_OTLP_* from the process environment.
+func newOTLP(ctx context.Context, p Protocol, env LookupEnv) (sdktrace.SpanExporter, error) {
+	// The exporters read OTEL_* from the process environment. For an http://
+	// endpoint with TLS material, explicit options override the TLS the SDK
+	// would build from that environment (Amendment 2: plaintext, FR-20).
+	plain := env != nil && len(tlsNamesForHTTP(env)) > 0
 	if p == ProtocolGRPC {
-		return otlptracegrpc.New(ctx)
+		var opts []otlptracegrpc.Option
+		if plain {
+			opts = plaintextGRPCOptions()
+		}
+		return otlptracegrpc.New(ctx, opts...)
 	}
-	return otlptracehttp.New(ctx)
+	var opts []otlptracehttp.Option
+	if plain {
+		opts = plaintextHTTPOptions()
+	}
+	return otlptracehttp.New(ctx, opts...)
 }
 
 // constError has constant text; cause is kept only for errors.Is on context

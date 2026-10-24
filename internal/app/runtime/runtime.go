@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -37,6 +38,8 @@ const (
 	msgShutdownFailed  = "corral shutdown step failed"
 	msgServeFailed     = "admin listener serve failed"
 	msgPanic           = "recovered panic in runtime goroutine"
+	// msgOTLPTLSIgnored is constant: no path, value or endpoint (FR-24, FR-29).
+	msgOTLPTLSIgnored = "OTLP TLS settings ignored because the traces endpoint uses http://"
 )
 
 const tracingShutdownTimeout = 5 * time.Second
@@ -109,6 +112,13 @@ func Run(ctx context.Context, args []string, env tracing.LookupEnv, stdout io.Wr
 	if resolveErr != nil {
 		config.LogError(cfgLog, resolveErr)
 		return exitFailure
+	}
+
+	// Amendment 2: TLS material with an http:// traces endpoint is withheld
+	// from the exporter (see tracing.newOTLP); say so once, constant text.
+	if names := tracing.TLSIgnoredSettings(tcfg, env); enabled && len(names) > 0 {
+		// Only variable names, never values (which are file paths).
+		cfgLog.Warn(msgOTLPTLSIgnored, slog.String("setting", strings.Join(names, ",")))
 	}
 
 	// Step 4: lifecycle starting record.
