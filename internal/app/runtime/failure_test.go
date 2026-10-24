@@ -195,6 +195,9 @@ func TestBindFailureEADDRINUSE(t *testing.T) { // AC-30, FR-35
 	if _, ok := r["error"]; !ok {
 		t.Errorf("config record has no error class attribute (errclass via config.LogError)")
 	}
+	if got := str(r, "corral.error.detail"); got != "EADDRINUSE" {
+		t.Errorf("corral.error.detail = %q, want EADDRINUSE", got)
+	}
 	if hasLifecycle(h.out.records(t), "startup complete") {
 		t.Errorf("startup-complete record after a bind failure")
 	}

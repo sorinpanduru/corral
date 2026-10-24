@@ -3,12 +3,9 @@ package runtime_test
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"net"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	corralrt "github.com/sorinpanduru/corral/internal/app/runtime"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logging"
@@ -18,55 +15,60 @@ import (
 // AC-31 (FR-18): /readyz is 503 "starting\n" while startup is held before its
 // last step, 200 "ok\n" after startup completes (and the startup-complete
 // record exists), and 503 "shutting_down\n" from the lifecycle "shutting down"
-// record onward. Registered readiness checks cannot be injected through Run,
-// so the "check not consulted" sub-bullets are covered at the adminhttp level.
+// record onward, observed from inside Hooks.Stopping (called after the record
+// and before the admin server shuts down). Registered readiness checks cannot
+// be injected through Run, so the "check not consulted" sub-bullets are covered
+// at the adminhttp level.
 func TestReadyzStartingOkShuttingDown(t *testing.T) { // AC-31
 	addr := reserveAddr(t)
-
-	var (
-		mu         sync.Mutex
-		held       resp
-		heldErr    error
-		heldHealth resp
-		heldRecs   []map[string]any
-		hookCalls  int
-	)
 	out := &syncBuf{}
+
+	type snap struct {
+		r      resp
+		err    error
+		health resp
+		recs   []map[string]any
+		calls  int
+	}
+	var mu sync.Mutex
+	var held, stopping snap
+	take := func(s *snap) {
+		r, err := get(addr, "/readyz")
+		hz, _ := get(addr, "/healthz")
+		recs := jsonRecordsNoFail(out.lines())
+		mu.Lock()
+		s.r, s.err, s.health, s.recs = r, err, hz, recs
+		s.calls++
+		mu.Unlock()
+	}
 	h := run(t, runOpts{
-		out:  out,
-		args: []string{"-admin.listen=" + addr},
-		before: func(ctx context.Context) {
-			r, err := get(addr, "/readyz")
-			hz, _ := get(addr, "/healthz")
-			recs := jsonRecordsNoFail(out.lines())
-			mu.Lock()
-			held, heldErr, heldHealth, heldRecs = r, err, hz, recs
-			hookCalls++
-			mu.Unlock()
-		},
+		out:      out,
+		args:     []string{"-admin.listen=" + addr},
+		before:   func(context.Context) { take(&held) },
+		stopping: func(context.Context) { take(&stopping) },
 	})
 	hd := h.waitStarted()
 
 	mu.Lock()
-	if hookCalls != 1 {
-		t.Errorf("BeforeLastStep called %d times, want 1", hookCalls)
+	if held.calls != 1 {
+		t.Errorf("BeforeLastStep called %d times, want 1", held.calls)
 	}
-	if heldErr != nil {
-		t.Fatalf("GET /readyz during BeforeLastStep: %v", heldErr)
+	if held.err != nil {
+		t.Fatalf("GET /readyz during BeforeLastStep: %v", held.err)
 	}
-	if held.status != 503 || held.body != "starting\n" {
-		t.Errorf("/readyz while held: got %d %q, want 503 %q", held.status, held.body, "starting\n")
+	if held.r.status != 503 || held.r.body != "starting\n" {
+		t.Errorf("/readyz while held: got %d %q, want 503 %q", held.r.status, held.r.body, "starting\n")
 	}
-	if held.ctype != plainUTF8 {
-		t.Errorf("/readyz while held: Content-Type %q, want %q", held.ctype, plainUTF8)
+	if held.r.ctype != plainUTF8 {
+		t.Errorf("/readyz while held: Content-Type %q, want %q", held.r.ctype, plainUTF8)
 	}
-	if heldHealth.status != 200 || heldHealth.body != "ok\n" {
-		t.Errorf("/healthz while held: got %d %q, want 200 ok", heldHealth.status, heldHealth.body)
+	if held.health.status != 200 || held.health.body != "ok\n" {
+		t.Errorf("/healthz while held: got %d %q, want 200 ok", held.health.status, held.health.body)
 	}
-	if !hasLifecycle(heldRecs, "starting") {
-		t.Errorf("no lifecycle starting record before BeforeLastStep (ADR-0006 step 4 precedes step 7)")
+	if !hasLifecycle(held.recs, "starting") {
+		t.Errorf("no lifecycle starting record before BeforeLastStep")
 	}
-	if hasLifecycle(heldRecs, "startup complete") {
+	if hasLifecycle(held.recs, "startup complete") {
 		t.Errorf("startup-complete record emitted before the last startup step finished")
 	}
 	mu.Unlock()
@@ -75,11 +77,7 @@ func TestReadyzStartingOkShuttingDown(t *testing.T) { // AC-31
 		t.Errorf("Handles.AdminAddr = %v, want %s", hd.AdminAddr, addr)
 	}
 
-	// After startup completed: 200 ok, and the startup-complete record exists.
-	eventually(t, "/readyz 200", func() bool {
-		r, err := get(addr, "/readyz")
-		return err == nil && r.status == 200
-	})
+	// Started runs after startup completes: 200 ok, startup-complete record.
 	r, err := get(addr, "/readyz")
 	if err != nil {
 		t.Fatalf("GET /readyz: %v", err)
@@ -87,38 +85,29 @@ func TestReadyzStartingOkShuttingDown(t *testing.T) { // AC-31
 	if r.status != 200 || r.body != "ok\n" || r.ctype != plainUTF8 {
 		t.Errorf("/readyz after startup: got %d %q %q, want 200 %q %q", r.status, r.body, r.ctype, "ok\n", plainUTF8)
 	}
-	eventually(t, "startup complete record", func() bool {
-		return hasLifecycle(h.out.records(t), "startup complete")
-	})
+	if !hasLifecycle(out.records(t), "startup complete") {
+		t.Errorf("no startup-complete record once Started ran")
+	}
 
-	// Hold a request open across the start of shutdown: send the request head
-	// minus the final CRLF, begin shutdown, wait for the shutting-down record,
-	// then complete the request. The handler runs after the record exists.
-	c, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer c.Close()
-	if _, err := fmt.Fprintf(c, "GET /readyz HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n", addr); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	time.Sleep(200 * time.Millisecond) // let the server start reading it
-	h.cancel()
-	eventually(t, "lifecycle shutting down record", func() bool {
-		return hasLifecycle(h.out.records(t), "shutting down")
-	})
-	if _, err := fmt.Fprint(c, "\r\n"); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	sr := readResponse(t, c)
-	if sr.status != 503 || sr.body != "shutting_down\n" {
-		t.Errorf("/readyz after the shutting-down record: got %d %q, want 503 %q", sr.status, sr.body, "shutting_down\n")
-	}
-	if sr.ctype != plainUTF8 {
-		t.Errorf("/readyz shutting_down Content-Type %q, want %q", sr.ctype, plainUTF8)
-	}
-	if code := h.wait(); code != 0 {
+	if code := h.stop(); code != 0 {
 		t.Errorf("exit code after graceful shutdown = %d, want 0", code)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if stopping.calls != 1 {
+		t.Fatalf("Stopping called %d times, want 1", stopping.calls)
+	}
+	if stopping.err != nil {
+		t.Fatalf("GET /readyz inside Stopping: %v", stopping.err)
+	}
+	if stopping.r.status != 503 || stopping.r.body != "shutting_down\n" {
+		t.Errorf("/readyz inside Stopping: got %d %q, want 503 %q", stopping.r.status, stopping.r.body, "shutting_down\n")
+	}
+	if stopping.r.ctype != plainUTF8 {
+		t.Errorf("/readyz inside Stopping: Content-Type %q, want %q", stopping.r.ctype, plainUTF8)
+	}
+	if !hasLifecycle(stopping.recs, "shutting down") {
+		t.Errorf("Stopping ran before the lifecycle shutting-down record was emitted")
 	}
 }
 
@@ -243,11 +232,6 @@ func TestStartedHandles(t *testing.T) { // FR-34 (hook contract)
 	}
 }
 
-// Panics recovered in runtime goroutines are logged via errclass.FromPanic
-// (class internal, optional stack). Run exposes no hook that makes a runtime
-// goroutine panic, so this cannot be driven from outside the package.
-func TestRecoveredPanicLoggedViaErrclass(t *testing.T) { // FR-24, FR-29
-	t.Skip("no Hooks field lets a test trigger a panic in a runtime goroutine; covered by review and errclass unit tests")
-}
+// Recovered panics are covered white-box in recoverpanic_test.go.
 
 var _ = corralrt.Run

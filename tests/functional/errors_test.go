@@ -161,6 +161,9 @@ func TestAC30_AddressInUse(t *testing.T) {
 	if len(cfg) != 1 || str(cfg[0], "setting") != "admin.listen" {
 		t.Fatalf("want exactly one component=config record with setting=admin.listen, got %d", len(cfg))
 	}
+	if got := str(cfg[0], "corral.error.detail"); got != "EADDRINUSE" {
+		t.Errorf("corral.error.detail = %q, want EADDRINUSE", got)
+	}
 	out := string(p.stdout.Bytes()) + string(p.stderr.Bytes())
 	for _, bad := range []string{addr, ":" + port, "127.0.0.1"} {
 		if strings.Contains(out, bad) {

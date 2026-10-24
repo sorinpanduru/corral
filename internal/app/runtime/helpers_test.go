@@ -17,6 +17,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -175,14 +176,30 @@ type harness struct {
 }
 
 type runOpts struct {
-	args   []string
-	env    map[string]string
-	before func(ctx context.Context)
-	out    *syncBuf // optional, so hooks can read it before run returns
+	args           []string
+	env            map[string]string
+	before         func(ctx context.Context)
+	stopping       func(ctx context.Context)
+	cancelInBefore bool     // cancel the Run context inside BeforeLastStep
+	out            *syncBuf // optional, so hooks can read it before run returns
 }
 
 func run(tb testing.TB, o runOpts) *harness {
 	tb.Helper()
+	// Isolation: exporters read the real process environment, so host OTEL_*
+	// variables are cleared (empty counts as unset) and the test's variables are
+	// set for real as well as passed through the lookup function. Tests using
+	// run are therefore not parallel.
+	if tt, ok := tb.(*testing.T); ok {
+		for _, kv := range os.Environ() {
+			if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "OTEL_") {
+				tt.Setenv(k, "")
+			}
+		}
+		for k, v := range o.env {
+			tt.Setenv(k, v)
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	if o.out == nil {
 		o.out = &syncBuf{}
@@ -195,7 +212,15 @@ func run(tb testing.TB, o runOpts) *harness {
 	calls := 0
 	h.startedCalls = func() int { mu.Lock(); defer mu.Unlock(); return calls }
 	hooks := corralrt.Hooks{
-		BeforeLastStep: o.before,
+		BeforeLastStep: func(c context.Context) {
+			if o.before != nil {
+				o.before(c)
+			}
+			if o.cancelInBefore {
+				cancel()
+			}
+		},
+		Stopping: o.stopping,
 		Started: func(hd corralrt.Handles) {
 			mu.Lock()
 			calls++
