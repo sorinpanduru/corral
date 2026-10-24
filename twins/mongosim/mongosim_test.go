@@ -592,11 +592,13 @@ func TestLargeReply(t *testing.T) {
 	s := mongosim.Start(t, mongosim.Options{})
 	c := dial(t, s.Addr())
 	const n = 30 << 20
+	c.short = 30 * time.Second
 	rp := c.cmd(bson.D{{Key: "find", Value: "c"}, {Key: "$db", Value: "t"}, {Key: "corraltestReplyBytes", Value: int64(n)}})
 	if len(rp.whole) < n || len(rp.whole) > n+1<<20 {
 		t.Fatalf("reply %d bytes", len(rp.whole))
 	}
 	sum1 := sha256.Sum256(rp.whole[16:])
+	c.short = 30 * time.Second
 	rp2 := c.cmd(bson.D{{Key: "find", Value: "c"}, {Key: "$db", Value: "t"}, {Key: "corraltestReplyBytes", Value: int64(n)}})
 	if sha256.Sum256(rp2.whole[16:]) != sum1 {
 		// request ids differ only in the header; payload must be deterministic
@@ -778,7 +780,7 @@ func TestDriverSCRAM(t *testing.T) {
 func TestDriverObservesFaults(t *testing.T) {
 	s := mongosim.Start(t, mongosim.Options{Hello: mongosim.HelloSpec{Role: mongosim.Primary}})
 	cl := connect(t, "mongodb://"+s.Addr()+"/?directConnection=true", func(o *options.ClientOptions) {
-		o.SetRetryWrites(false).SetRetryReads(false).SetTimeout(0)
+		o.SetRetryWrites(false).SetRetryReads(false).SetTimeout(0).SetHeartbeatInterval(500 * time.Millisecond).SetServerSelectionTimeout(10 * time.Second)
 	})
 	coll := cl.Database("db").Collection("c")
 	ctx := context.Background()
@@ -823,4 +825,199 @@ func asWriteErr(err error, t *mongo.WriteException) bool {
 func arrLen(v bson.RawValue) int {
 	vals, _ := v.Array().Values()
 	return len(vals)
+}
+
+func TestIdleConnsSendRawCloseConn(t *testing.T) {
+	s := mongosim.Start(t, mongosim.Options{})
+	c := dial(t, s.Addr())
+	c.cmd(helloCmd("corral"))
+	c.cmd(bson.D{{Key: "ping", Value: 1}, {Key: "$db", Value: "admin"}})
+	if !poll(func() bool { return len(s.IdleConns("corral")) == 1 }) {
+		t.Fatal("connection should be idle")
+	}
+	h := s.AddRule(mongosim.Match{Command: "ping"}, mongosim.Hold())
+	c.sendMsg(0, bson.D{{Key: "ping", Value: 1}, {Key: "$db", Value: "admin"}})
+	if !h.WaitHeld(1, 2*time.Second) {
+		t.Fatal("not held")
+	}
+	if len(s.IdleConns("corral")) != 0 || !s.Conns()[0].InFlight {
+		t.Fatal("held connection is in flight")
+	}
+	h.Release()
+	if _, err := c.read(); err != nil {
+		t.Fatal(err)
+	}
+	if !poll(func() bool { return len(s.IdleConns("corral")) == 1 }) {
+		t.Fatal("idle again")
+	}
+	if err := s.SendRaw(0, []byte("0123456789")); err != nil {
+		t.Fatal(err)
+	}
+	c.nc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 10)
+	if _, err := io.ReadFull(c.nc, buf); err != nil || string(buf) != "0123456789" {
+		t.Fatalf("raw bytes: %v %q", err, buf)
+	}
+	if err := s.CloseConn(0, false); err != nil {
+		t.Fatal(err)
+	}
+	if !isClosed(c) {
+		t.Fatal("CloseConn")
+	}
+	if s.SendRaw(0, []byte("x")) == nil || s.CloseConn(9, false) == nil {
+		t.Fatal("errors expected for closed/unknown connections")
+	}
+}
+
+func TestHelloVsIsMasterFields(t *testing.T) {
+	s := mongosim.Start(t, mongosim.Options{})
+	c := dial(t, s.Addr())
+	d := c.cmd(helloCmd("")).doc
+	if _, err := d.LookupErr("ismaster"); err == nil {
+		t.Fatal("hello must not carry ismaster")
+	}
+	d = c.cmd(bson.D{{Key: "isMaster", Value: 1}, {Key: "$db", Value: "admin"}}).doc
+	if _, err := d.LookupErr("isWritablePrimary"); err == nil {
+		t.Fatal("isMaster must not carry isWritablePrimary")
+	}
+	if !d.Lookup("ismaster").Boolean() {
+		t.Fatal("ismaster")
+	}
+}
+
+func TestOpQueryNonHandshakeRefused352(t *testing.T) {
+	s := mongosim.Start(t, mongosim.Options{})
+	c := dial(t, s.Addr())
+	d, _ := bson.Marshal(bson.D{{Key: "ping", Value: 1}})
+	p := binary.LittleEndian.AppendUint32(nil, 0)
+	p = append(p, "admin.$cmd\x00"...)
+	p = binary.LittleEndian.AppendUint32(p, 0)
+	p = binary.LittleEndian.AppendUint32(p, 0xffffffff)
+	p = append(p, d...)
+	c.nc.Write(frame(mongosim.OpQuery, 3, 0, p))
+	rp, err := c.read()
+	if err != nil || code(rp) != 352 || rp.doc.Lookup("codeName").StringValue() != "UnsupportedOpQueryCommand" {
+		t.Fatalf("%v %s", err, rp.doc)
+	}
+}
+
+func TestReplyWriteErrors(t *testing.T) {
+	s := mongosim.Start(t, mongosim.Options{})
+	c := dial(t, s.Addr())
+	s.AddRule(mongosim.Match{Command: "insert"}, mongosim.ReplyWriteErrors(10107))
+	rp := c.cmd(bson.D{{Key: "insert", Value: "c"}, {Key: "$db", Value: "t"}})
+	if rp.doc.Lookup("ok").AsFloat64() != 1 || firstDocCode(rp.doc.Lookup("writeErrors")) != 10107 {
+		t.Fatalf("%s", rp.doc)
+	}
+}
+
+func TestRefuseAfterHelloAttributesAttempts(t *testing.T) {
+	s := mongosim.Start(t, mongosim.Options{})
+	s.RefuseAfterHello(true)
+	c := dial(t, s.Addr())
+	c.sendMsg(0, helloCmd("corral"))
+	if _, err := c.read(); err == nil {
+		t.Fatal("expected close without reply")
+	}
+	if s.ConnAttemptsBy("corral") != 1 || s.ConnAttempts() != 1 {
+		t.Fatal("attempt should be attributed to the appName")
+	}
+}
+
+func TestBadServerSignatureNotAuthenticated(t *testing.T) {
+	s := mongosim.Start(t, mongosim.Options{Users: map[string]string{"u": "synth-pass"}})
+	s.SetAuthOutcome(mongosim.BadServerSignature)
+	cl := connect(t, "mongodb://"+s.Addr()+"/?directConnection=true", func(o *options.ClientOptions) {
+		o.SetAuth(options.Credential{AuthMechanism: "SCRAM-SHA-256", Username: "u", Password: "synth-pass", AuthSource: "admin"})
+	})
+	if cl.Ping(context.Background(), nil) == nil {
+		t.Fatal("expected failure")
+	}
+	forged := false
+	for _, ci := range s.Conns() {
+		if ci.Authenticated {
+			t.Fatal("must not be marked authenticated")
+		}
+		forged = forged || ci.SignatureForged
+	}
+	if !forged {
+		t.Fatal("SignatureForged not set")
+	}
+}
+
+func TestStopRacesAccept(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		s := mongosim.Start(t, mongosim.Options{})
+		go func() {
+			if nc, err := net.Dial("tcp", s.Addr()); err == nil {
+				nc.Close()
+			}
+		}()
+		s.Stop()
+		for _, ci := range s.Conns() {
+			if ci.Open {
+				t.Fatal("connection left open after Stop")
+			}
+		}
+	}
+}
+
+func firstDocCode(v bson.RawValue) int32 {
+	vals, _ := v.Array().Values()
+	return vals[0].Document().Lookup("code").Int32()
+}
+
+func TestRefuseAppKeepsMonitorAnswering(t *testing.T) {
+	s := mongosim.Start(t, mongosim.Options{})
+	s.RefuseApp("corral", true)
+	pool := dial(t, s.Addr())
+	pool.sendMsg(0, helloCmd("corral"))
+	if _, err := pool.read(); err == nil {
+		t.Fatal("pool connection should be refused after its hello")
+	}
+	mon := dial(t, s.Addr())
+	if mon.cmd(helloCmd("corral-monitor")).doc.Lookup("ok").AsFloat64() != 1 {
+		t.Fatal("monitor must still be answered")
+	}
+	if s.ConnAttemptsBy("corral") != 1 || s.ConnAttemptsBy("corral-monitor") != 1 {
+		t.Fatal("attribution")
+	}
+	s.RefuseApp("corral", false)
+	if dial(t, s.Addr()).cmd(helloCmd("corral")).doc.Lookup("ok").AsFloat64() != 1 {
+		t.Fatal("refusal should be lifted")
+	}
+}
+
+func TestPartialBytesAndPingErrors(t *testing.T) {
+	s := mongosim.Start(t, mongosim.Options{})
+	c := dial(t, s.Addr())
+	c.cmd(helloCmd("corral"))
+	d, _ := bson.Marshal(bson.D{{Key: "ping", Value: 1}, {Key: "$db", Value: "admin"}})
+	p := binary.LittleEndian.AppendUint32(nil, 0)
+	p = append(p, 0)
+	p = append(p, d...)
+	full := frame(mongosim.OpMsg, 99, 0, p)
+	c.nc.Write(full[:20])
+	if !poll(func() bool { return s.Conns()[0].PartialBytes == 20 }) {
+		t.Fatalf("partial bytes %d", s.Conns()[0].PartialBytes)
+	}
+	before := s.Conns()[0].BytesReceived
+	c.nc.Write(full[20:])
+	if _, err := c.read(); err != nil {
+		t.Fatal(err)
+	}
+	if ci := s.Conns()[0]; ci.PartialBytes != 0 || ci.BytesReceived != before+int64(len(full)-20) {
+		t.Fatalf("%+v", ci)
+	}
+	for _, ec := range []struct {
+		c int32
+		n string
+	}{{10107, "NotWritablePrimary"}, {91, "ShutdownInProgress"}} {
+		h := s.AddRule(mongosim.Match{Command: "ping", Once: true}, mongosim.ReplyError(ec.c, ec.n))
+		rp := c.cmd(bson.D{{Key: "ping", Value: 1}, {Key: "$db", Value: "admin"}})
+		if code(rp) != ec.c {
+			t.Fatalf("%s", rp.doc)
+		}
+		h.Remove()
+	}
 }

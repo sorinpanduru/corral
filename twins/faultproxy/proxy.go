@@ -158,6 +158,12 @@ func (p *Proxy) acceptLoop() {
 			return
 		}
 		p.mu.Lock()
+		if p.closed {
+			// Stop raced with Accept: do not register a connection.
+			p.mu.Unlock()
+			_ = cc.Close()
+			return
+		}
 		c := &pconn{p: p, idx: len(p.conns), client: cc, done: make(chan struct{}), pending: map[int32]pendingReq{}, open: true}
 		p.conns = append(p.conns, c)
 		black := p.blackNew

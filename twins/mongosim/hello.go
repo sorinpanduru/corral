@@ -71,16 +71,19 @@ func (h HelloSpec) maxMsg() int32 {
 }
 
 // helloDoc builds the reply body for spec, as seen by connection c.
-func (s *Server) helloDoc(h HelloSpec, counter int64, connID int, helloOK bool, mechs bson.A) bson.D {
+func (s *Server) helloDoc(h HelloSpec, counter int64, connID int, helloOK, legacy bool, mechs bson.A) bson.D {
 	isPrimary := h.Role == Primary || h.Role == Standalone || h.Role == Mongos
 	d := bson.D{}
 	if helloOK {
 		d = append(d, bson.E{Key: "helloOk", Value: true})
 	}
-	d = append(d,
-		bson.E{Key: "isWritablePrimary", Value: isPrimary},
-		bson.E{Key: "ismaster", Value: isPrimary},
-	)
+	// hello replies carry isWritablePrimary only; legacy isMaster replies
+	// carry ismaster only (as real servers do).
+	if legacy {
+		d = append(d, bson.E{Key: "ismaster", Value: isPrimary})
+	} else {
+		d = append(d, bson.E{Key: "isWritablePrimary", Value: isPrimary})
+	}
 	rs := h.Role == Primary || h.Role == Secondary || h.Role == Arbiter || h.Role == Other
 	if rs {
 		if h.SetName != "" {

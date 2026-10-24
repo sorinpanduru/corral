@@ -15,6 +15,7 @@ const (
 	actError
 	actErrorMessage
 	actWriteConcernError
+	actWriteErrors
 	actUnknownResponseTo
 	actMoreToCome
 	actOversize
@@ -63,6 +64,10 @@ func ReplyErrorMessage(errmsg string) Action {
 func ReplyWriteConcernError(code int32) Action {
 	return Action{kind: actWriteConcernError, code: code}
 }
+
+// ReplyWriteErrors answers {ok: 1, n: 0, writeErrors: [{index: 0, code, errmsg}]}
+// (a per-document write error, not a command error).
+func ReplyWriteErrors(code int32) Action { return Action{kind: actWriteErrors, code: code} }
 
 // ReplyUnknownResponseTo answers with a responseTo that matches no request.
 func ReplyUnknownResponseTo() Action { return Action{kind: actUnknownResponseTo} }

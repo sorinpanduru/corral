@@ -65,10 +65,19 @@ type ConnInfo struct {
 	AuthMechanism string
 	AuthUser      string // synthetic
 	Open          bool
-	Blackholed    bool
-	Opened        time.Time
-	Closed        time.Time
-	Messages      int
+	// InFlight is true while a received request has not been fully handled
+	// (held, delayed or being answered). An open, non-InFlight connection is idle.
+	InFlight bool
+	// PartialBytes is how many bytes of a not-yet-complete message have been
+	// received; BytesReceived counts all bytes read on the connection.
+	PartialBytes  int
+	BytesReceived int64
+	// SignatureForged is set when BadServerSignature was scripted on it.
+	SignatureForged bool
+	Blackholed      bool
+	Opened          time.Time
+	Closed          time.Time
+	Messages        int
 }
 
 // Server is a simulated MongoDB upstream.
@@ -76,28 +85,30 @@ type Server struct {
 	tb   testing.TB
 	opts Options
 
-	mu         sync.Mutex
-	ln         net.Listener
-	addr       string
-	running    bool
-	refuse     bool
-	blackhole  bool
-	spec       HelloSpec
-	counter    int64
-	topoCh     chan struct{}
-	processID  bson.ObjectID
-	conns      []*conn
-	attempts   int
-	attemptsBy map[string]int
-	msgs       []Message
-	rules      []*RuleHandle
-	checks     []*checkFault
-	checkGate  chan struct{}
-	authSticky AuthOutcome
-	authQueue  []AuthOutcome
-	nonceSeq   int64
-	reqSeq     int32
-	wg         sync.WaitGroup
+	mu               sync.Mutex
+	ln               net.Listener
+	addr             string
+	running          bool
+	refuse           bool
+	blackhole        bool
+	spec             HelloSpec
+	counter          int64
+	topoCh           chan struct{}
+	processID        bson.ObjectID
+	conns            []*conn
+	attempts         int
+	attemptsBy       map[string]int
+	msgs             []Message
+	rules            []*RuleHandle
+	checks           []*checkFault
+	checkGate        chan struct{}
+	refuseAfterHello bool
+	refuseApps       map[string]bool
+	authSticky       AuthOutcome
+	authQueue        []AuthOutcome
+	nonceSeq         int64
+	reqSeq           int32
+	wg               sync.WaitGroup
 }
 
 // Start launches a server on 127.0.0.1:0 (or opts.Addr) and stops it through
@@ -207,6 +218,12 @@ func (s *Server) acceptLoop(ln net.Listener) {
 			return
 		}
 		s.mu.Lock()
+		if !s.running || s.ln != ln {
+			// Stop raced with Accept: do not register a connection.
+			s.mu.Unlock()
+			_ = nc.Close()
+			return
+		}
 		s.attempts++
 		c := &conn{
 			s:      s,
@@ -427,3 +444,75 @@ func (s *Server) nextRequestID() int32 {
 }
 
 func (s *Server) String() string { return fmt.Sprintf("mongosim(%s)", s.addr) }
+
+// RefuseAfterHello makes every connection read its first hello (so its appName
+// and the per-appName attempt count are recorded) and then close with a reset
+// without answering.
+func (s *Server) RefuseAfterHello(b bool) { s.mu.Lock(); s.refuseAfterHello = b; s.mu.Unlock() }
+
+// RefuseApp makes connections whose handshake appName is appName read their
+// hello (recording it) and then close with a reset, while other appNames (for
+// example the monitor) are answered normally. Use it to refuse pool
+// connections ("corral") while monitoring checks keep succeeding.
+func (s *Server) RefuseApp(appName string, b bool) {
+	s.mu.Lock()
+	if s.refuseApps == nil {
+		s.refuseApps = map[string]bool{}
+	}
+	s.refuseApps[appName] = b
+	s.mu.Unlock()
+}
+
+func (s *Server) refusesApp(appName string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.refuseAfterHello || s.refuseApps[appName]
+}
+
+// SendRaw writes unsolicited bytes to connection connIndex (AC-46: data on an
+// idle pool connection). It fails if the connection is closed or unknown.
+func (s *Server) SendRaw(connIndex int, b []byte) error {
+	c, err := s.connAt(connIndex)
+	if err != nil {
+		return err
+	}
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	_, err = c.nc.Write(b)
+	return err
+}
+
+// CloseConn closes connection connIndex; reset sends a TCP RST instead of FIN.
+func (s *Server) CloseConn(connIndex int, reset bool) error {
+	c, err := s.connAt(connIndex)
+	if err != nil {
+		return err
+	}
+	c.close(reset)
+	return nil
+}
+
+// IdleConns lists the indexes of open, not-in-flight connections whose
+// handshake appName is appName (the idle pool connections for "corral").
+func (s *Server) IdleConns(appName string) []int {
+	var out []int
+	for _, ci := range s.Conns() {
+		if ci.Open && !ci.InFlight && !ci.Blackholed && ci.AppName == appName {
+			out = append(out, ci.Index)
+		}
+	}
+	return out
+}
+
+func (s *Server) connAt(i int) (*conn, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if i < 0 || i >= len(s.conns) {
+		return nil, fmt.Errorf("mongosim: no connection %d", i)
+	}
+	c := s.conns[i]
+	if !c.open {
+		return nil, fmt.Errorf("mongosim: connection %d is closed", i)
+	}
+	return c, nil
+}

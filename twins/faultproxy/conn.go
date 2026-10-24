@@ -110,7 +110,10 @@ func (c *pconn) pumpRequests() {
 			}
 		}
 		app := c.appName
-		c.pending[in.requestID] = pendingReq{command: in.command, db: in.db}
+		if in.flags&flagMoreToCome == 0 || in.opcode != opMsg {
+			// moreToCome requests get no reply: nothing to correlate.
+			c.pending[in.requestID] = pendingReq{command: in.command, db: in.db}
+		}
 		c.p.mu.Unlock()
 		if in.parsed {
 			c.p.record(Record{

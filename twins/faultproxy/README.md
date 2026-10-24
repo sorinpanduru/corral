@@ -34,3 +34,5 @@ parser; BSON from the official driver. Run: `go test -race ./twins/faultproxy`
   side with a reset right after writing the request; the upstream may or may
   not have executed it.
 - Fire-and-forget (`moreToCome`) requests are recorded like any other request.
+- `Stop` is safe against a racing Accept. `moreToCome` requests leave no
+  pending-reply state.

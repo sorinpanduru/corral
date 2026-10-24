@@ -280,8 +280,21 @@ func TestPauseBlackholeKill(t *testing.T) {
 	}
 
 	n := px.ConnCount()
+	old := map[int]bool{}
+	for _, ci := range px.Conns() {
+		if ci.Open {
+			old[ci.Index] = true
+		}
+	}
 	px.KillAll()
-	if !eventually(func() bool { return px.OpenConns() == 0 }) {
+	if !eventually(func() bool {
+		for _, ci := range px.Conns() {
+			if old[ci.Index] && ci.Open {
+				return false
+			}
+		}
+		return true
+	}) {
 		t.Fatal("KillAll did not close connections")
 	}
 	if !eventually(func() bool { return db.RunCommand(ctx, bson.D{{Key: "ping", Value: 1}}).Err() == nil }) {
@@ -328,4 +341,20 @@ func eventually(f func() bool) bool {
 		time.Sleep(50 * time.Millisecond)
 	}
 	return false
+}
+
+func TestStopRacesAccept(t *testing.T) {
+	up := mongosim.Start(t, mongosim.Options{})
+	for i := 0; i < 200; i++ {
+		px := faultproxy.Start(t, up.Addr(), faultproxy.Options{})
+		go func() {
+			if nc, err := net.Dial("tcp", px.Addr()); err == nil {
+				nc.Close()
+			}
+		}()
+		px.Stop()
+		if px.OpenConns() != 0 {
+			t.Fatal("connection left open after Stop")
+		}
+	}
 }

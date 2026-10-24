@@ -4,6 +4,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -30,6 +31,11 @@ type conn struct {
 	opened        time.Time
 	closed        time.Time
 	nmsgs         int
+	inflight      bool
+	partial       atomic.Int64 // bytes of the incomplete frame being read
+	recvTotal     atomic.Int64 // all bytes read
+	sigForged     bool
+	wmu           sync.Mutex // serialises writes (serve goroutine and SendRaw)
 
 	conv *scramConv // owned by the serve goroutine
 }
@@ -39,7 +45,8 @@ func (c *conn) infoLocked() ConnInfo {
 		Index: c.idx, Remote: c.nc.RemoteAddr().String(), AppName: c.appName,
 		DriverName: c.driverName, DriverVersion: c.driverVersion,
 		Authenticated: c.authenticated, AuthMechanism: c.authMech, AuthUser: c.authUser,
-		Open: c.open, Blackholed: c.blackholed, Opened: c.opened, Closed: c.closed, Messages: c.nmsgs,
+		Open: c.open, InFlight: c.inflight, SignatureForged: c.sigForged,
+		PartialBytes: int(c.partial.Load()), BytesReceived: c.recvTotal.Load(), Blackholed: c.blackholed, Opened: c.opened, Closed: c.closed, Messages: c.nmsgs,
 	}
 }
 
@@ -58,10 +65,25 @@ func (c *conn) close(reset bool) {
 	})
 }
 
+// progressReader counts bytes as they arrive so tests can observe partial
+// messages (frame bytes read before the frame completes).
+type progressReader struct {
+	r interface{ Read([]byte) (int, error) }
+	c *conn
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	p.c.partial.Add(int64(n))
+	p.c.recvTotal.Add(int64(n))
+	return n, err
+}
+
 func (c *conn) readLoop() {
 	defer close(c.in)
 	for {
-		raw, err := readFrame(c.nc)
+		raw, err := readFrame(&progressReader{r: c.nc, c: c})
+		c.partial.Store(0)
 		if err != nil {
 			c.close(false)
 			return
@@ -86,11 +108,19 @@ func (c *conn) sleep(d time.Duration) bool {
 }
 
 func (c *conn) send(b []byte) bool {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
 	if _, err := c.nc.Write(b); err != nil {
 		c.close(false)
 		return false
 	}
 	return true
+}
+
+func (c *conn) setInflight(b bool) {
+	c.s.mu.Lock()
+	c.inflight = b
+	c.s.mu.Unlock()
 }
 
 func (c *conn) serve() {
@@ -100,7 +130,10 @@ func (c *conn) serve() {
 			if !ok {
 				return
 			}
-			if !c.handle(raw) {
+			c.setInflight(true)
+			cont := c.handle(raw)
+			c.setInflight(false)
+			if !cont {
 				return
 			}
 		case <-c.done:
@@ -157,6 +190,11 @@ func (c *conn) handle(raw []byte) bool {
 	s.mu.Unlock()
 	if err != nil {
 		// Unsupported opcode (for example OP_COMPRESSED) or malformed request.
+		c.close(true)
+		return false
+	}
+
+	if (lower == "hello" || lower == "ismaster") && s.refusesApp(appName) {
 		c.close(true)
 		return false
 	}
@@ -233,6 +271,14 @@ func (c *conn) handle(raw []byte) bool {
 					{Key: "errmsg", Value: "simulated write concern error"},
 				}},
 			}), crcNone, hdr.requestID)
+		case actWriteErrors:
+			return c.reply(p, mustMarshal(bson.D{
+				{Key: "ok", Value: float64(1)}, {Key: "n", Value: int32(0)},
+				{Key: "writeErrors", Value: bson.A{bson.D{
+					{Key: "index", Value: int32(0)}, {Key: "code", Value: a.code},
+					{Key: "errmsg", Value: "simulated write error"},
+				}}},
+			}), crcNone, hdr.requestID)
 		case actUnknownResponseTo:
 			return c.reply(p, c.defaultReply(p, cmd, lower), crcNone, hdr.requestID+1000)
 		case actMoreToCome:
@@ -258,7 +304,11 @@ func (c *conn) handle(raw []byte) bool {
 		}
 	}
 
-	// Default handling.
+	// Default handling. Like servers 6.0+, OP_QUERY only carries hello/isMaster.
+	if hdr.opcode == OpQuery && lower != "hello" && lower != "ismaster" {
+		return c.reply(p, errorDoc(352, "UnsupportedOpQueryCommand",
+			"Unsupported OP_QUERY command: "+cmd+". The client driver may require an upgrade."), crcNone, hdr.requestID)
+	}
 	switch lower {
 	case "saslstart", "saslcontinue":
 		doc, reset := c.handleSasl(p, lower)
@@ -388,7 +438,7 @@ func (c *conn) helloReply(p *parsed, isHello bool) []byte {
 	s.mu.Lock()
 	spec, counter := s.spec, s.counter
 	s.mu.Unlock()
-	return mustMarshal(s.helloDoc(spec, counter, c.idx, helloOK, mechs))
+	return mustMarshal(s.helloDoc(spec, counter, c.idx, helloOK, !isHello, mechs))
 }
 
 func (c *conn) handleSasl(p *parsed, lower string) (doc []byte, reset bool) {
@@ -397,7 +447,7 @@ func (c *conn) handleSasl(p *parsed, lower string) (doc []byte, reset bool) {
 	apply := func(o AuthOutcome) ([]byte, bool, bool) { // doc, reset, handled
 		switch o.kind {
 		case authError:
-			d, r := fail(o.code, o.name, "simulated authentication error")
+			d, r := fail(o.code, o.name, "")
 			return d, r, true
 		case authReset:
 			return nil, true, true
@@ -485,6 +535,14 @@ func (c *conn) handleSasl(p *parsed, lower string) (doc []byte, reset bool) {
 }
 
 func (c *conn) markAuth(conv *scramConv) {
+	if conv.outcome.kind == authBadSig {
+		// The client rejects the forged signature; the server never treats
+		// the connection as authenticated in a way tests should rely on.
+		c.s.mu.Lock()
+		c.sigForged = true
+		c.s.mu.Unlock()
+		return
+	}
 	c.s.mu.Lock()
 	c.authenticated = true
 	c.authMech = conv.mechanism
@@ -513,7 +571,7 @@ var codeNames = map[int32]string{
 	2: "BadValue", 6: "HostUnreachable", 7: "HostNotFound", 13: "Unauthorized", 18: "AuthenticationFailed",
 	43: "CursorNotFound", 50: "MaxTimeMSExpired", 59: "CommandNotFound", 64: "WriteConcernFailed",
 	79: "UnknownReplWriteConcern", 89: "NetworkTimeout", 91: "ShutdownInProgress", 100: "UnsatisfiableWriteConcern",
-	115: "CommandNotSupported", 189: "PrimarySteppedDown", 334: "MechanismUnavailable",
+	115: "CommandNotSupported", 352: "UnsupportedOpQueryCommand", 189: "PrimarySteppedDown", 334: "MechanismUnavailable",
 	9001: "SocketException", 10107: "NotWritablePrimary", 11600: "InterruptedAtShutdown",
 	11602: "InterruptedDueToReplStateChange", 13435: "NotPrimaryNoSecondaryOk", 13436: "NotPrimaryOrSecondary",
 }

@@ -40,6 +40,31 @@ users and passwords only. Run: `go test -race ./twins/mongosim`.
   `ResetRecording`, `ConnAttempts()`, `ConnAttemptsBy(appName)`,
   `OpenConns(appName)`, `Conns()`.
 
+## Amendment 1 additions (FR-62, AC-43, AC-46)
+
+- `SendRaw(connIndex, b)`: unsolicited bytes on a connection (AC-46).
+  `CloseConn(connIndex, reset)`: close one connection (FIN or RST).
+- Idle detection: `ConnInfo.InFlight` is true from receipt of a request until
+  it is fully handled (held, delayed, being answered); `IdleConns(appName)`
+  lists open, non-in-flight connections with that handshake appName (use
+  `"corral"` for idle pool connections).
+- Partial messages: `ConnInfo.PartialBytes` (bytes of the incomplete frame
+  received so far, 0 when none) and `ConnInfo.BytesReceived` (all bytes).
+- Refusal with attribution: `RefuseApp(appName, bool)` reads that appName's
+  hello, records it (so `ConnAttemptsBy(appName)` counts it), then resets the
+  connection without a reply, while other appNames (the monitor) are answered
+  normally. `RefuseAfterHello(bool)` does the same for every appName.
+- `ReplyWriteErrors(code)`: `{ok:1, n:0, writeErrors:[{index:0, code, errmsg}]}`.
+- Error replies to `ping` (barrier) use `ReplyError(code, name)` with
+  `Match{Command: "ping"}`, for example 10107 or 91.
+- `hello` replies carry `isWritablePrimary` only; legacy `isMaster` replies
+  carry `ismaster` only.
+- A non-handshake OP_QUERY gets `{ok:0, code:352, codeName:"UnsupportedOpQueryCommand"}`.
+- `BadServerSignature` does not mark the connection authenticated; it sets
+  `ConnInfo.SignatureForged`. `Fail18` carries errmsg "Authentication failed.".
+- `Stop` is safe against a racing Accept (a late connection is closed, never
+  registered); `Cluster` mutators publish atomically under a cluster lock.
+
 ## Known differences from a real mongod
 
 - Commands other than the ones above are echoed, never executed; there is no
@@ -51,8 +76,7 @@ users and passwords only. Run: `go test -race ./twins/mongosim`.
 - Hold, Delay and the check faults block the connection (requests on one
   connection are served in order, as on mongod).
 - SASLprep is not applied (use ASCII passwords). Salt and server nonce suffix
-  are deterministic. `BadServerSignature` still marks the connection
-  authenticated server-side.
+  are deterministic.
 - OP_COMPRESSED requests and unparsable frames close the connection with a reset.
 - `compression` is never advertised; `speculativeAuthenticate` is ignored.
 - `localTime` uses the wall clock; everything else is deterministic.

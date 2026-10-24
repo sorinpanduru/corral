@@ -27,6 +27,7 @@ type ClusterOptions struct {
 // Cluster is a simulated replica set whose members advertise each other's
 // real addresses.
 type Cluster struct {
+	pubMu      sync.Mutex // serialises state change + publish
 	mu         sync.Mutex
 	opts       ClusterOptions
 	data       []*Server
@@ -96,38 +97,46 @@ func (c *Cluster) URI() string {
 // SetPrimary elects member i: its electionId is bumped and the others become
 // secondaries.
 func (c *Cluster) SetPrimary(i int) {
+	c.pubMu.Lock()
+	defer c.pubMu.Unlock()
 	c.mu.Lock()
 	c.primary = i
 	c.electionN++
 	c.mu.Unlock()
-	c.publish()
+	c.publishLocked()
 }
 
 // NoPrimary leaves every member a secondary with no primary advertised.
 func (c *Cluster) NoPrimary() {
+	c.pubMu.Lock()
+	defer c.pubMu.Unlock()
 	c.mu.Lock()
 	c.primary = -1
 	c.mu.Unlock()
-	c.publish()
+	c.publishLocked()
 }
 
 // StepDown makes member i a secondary. If it was the primary the set has no
 // primary until SetPrimary.
 func (c *Cluster) StepDown(i int) {
+	c.pubMu.Lock()
+	defer c.pubMu.Unlock()
 	c.mu.Lock()
 	if c.primary == i {
 		c.primary = -1
 	}
 	c.mu.Unlock()
-	c.publish()
+	c.publishLocked()
 }
 
 // BumpSetVersion increments setVersion on every member.
 func (c *Cluster) BumpSetVersion() {
+	c.pubMu.Lock()
+	defer c.pubMu.Unlock()
 	c.mu.Lock()
 	c.setVersion++
 	c.mu.Unlock()
-	c.publish()
+	c.publishLocked()
 }
 
 // PrimaryIndex returns the current primary's index or -1.
@@ -135,6 +144,13 @@ func (c *Cluster) PrimaryIndex() int { c.mu.Lock(); defer c.mu.Unlock(); return 
 
 // publish pushes the current topology to every member.
 func (c *Cluster) publish() {
+	c.pubMu.Lock()
+	defer c.pubMu.Unlock()
+	c.publishLocked()
+}
+
+// publishLocked pushes the topology; the caller holds pubMu.
+func (c *Cluster) publishLocked() {
 	c.mu.Lock()
 	primary, n, sv := c.primary, c.electionN, c.setVersion
 	c.mu.Unlock()
