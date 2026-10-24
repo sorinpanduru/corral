@@ -8,3 +8,15 @@
 *.out
 coverage.*
 *.coverprofile
+
+# Local secrets and environment config (never commit)
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.local.yaml
+*.local.yml
+
+# Per-task factory worktrees
+/.worktrees/
