@@ -1,7 +1,11 @@
 .PHONY: build test test-functional tidy
 
+# VERSION is stamped into `corral --version` (FR-22). It must not contain
+# whitespace: the output is `corral <version>` on one line.
+VERSION ?= devel
+
 build:
-	go build -o bin/corral ./cmd/corral
+	go build -ldflags "-X main.version=$(VERSION)" -o bin/corral ./cmd/corral
 
 # Unit and integration tests. The `functional` build tag is not set, so
 # tests/functional is excluded.

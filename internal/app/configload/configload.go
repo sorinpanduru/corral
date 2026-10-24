@@ -12,7 +12,6 @@ import (
 	"errors"
 
 	"github.com/sorinpanduru/corral/internal/app/settings"
-	"github.com/sorinpanduru/corral/internal/infra/config"
 	"github.com/sorinpanduru/corral/internal/infra/config/loader"
 	"github.com/sorinpanduru/corral/internal/infra/config/registry"
 	"github.com/sorinpanduru/corral/internal/infra/config/source"
@@ -23,8 +22,8 @@ import (
 // validation needs (a programming error, never input).
 var ErrRegistry = errors.New("configload: registry lacks the tracing settings")
 
-// settingRegistry names the error for ErrRegistry.
-const settingRegistry = "registry"
+// ErrNoReader reports a nil file reader (a programming error).
+var ErrNoReader = errors.New("configload: no file reader")
 
 // Inputs are the injected inputs (FR-25).
 type Inputs struct {
@@ -46,9 +45,11 @@ type Outcome struct {
 	Tracing        tracing.EnvConfig
 	TLSIgnored     []string
 	Errors         []error
+	// Err is a programming error (a registry without the tracing settings, a
+	// nil file reader). It is never a *config.Error and never appears in
+	// Errors; the runtime maps it to exit code 1, not to FR-11 records.
+	Err error
 }
-
-func unreadable(string, int64) ([]byte, error) { return nil, source.ErrUnreadable }
 
 // Load selects the mode and, for run and check-config, loads and validates
 // everything a run would. Help and version return at once, before any
@@ -61,11 +62,11 @@ func Load(r *registry.Registry, in Inputs) Outcome {
 	_, okE := r.Lookup(settings.TracingEnabled)
 	ratioDecl, okR := r.Lookup(settings.TracingSampleRatio)
 	if !okE || !okR {
-		return Outcome{Mode: mode, Errors: []error{config.NewError(settingRegistry, ErrRegistry)}}
+		return Outcome{Mode: mode, Err: ErrRegistry}
 	}
 	read := in.ReadFile
 	if read == nil {
-		read = unreadable
+		return Outcome{Mode: mode, Err: ErrNoReader}
 	}
 
 	env := source.NewEnv(in.Env)
