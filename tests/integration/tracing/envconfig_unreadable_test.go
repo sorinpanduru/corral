@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sorinpanduru/corral/internal/infra/telemetry/logbridge"
 	"github.com/sorinpanduru/corral/internal/testkit/otlpcollector"
 )
 
@@ -102,9 +103,17 @@ func TestT24_UnreadableTLSFilesNeverLeakPath(t *testing.T) {
 					afterResolve: func() { v.break_(t, cert, key) }})
 				failFlushes(h, 2)
 				scanAll(t, h, nil, m) // finish() asserts empty stderr and JSON stdout
-				// Non-vacuity: the SDK's logger sink was really exercised.
-				if len(h.otelRecords()) == 0 {
-					t.Error("precondition: no component=otel record, the sink was never reached")
+				// Non-vacuity: the SDK's global.Error path reached the logr sink
+				// (MsgOTelError records come from the export-failure handler and
+				// do not prove this).
+				sinkWarns := 0
+				for _, r := range h.otelRecords() {
+					if r.Msg == logbridge.MsgOTelLogWarn {
+						sinkWarns++
+					}
+				}
+				if sinkWarns == 0 {
+					t.Error("precondition: no record with the logr sink's fixed warn message; the SDK global.Error path was not exercised")
 				}
 			})
 		}

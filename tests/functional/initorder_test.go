@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
-	"os"
 	"os/exec"
 	"regexp"
 	"sort"
@@ -30,7 +29,9 @@ var logOnlyInitBeforeEarlyslog = map[string]string{
 	// Reviewed in T24.2 (grpc v1.83.2): grpclog's init only calls
 	// SetLoggerV2(newLoggerV2()), which builds loggers over os.Stderr or
 	// io.Discard from GRPC_GO_LOG_* and emits nothing. Its writes bypass std
-	// log. Run-time output is covered by TestT24_GRPCLogNeverReachesStderr.
+	// log. Init-time and bootstrap output (grpc client bootstrap after
+	// logbridge.Install) is covered by TestT24_GRPCLogNeverReachesStderr; export
+	// is not, as the binary creates no spans yet.
 	"google.golang.org/grpc/grpclog": "init builds the default LoggerV2 only; no output at init",
 	// Reviewed in T24.2: its only package-level state is
 	// `var logger = grpclog.Component("core")` (a cache lookup, no output);
@@ -44,13 +45,9 @@ var initTraceLine = regexp.MustCompile(`^init (\S+) @`)
 // driver switched off (as in T21), from the module root.
 func hermeticGo(t *testing.T, args ...string) []byte {
 	t.Helper()
-	root, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}").Output()
-	if err != nil {
-		t.Fatalf("go list -m: %v", err)
-	}
 	cmd := exec.Command("go", args...)
-	cmd.Dir = string(trimNL(root))
-	cmd.Env = append(os.Environ(), "GOENV=off", "GOPACKAGESDRIVER=off")
+	cmd.Dir = moduleRoot(t)
+	cmd.Env = hermeticEnv()
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("go %s: %v", strings.Join(args, " "), err)
@@ -110,7 +107,8 @@ func initOrder(t *testing.T) map[string]int {
 // A package that reaches slog/log through an intermediate package is covered.
 func TestT22_EarlyslogInitOrderGuard(t *testing.T) {
 	out := hermeticGo(t, "list", "-deps", "-json=ImportPath,Standard,Imports,Deps", "./cmd/corral")
-	var slogUsers, logOnlyUsers, indirectSlog []string
+	var slogUsers, logOnlyUsers []string
+	indirectSlog := map[string]bool{}
 	haveEarly := false
 	dec := json.NewDecoder(bytes.NewReader(out))
 	for dec.More() {
@@ -131,7 +129,7 @@ func TestT22_EarlyslogInitOrderGuard(t *testing.T) {
 		case hasSlog:
 			slogUsers = append(slogUsers, p.ImportPath)
 			if !containsStr(p.Imports, "log/slog") {
-				indirectSlog = append(indirectSlog, p.ImportPath)
+				indirectSlog[p.ImportPath] = true
 			}
 		case hasLog:
 			logOnlyUsers = append(logOnlyUsers, p.ImportPath)
@@ -143,10 +141,13 @@ func TestT22_EarlyslogInitOrderGuard(t *testing.T) {
 	if len(slogUsers) == 0 {
 		t.Fatal("found no third-party transitive log/slog dependents: guard would be vacuous; check go list output")
 	}
-	// Self-check: transitive selection must pick up at least one package with
-	// no direct log/slog import, else this is no stronger than the old guard.
-	if len(indirectSlog) == 0 {
-		t.Fatal("no indirect (no direct log/slog import) dependent selected: transitive selection is broken")
+	// Self-check: pin a named third-party package that reaches log/slog only
+	// transitively (no direct import), so the selection is provably stronger
+	// than the old direct-importer guard. First-party packages would not do.
+	const pinnedIndirect = "go.opentelemetry.io/otel"
+	if !indirectSlog[pinnedIndirect] {
+		t.Fatalf("%s is not selected as an indirect log/slog dependent: transitive selection is broken "+
+			"(or the pin needs replacing with another third-party indirect dependent)", pinnedIndirect)
 	}
 
 	order := initOrder(t)

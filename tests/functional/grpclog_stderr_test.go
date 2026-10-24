@@ -87,15 +87,24 @@ func runGRPCLogCase(t *testing.T, mode, sev, verbosity string) {
 		logbridge.MsgGRPCDebug: true, logbridge.MsgGRPCWarn: true,
 		logbridge.MsgGRPCError: true, logbridge.MsgGRPCFatal: true,
 	}
+	grpcRecs := 0
 	for _, r := range p.records() { // fails on non-JSON stdout lines
-		if str(r, "component") == "grpc" && !fixed[str(r, "msg")] {
-			t.Errorf("component=grpc record has a message outside the fixed set (len %d)", len(str(r, "msg")))
+		if str(r, "component") == "grpc" {
+			grpcRecs++
+			if !fixed[str(r, "msg")] {
+				t.Errorf("component=grpc record has a message outside the fixed set (len %d)", len(str(r, "msg")))
+			}
 		}
 	}
-	// Note: the current binary creates no spans, so the exporter has nothing
-	// to send and the collector may see no request. Init-time grpclog output
-	// and the bootstrap path are what this case exercises today; once spans
-	// exist the same cases exercise the export path unchanged.
+	// Non-vacuity: with tracing on, the grpc client bootstrap after
+	// logbridge.Install logs through the bridge at debug (the bridge follows
+	// log.level, not GRPC_GO_LOG_*), whatever the env severity or verbosity.
+	if mode != "off" && grpcRecs == 0 {
+		t.Error("no component=grpc record: the grpclog bridge was not exercised")
+	}
+	// Coverage: init-time grpclog behaviour and the grpc client bootstrap
+	// after Install are exercised. The export itself is not, because the
+	// current binary creates no spans (the collector may see no request).
 
 	sc := markerscan.New()
 	sc.AddMarker(t, marker)

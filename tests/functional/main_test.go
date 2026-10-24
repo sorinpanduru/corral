@@ -28,13 +28,14 @@ func realMain(m *testing.M) int {
 	}
 	defer os.RemoveAll(dir)
 	binPath = filepath.Join(dir, "corral")
-	root, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}").Output()
+	root, err := moduleRootDir()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "go list -m:", err)
 		return 2
 	}
 	build := exec.Command("go", "build", "-o", binPath, "./cmd/corral")
-	build.Dir = string(trimNL(root))
+	build.Dir = root
+	build.Env = hermeticEnv()
 	build.Stdout, build.Stderr = os.Stdout, os.Stderr
 	if err := build.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "go build ./cmd/corral failed:", err)
@@ -48,4 +49,27 @@ func trimNL(b []byte) []byte {
 		b = b[:len(b)-1]
 	}
 	return b
+}
+
+// hermeticEnv is the environment of every go tool invocation in this package
+// (build and go list alike), so the guard analyses what was built: the user's
+// go env file and any package driver are switched off.
+func hermeticEnv() []string {
+	return append(os.Environ(), "GOENV=off", "GOPACKAGESDRIVER=off")
+}
+
+func moduleRootDir() (string, error) {
+	cmd := exec.Command("go", "list", "-m", "-f", "{{.Dir}}")
+	cmd.Env = hermeticEnv()
+	root, err := cmd.Output()
+	return string(trimNL(root)), err
+}
+
+func moduleRoot(t *testing.T) string {
+	t.Helper()
+	r, err := moduleRootDir()
+	if err != nil {
+		t.Fatalf("go list -m: %v", err)
+	}
+	return r
 }

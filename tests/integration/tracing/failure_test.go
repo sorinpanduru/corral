@@ -82,6 +82,9 @@ func TestAC3_UnreachableCollectorLogsOnlyRateLimitedFixedWarnings(t *testing.T) 
 			}
 
 			stdout, stderr := h.finish()
+			if proto == "grpc" {
+				requireGRPCRecord(t, h)
+			}
 			if len(stderr) != 0 {
 				t.Errorf("stderr has %d bytes", len(stderr))
 			}
@@ -95,6 +98,18 @@ func TestAC3_UnreachableCollectorLogsOnlyRateLimitedFixedWarnings(t *testing.T) 
 			}
 		})
 	}
+}
+
+// requireGRPCRecord asserts at least one component=grpc record (T24 S3: the
+// grpc client path really went through the logbridge grpclog logger).
+func requireGRPCRecord(t *testing.T, h *harness) {
+	t.Helper()
+	for _, r := range h.records() {
+		if r.str("component") == "grpc" {
+			return
+		}
+	}
+	t.Error("no component=grpc record: the grpclog bridge was not exercised")
 }
 
 func allowedFailureComponent(c string) bool {
