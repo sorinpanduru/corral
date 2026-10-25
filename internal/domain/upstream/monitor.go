@@ -718,22 +718,6 @@ func (m *Monitor) PoolAuthResult(ctx context.Context, hostAddr string, err error
 	m.run(ev)
 }
 
-// safeCodeName keeps an upstream codeName only if it looks like one (letters,
-// digits, underscore, at most 64 bytes); anything else would be upstream text
-// on its way to logs and is dropped (SPEC-001 FR-24).
-func safeCodeName(s string) string {
-	if len(s) == 0 || len(s) > 64 {
-		return ""
-	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_') {
-			return ""
-		}
-	}
-	return s
-}
-
 // prune removes hosts from monitoring by the FR-37 rule: a host that is not a
 // seed, is not listed by any matching member's latest check, and did not
 // itself report the matching setName. Its monitoring connection is closed
