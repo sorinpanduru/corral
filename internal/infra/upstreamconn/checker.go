@@ -141,10 +141,21 @@ func (k *Checker) Check(ctx context.Context, req upstream.CheckRequest) upstream
 			// The monitor reports authentication outcomes (one reporter). A
 			// transient failure is a failed attempt to make the connection
 			// ready: report it as a connect error and drop the connection.
-			rep.AuthErr = aerr
-			if !upstream.IsAuthFailed(aerr) {
+			if upstream.IsAuthFailed(aerr) {
+				rep.AuthErr = aerr
+			} else {
 				m.drop(k, ctx, host, pool.CloseError)
 				k.obs.MonitorConnFailed(ctx, host, aerr)
+				// The target's check did not complete (FR-22: transient
+				// failures are failed connection attempts): the check fails,
+				// so the target becomes unusable and readiness follows
+				// (FR-35, FR-46). Only network, TLS and timeout errors are
+				// retried once; an error reply is applied at once.
+				if c, _ := errclass.Classify(aerr); c == errclass.ClassConfig {
+					rep.AuthErr = aerr // unusable credentials: not a connection failure
+				} else {
+					rep.Err, rep.Transient = aerr, transient(aerr)
+				}
 			}
 		}
 	}

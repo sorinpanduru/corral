@@ -417,7 +417,16 @@ func (o *poolObs) StatsChanged(ctx context.Context, s pool.Stats) {
 
 func connectFailed(a *Adapters, ctx context.Context, kind, host string, err error) {
 	inc(a.m.connectErrs, kind, classOf(err))
-	attrs := append(errclass.LogAttrs(err), hostAttrs(host)...)
+	// The FR-49 table lists only error, corral.error.detail and the host for
+	// this record; the upstream's code and code name belong to the
+	// authentication failure record.
+	var attrs []slog.Attr
+	for _, at := range errclass.LogAttrs(err) {
+		if at.Key != attr.DBResponseStatusCode && at.Key != attr.DBResponseCodeName {
+			attrs = append(attrs, at)
+		}
+	}
+	attrs = append(attrs, hostAttrs(host)...)
 	if attrs, ok := a.allow(msgUpConnFailed, attrs); ok {
 		a.upLog.LogAttrs(ctx, slog.LevelWarn, msgUpConnFailed, attrs...)
 	}
