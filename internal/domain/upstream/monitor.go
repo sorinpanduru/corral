@@ -3,7 +3,15 @@ package upstream
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"io"
+	"math/rand"
+	"net"
+	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/sorinpanduru/corral/internal/domain/clock"
@@ -26,8 +34,10 @@ type host struct {
 	hasReport bool
 	rep       Report // latest successful report
 
-	dropped  bool
-	markedNP bool // marked not primary or unusable by a reply code (FR-35)
+	dropped   bool
+	markedNP  bool          // marked not primary or unusable by a reply code (FR-35)
+	markSeq   uint64        // launches with a sequence above this started after the marking
+	authDelay time.Duration // FR-22, FR-56: added to the heartbeat while authentication fails
 }
 
 // Monitor tracks the upstream deployment. It is safe for concurrent use.
@@ -56,8 +66,10 @@ type Monitor struct {
 	maxEID      [12]byte
 	maxSV       int64
 
-	cur      State
-	onChange []func(Change)
+	cur       State
+	seq       uint64
+	authFails int
+	onChange  []func(Change)
 }
 
 // NewMonitor returns a monitor. Call Start to begin checking.
@@ -157,6 +169,9 @@ func (m *Monitor) dueAt(h *host, now time.Time) (time.Time, bool) {
 		return now, true
 	}
 	due := h.last.Add(m.interval())
+	if m.authFailing && m.cur.HasTarget && m.cur.Target == h.addr {
+		due = due.Add(h.authDelay)
+	}
 	if h.hasOverride && h.override.Before(due) {
 		due = h.override
 	}
@@ -214,12 +229,14 @@ func (m *Monitor) launch(h *host, retry, fresh bool) {
 	req := CheckRequest{Host: h.addr, Authenticate: m.cfg.Authenticate && isTarget}
 	req.Fresh = fresh || (isTarget && m.authFailing)
 	ctx := m.ctx
+	m.seq++
+	seq := m.seq
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
 		rep := m.chk.Check(ctx, req)
 		rep.Host = h.addr
-		m.apply(h, req, rep)
+		m.apply(h, req, rep, seq)
 	}()
 }
 
@@ -258,7 +275,7 @@ func (m *Monitor) stale(r Report) bool {
 }
 
 // apply folds one check result into the state.
-func (m *Monitor) apply(h *host, req CheckRequest, rep Report) {
+func (m *Monitor) apply(h *host, req CheckRequest, rep Report, seq uint64) {
 	m.mu.Lock()
 	if m.stopped {
 		m.mu.Unlock()
@@ -268,7 +285,7 @@ func (m *Monitor) apply(h *host, req CheckRequest, rep Report) {
 	ev := &events{}
 	if rep.Err != nil {
 		isTarget := m.cur.HasTarget && m.cur.Target == h.addr
-		if isTarget && !h.retrying {
+		if isTarget && !h.retrying && retryable(rep.Err) {
 			// FR-35: retry once at once on a new connection; nothing changes
 			// while it runs.
 			h.retrying = true
@@ -279,7 +296,10 @@ func (m *Monitor) apply(h *host, req CheckRequest, rep Report) {
 		h.retrying, h.checking, h.up = false, false, false
 	} else {
 		h.retrying, h.checking, h.up = false, false, true
-		h.hasReport, h.rep, h.markedNP = true, rep, false
+		h.hasReport, h.rep = true, rep
+		if h.markedNP && seq > h.markSeq {
+			h.markedNP = false // confirmed by a check launched after the marking
+		}
 		if m.matching(rep) {
 			m.discover(rep)
 			if rep.IsWritablePrimary && !rep.ArbiterOnly {
@@ -294,19 +314,89 @@ func (m *Monitor) apply(h *host, req CheckRequest, rep Report) {
 		switch {
 		case rep.AuthErr != nil && IsAuthFailed(rep.AuthErr):
 			m.authFailing = true
+			m.authFails++
+			h.authDelay = authBackoff(m.authFails)
 			err := rep.AuthErr
 			ev.add(func() { m.obs.AuthFailed(ctx, "monitor", h.addr, err) })
 		case rep.AuthErr == nil && req.Authenticate:
 			m.authFailing = false
+			m.authFails = 0
+			h.authDelay = 0
 			ev.add(func() { m.obs.AuthSucceeded(ctx, "monitor", h.addr) })
 		}
 	} else if rep.Err == nil && rep.AuthErr != nil && IsAuthFailed(rep.AuthErr) && !ev2.hasTarget && !ev2.incompat {
 		m.authFailing = true
 	}
+	prevTarget := m.cur
 	m.commit(ctx, ev, ev2)
+	if m.cfg.Authenticate && !m.authFailing && m.cur.HasTarget && (!prevTarget.HasTarget || prevTarget.Target != m.cur.Target) {
+		// ADR-0019: a host that just became the target authenticates its
+		// monitoring connection at once, not at the next heartbeat.
+		if t := m.byAdr[m.cur.Target]; t != nil {
+			m.scheduleHost(t)
+		}
+	}
 	m.pump()
 	m.mu.Unlock()
 	m.run(ev)
+}
+
+// retryable reports whether a failed check counts for the FR-35 retry-once
+// rule: only network, TLS and timeout errors do. An error reply from the
+// server, a protocol violation or anything unrecognised does not.
+func retryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se interface{ ServerCode() int32 }
+	var de interface{ CorralErrorDetail() string }
+	if errors.As(err, &se) || errors.As(err, &de) {
+		return false
+	}
+	var ne net.Error
+	var errno syscall.Errno
+	var alert tls.AlertError
+	var rh tls.RecordHeaderError
+	var cv *tls.CertificateVerificationError
+	var ua x509.UnknownAuthorityError
+	var hn x509.HostnameError
+	var ci x509.CertificateInvalidError
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded),
+		errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return true
+	case errors.As(err, &ne), errors.As(err, &errno), errors.As(err, &alert), errors.As(err, &rh),
+		errors.As(err, &cv), errors.As(err, &ua), errors.As(err, &hn), errors.As(err, &ci):
+		return true
+	}
+	return false
+}
+
+// authBackoff is the FR-56 delay (100 ms doubling to 5 s, up to 20 percent
+// jitter) added to the heartbeat interval of target checks after n
+// consecutive authentication failures.
+func authBackoff(n int) time.Duration {
+	d := 100 * time.Millisecond
+	for i := 1; i < n && d < 5*time.Second; i++ {
+		d *= 2
+	}
+	if d > 5*time.Second {
+		d = 5 * time.Second
+	}
+	return time.Duration(float64(d) * (0.8 + 0.4*rand.Float64()))
+}
+
+// scheduleHost asks for an immediate check of one host, at least MinHeartbeat
+// after its previous one. Call with m.mu held.
+func (m *Monitor) scheduleHost(h *host) {
+	now := m.clk.Now()
+	at := now
+	if h.checked {
+		if floor := h.last.Add(MinHeartbeat); floor.After(at) {
+			at = floor
+		}
+	}
+	h.override, h.hasOverride = at, true
 }
 
 func (m *Monitor) run(ev *events) {
@@ -356,11 +446,6 @@ func (m *Monitor) evaluate() evalResult {
 	for _, h := range m.hosts {
 		if h.hasReport && m.matching(h.rep) {
 			matchKnown = true
-		}
-	}
-	for _, h := range m.hosts {
-		if h.hasReport && !m.matching(h.rep) && (matchKnown || !h.seed) {
-			h.dropped = true // sticky: no longer monitored (FR-37, FR-18)
 		}
 	}
 	var chosen *host
@@ -455,7 +540,15 @@ func (m *Monitor) commit(ctx context.Context, ev *events, e evalResult) {
 	}
 	m.cur = ns
 
-	if old.HasTarget && (!ns.HasTarget || ns.Target != old.Target) {
+	// BecameIncompatible comes first, and replaces the not-primary change for
+	// the same host, so the pool closes its connections as incompatible.
+	if !old.Incompatible && ns.Incompatible {
+		reason, host := ns.IncompatReason, ns.IncompatHost
+		ev.add(func() { m.obs.Incompatible(ctx, reason, host) })
+		ev.change(m, Change{Kind: BecameIncompatible, Host: host, Reason: string(reason)})
+	}
+	intoIncompat := !old.Incompatible && ns.Incompatible && ns.IncompatHost == old.Target
+	if old.HasTarget && !intoIncompat && (!ns.HasTarget || ns.Target != old.Target) {
 		kind := HostNotPrimary
 		if h := m.byAdr[old.Target]; h != nil && !h.up {
 			kind = HostUnknown
@@ -466,11 +559,6 @@ func (m *Monitor) commit(ctx context.Context, ev *events, e evalResult) {
 		host := ns.Target
 		ev.change(m, Change{Kind: TargetChanged, Host: host})
 		ev.add(func() { m.obs.PrimaryChanged(ctx, host) })
-	}
-	if !old.Incompatible && ns.Incompatible {
-		reason, host := ns.IncompatReason, ns.IncompatHost
-		ev.add(func() { m.obs.Incompatible(ctx, reason, host) })
-		ev.change(m, Change{Kind: BecameIncompatible, Host: host, Reason: string(reason)})
 	}
 	or, nr := EvaluateReadiness(old), EvaluateReadiness(ns)
 	if or != nr {
@@ -543,7 +631,7 @@ func (m *Monitor) ReplyCodes(ctx context.Context, hostAddr string, src ReplySour
 		}
 	case f.HasTop && f.OKZero && isNotPrimaryCode(f.Top):
 		code, name = f.Top, f.TopName
-	case src == Forwarded && f.HasWCE && isNotPrimaryCode(f.WCE):
+	case src == Forwarded && f.HasWCE && !f.OKZero && isNotPrimaryCode(f.WCE):
 		code = f.WCE
 	default:
 		return false
@@ -558,6 +646,7 @@ func (m *Monitor) ReplyCodes(ctx context.Context, hostAddr string, src ReplySour
 	}
 	wasTarget := m.cur.HasTarget && m.cur.Target == hostAddr
 	h.markedNP = true
+	h.markSeq = m.seq
 	ev := &events{}
 	m.commit(ctx, ev, m.evaluate())
 	if wasTarget {

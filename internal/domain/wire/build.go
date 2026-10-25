@@ -40,6 +40,7 @@ func PingBody() []byte {
 func HelloBody(app, driverVersion, osType string) []byte {
 	b := bson.NewBuilder()
 	b.AppendInt32("hello", 1)
+	b.AppendBool("helloOk", true)
 	b.StartDocument("client")
 	b.StartDocument("application")
 	b.AppendString("name", app)

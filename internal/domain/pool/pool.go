@@ -449,11 +449,15 @@ func (p *Pool[C]) startOpen(host string, base context.Context, fx *effects) {
 	id := p.nextID
 	ctx, cancel := context.WithCancel(context.WithoutCancel(base))
 	p.cancels[id] = cancel
+	// ConnOpening is reported before the open starts, so observers see it
+	// before ConnOpened or ConnOpenFailed.
 	fx.add(func() { p.obs.ConnOpening(ctx, host) })
-	go func() {
-		c, err := p.op.Open(ctx, host)
-		p.openDone(ctx, id, host, c, err)
-	}()
+	fx.add(func() {
+		go func() {
+			c, err := p.op.Open(ctx, host)
+			p.openDone(ctx, id, host, c, err)
+		}()
+	})
 }
 
 func (p *Pool[C]) openDone(ctx context.Context, id uint64, host string, c C, err error) {
@@ -479,6 +483,10 @@ func (p *Pool[C]) openDone(ctx context.Context, id uint64, host string, c C, err
 		fx.add(func() { p.obs.ConnOpened(ctx, host, id) })
 		adm := p.gate.Admission()
 		switch {
+		case adm.Kind == FailFast && adm.Detail == "upstream_incompatible":
+			p.closeConn(c, CloseIncompatible, fx)
+		case adm.Kind == FailFast && adm.Detail == "upstream_auth_failed":
+			p.closeConn(c, CloseError, fx)
 		case adm.Kind != Ready || adm.Target != host:
 			p.closeConn(c, CloseNotPrimary, fx)
 		case len(p.waiters) > 0:
