@@ -131,7 +131,7 @@ func New(cfg settings.Proxy, d Deps) (*Service, error) {
 		Leaser: leaser{p: s.pool, svc: s}, Upstream: view{s.mon}, Obs: ad.Proxy(),
 		Spans: spans.New(d.Tracer, d.TracingEnabled), Clock: d.Clock,
 		IOTimeout: cfg.ClientIOTimeout, IdleTimeout: cfg.ClientIdleTimeout, Shutdown: s.sd,
-		ReplyCodes: s.mon.ReplyCodes, Probe: d.Hooks.Probe, PanicCommand: d.Hooks.PanicCommand,
+		ReplyCodes: s.mon.ReplyCodes, UpstreamNetworkError: s.mon.PoolConnectFailed, Probe: d.Hooks.Probe, PanicCommand: d.Hooks.PanicCommand,
 	})
 	s.srv = proxyserver.New(proxyserver.Options{Addr: cfg.Listen, MaxConns: cfg.MaxClientConnections, TLS: serverTLS,
 		IOTimeout: cfg.ClientIOTimeout, Engine: eng, Obs: ad.Proxy(), Shutdown: s.sd, IDs: proxy.NewConnIDs(), Hold: d.Hooks.Hold,

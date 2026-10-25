@@ -80,6 +80,9 @@ func (x *msg) run() (proxy.CloseReason, bool) {
 
 	req, err := wire.ClassifyPrefix(x.prefix, x.h.Length)
 	if err != nil {
+		// The request is still labelled with its command when the name is in
+		// the prefix (FR-48, Amendment 1 S4).
+		x.cmd = partialCommand(x.prefix)
 		return x.protocolFail(err)
 	}
 	x.req, x.cmd = req, req.Command
@@ -135,8 +138,28 @@ func (x *msg) drain() error {
 			return err
 		}
 		x.remaining -= n
+		if x.v != nil {
+			// Only to learn the FR-39 label fields from the whole message. A
+			// validation error here changes nothing: the message is refused
+			// anyway, and the sticky error stops further capture.
+			_ = x.v.Write(buf[:n])
+		}
 	}
 	return nil
+}
+
+// refreshLabels updates the label inputs from the whole message after it has
+// been read (FR-38: the FR-39 labels are determined from the whole message).
+func (x *msg) refreshLabels() {
+	if x.v == nil {
+		return
+	}
+	if x.v.TxnNumberPresent() {
+		x.req.HasTxnNumber = true
+	}
+	if x.v.AutocommitFalse() {
+		x.req.AutocommitFalse = true
+	}
 }
 
 // local answers a message without the upstream: handshakes, refusals and the
@@ -151,6 +174,16 @@ func (x *msg) local(dec proxy.Decision, closeAfter bool) (proxy.CloseReason, boo
 	if x.req.Kind != wire.KindOpMsg {
 		op = "op_query"
 	}
+	// Refusals other than client auth get a root span in error; handshakes and
+	// auth commands get none (FR-50). The span starts before the observers run,
+	// so their records carry its trace and span ids.
+	octx := s.ctx
+	var ex spans.Exchange
+	spanned := dec.Kind == proxy.QueryFailure || (dec.Kind == proxy.Refuse && !dec.ClientAuth)
+	if spanned {
+		octx, ex = d.Spans.Start(s.ctx, s.rootInfo(&x.req))
+	}
+	lateReply := false // built after the message was read: labels need all of it
 	switch dec.Kind {
 	case proxy.Handshake:
 		body := proxy.HandshakeReply(*x.req.Handshake, dec.Params, s.cc.ID, d.Clock.Now())
@@ -164,27 +197,34 @@ func (x *msg) local(dec proxy.Decision, closeAfter bool) (proxy.CloseReason, boo
 		reply = x.frame(proxy.QueryFailureDoc(), 2)
 		refusal = proxy.UnsupportedOpQuery
 	default: // Refuse
-		reply = x.frame(proxy.ErrorBody(dec.Refusal, proxy.Labels(dec.Refusal, x.req)), 0)
+		lateReply = true
 		refusal = dec.Refusal
 		if dec.ClientAuth {
-			d.Obs.ClientAuthRejected(s.ctx, s.cc.ID, dec.Refusal)
+			d.Obs.ClientAuthRejected(octx, s.cc.ID, dec.Refusal)
 		}
 		if dec.Blocked {
-			d.Obs.CommandBlocked(s.ctx, s.cc.ID, x.req.Command)
+			d.Obs.CommandBlocked(octx, s.cc.ID, x.req.Command)
 		}
 	}
 	if err := x.drain(); err != nil {
+		if spanned {
+			ex.End(err, nil)
+		}
 		return x.clientIOFail(err)
+	}
+	if lateReply {
+		x.refreshLabels()
+		reply = x.frame(proxy.ErrorBody(dec.Refusal, proxy.Labels(dec.Refusal, x.req)), 0)
 	}
 	if !dec.NoReply {
 		if err := s.write(reply); err != nil {
+			if spanned {
+				ex.End(err, nil)
+			}
 			return x.clientIOFail(err)
 		}
 	}
-	// Spans: refusals other than client auth get a root span in error;
-	// handshakes and auth commands get none (FR-50).
-	if dec.Kind == proxy.QueryFailure || (dec.Kind == proxy.Refuse && !dec.ClientAuth) {
-		_, ex := d.Spans.Start(s.ctx, s.rootInfo(&x.req))
+	if spanned {
 		ex.End(refusal, nil)
 	}
 	x.complete(outcome, refusal, dec.NoReply && dec.Kind != proxy.Handshake)
@@ -257,6 +297,7 @@ func (x *msg) checkoutFailed(co spans.Step, ex spans.Exchange, err error) (proxy
 	if err := x.drain(); err != nil {
 		return x.clientIOFail(err)
 	}
+	x.refreshLabels()
 	if !noReply {
 		if err := s.write(x.frame(proxy.ErrorBody(ref, proxy.Labels(ref, x.req)), 0)); err != nil {
 			return x.clientIOFail(err)
@@ -270,6 +311,7 @@ func (x *msg) checkoutFailed(co spans.Step, ex spans.Exchange, err error) (proxy
 // discarded and the client closed (FR-40).
 func (x *msg) upstreamFail(lease Lease, rt spans.Step, ex spans.Exchange, err error) (proxy.CloseReason, bool) {
 	lease.Discard(pool.CloseError)
+	x.networkError(lease.Upstream().Host(), err)
 	if isProtocolErr(err) {
 		x.s.e.d.Obs.UpstreamProtocolError(x.s.ctx, lease.Upstream().Host(), err)
 	}
@@ -323,4 +365,14 @@ func partialCommand(b []byte) string {
 		}
 	}
 	return ""
+}
+
+// networkError tells the monitor about a network or timeout error on a leased
+// connection (FR-37 immediate check).
+func (x *msg) networkError(host string, err error) {
+	if f := x.s.e.d.UpstreamNetworkError; f != nil {
+		if c := classOf(err); c == "network" || c == "timeout" {
+			f(x.s.ctx, host, err)
+		}
+	}
 }

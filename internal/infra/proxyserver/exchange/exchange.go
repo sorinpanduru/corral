@@ -74,17 +74,20 @@ type Probe interface {
 
 // Deps are the engine's dependencies.
 type Deps struct {
-	Leaser       Leaser
-	Upstream     UpstreamView
-	Obs          proxy.Observer
-	Spans        *spans.Factory
-	Clock        clock.Clock
-	IOTimeout    time.Duration
-	IdleTimeout  time.Duration
-	Shutdown     *proxy.Shutdown
-	ReplyCodes   func(ctx context.Context, host string, src upstream.ReplySource, f upstream.ReplyCodeInfo) bool
-	Probe        Probe
-	PanicCommand string // corraltest only: a command that panics the handler
+	Leaser      Leaser
+	Upstream    UpstreamView
+	Obs         proxy.Observer
+	Spans       *spans.Factory
+	Clock       clock.Clock
+	IOTimeout   time.Duration
+	IdleTimeout time.Duration
+	Shutdown    *proxy.Shutdown
+	ReplyCodes  func(ctx context.Context, host string, src upstream.ReplySource, f upstream.ReplyCodeInfo) bool
+	Probe       Probe
+	// UpstreamNetworkError is told about a network or timeout error on a
+	// leased upstream connection, which starts an immediate check (FR-37).
+	UpstreamNetworkError func(ctx context.Context, host string, err error)
+	PanicCommand         string // corraltest only: a command that panics the handler
 }
 
 // ClientConn is one accepted client connection.

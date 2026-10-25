@@ -195,6 +195,7 @@ func (x *msg) barrier(lease Lease, up Upstream) {
 	_ = nc.SetReadDeadline(time.Time{})
 	fail := func(err error) {
 		lease.Discard(pool.CloseError)
+		x.networkError(up.Host(), err)
 		d.Obs.UpstreamBarrierFailed(x.s.ctx, up.Host(), err)
 		if isProtocolErr(err) {
 			d.Obs.UpstreamProtocolError(x.s.ctx, up.Host(), err)
