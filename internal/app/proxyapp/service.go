@@ -14,7 +14,6 @@ import (
 	"crypto/tls"
 	"log/slog"
 	"net"
-	"time"
 
 	"go.opentelemetry.io/otel/trace"
 
@@ -79,7 +78,7 @@ func New(cfg settings.Proxy, d Deps) (*Service, error) {
 	if d.Clock == nil {
 		d.Clock = clock.System()
 	}
-	ad, err := proxyobs.New(d.Logs, d.Metrics, time.Now)
+	ad, err := proxyobs.New(d.Logs, d.Metrics, d.Clock.Now)
 	if err != nil {
 		return nil, err
 	}
