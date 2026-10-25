@@ -279,7 +279,8 @@ above.
 ## Setting reference
 
 All settings are listed with their flag, environment variable, type, presence,
-secret status and description. None of the current settings is secret.
+secret status and description. The SPEC-002 settings follow in "Proxy
+settings (SPEC-002)"; some of them are secret and take file references.
 
 ### `log.format`
 
@@ -346,6 +347,244 @@ required too; use `--upstream.auth.mechanism=none` for an upstream without
 authentication. All of them are read once at startup, and changing any of
 them (including credentials and TLS material) needs a restart. See
 [proxy.md](proxy.md) for what they mean for operations.
+
+Each setting below lists its flag form and its environment variable. A secret
+setting is never accepted as a literal flag; it takes a file reference, both
+as a flag and as an environment variable (see "File references").
+
+#### `proxy.listen`
+
+- Flag: `--proxy.listen=<value>`; environment variable: `CORRAL_PROXY_LISTEN`
+- Type: hostport
+- Presence: default `127.0.0.1:27017`
+- Secret: no
+- MongoDB wire listener address.
+
+#### `proxy.max_client_connections`
+
+- Flag: `--proxy.max_client_connections=<value>`; environment variable: `CORRAL_PROXY_MAX_CLIENT_CONNECTIONS`
+- Type: int
+- Presence: default `10000`
+- Secret: no
+- Maximum open client connections.
+
+#### `proxy.client_idle_timeout`
+
+- Flag: `--proxy.client_idle_timeout=<value>`; environment variable: `CORRAL_PROXY_CLIENT_IDLE_TIMEOUT`
+- Type: duration (zero allowed)
+- Presence: default `0s`
+- Secret: no
+- Close client connections idle this long.
+
+#### `proxy.client_io_timeout`
+
+- Flag: `--proxy.client_io_timeout=<value>`; environment variable: `CORRAL_PROXY_CLIENT_IO_TIMEOUT`
+- Type: duration
+- Presence: default `30s`
+- Secret: no
+- Maximum time to receive a started client message, to write a reply to a client, or to complete a client TLS handshake.
+
+#### `proxy.tls.enabled`
+
+- Flag: `--proxy.tls.enabled=<value>`; environment variable: `CORRAL_PROXY_TLS_ENABLED`
+- Type: bool
+- Presence: default `false`
+- Secret: no
+- Require TLS on the wire listener.
+
+#### `proxy.tls.cert_path`
+
+- Flag: `--proxy.tls.cert_path=<value>`; environment variable: `CORRAL_PROXY_TLS_CERT_PATH`
+- Type: path to a PEM file, read once at startup
+- Presence: optional
+- Secret: no
+- Path to the wire listener certificate chain (PEM).
+
+#### `proxy.tls.key`
+
+- Flag: not accepted as a literal value; file reference flag: `--proxy.tls.key_file=<path>`
+- Environment variable: `CORRAL_PROXY_TLS_KEY`; file reference: `CORRAL_PROXY_TLS_KEY_FILE`
+- Type: text
+- Presence: optional
+- Secret: yes
+- Wire listener TLS private key (PEM); supply via `CORRAL_PROXY_TLS_KEY_FILE` or `--proxy.tls.key_file`.
+
+#### `proxy.tls.client_ca_path`
+
+- Flag: `--proxy.tls.client_ca_path=<value>`; environment variable: `CORRAL_PROXY_TLS_CLIENT_CA_PATH`
+- Type: path to a PEM file, read once at startup
+- Presence: optional
+- Secret: no
+- CA bundle for verifying client certificates; when set, mutual TLS is required.
+
+#### `proxy.shutdown.listener_close_delay`
+
+- Flag: `--proxy.shutdown.listener_close_delay=<value>`; environment variable: `CORRAL_PROXY_SHUTDOWN_LISTENER_CLOSE_DELAY`
+- Type: duration (zero allowed)
+- Presence: default `0s`
+- Secret: no
+- Keep serving this long after shutdown starts before closing the listener.
+
+#### `proxy.shutdown.drain_timeout`
+
+- Flag: `--proxy.shutdown.drain_timeout=<value>`; environment variable: `CORRAL_PROXY_SHUTDOWN_DRAIN_TIMEOUT`
+- Type: duration
+- Presence: default `20s`
+- Secret: no
+- Maximum time to drain in-flight exchanges at shutdown.
+
+#### `pool.max_size`
+
+- Flag: `--pool.max_size=<value>`; environment variable: `CORRAL_POOL_MAX_SIZE`
+- Type: int
+- Presence: default `10`
+- Secret: no
+- Maximum upstream connections in the pool.
+
+#### `pool.min_size`
+
+- Flag: `--pool.min_size=<value>`; environment variable: `CORRAL_POOL_MIN_SIZE`
+- Type: int
+- Presence: default `0`
+- Secret: no
+- Upstream connections kept open while the upstream is available.
+
+#### `pool.max_waiters`
+
+- Flag: `--pool.max_waiters=<value>`; environment variable: `CORRAL_POOL_MAX_WAITERS`
+- Type: int
+- Presence: optional
+- Secret: no
+- Maximum requests waiting for an upstream connection.
+
+#### `pool.checkout_timeout`
+
+- Flag: `--pool.checkout_timeout=<value>`; environment variable: `CORRAL_POOL_CHECKOUT_TIMEOUT`
+- Type: duration
+- Presence: default `5s`
+- Secret: no
+- Maximum wait for an upstream connection.
+
+#### `upstream.hosts`
+
+- Flag: `--upstream.hosts=<value>`; environment variable: `CORRAL_UPSTREAM_HOSTS`
+- Type: list of hostport, comma-separated
+- Presence: required
+- Secret: no
+- Upstream seed addresses (`host:port`); never a connection string.
+
+#### `upstream.replica_set`
+
+- Flag: `--upstream.replica_set=<value>`; environment variable: `CORRAL_UPSTREAM_REPLICA_SET`
+- Type: string
+- Presence: optional
+- Secret: no
+- Replica set name; when set, corral targets that set's current primary. When unset, the single host must be a `mongos`.
+
+#### `upstream.auth.mechanism`
+
+- Flag: `--upstream.auth.mechanism=<value>`; environment variable: `CORRAL_UPSTREAM_AUTH_MECHANISM`
+- Type: enum SCRAM-SHA-256, none
+- Presence: default `SCRAM-SHA-256`
+- Secret: no
+- Upstream authentication mechanism.
+
+#### `upstream.auth.source`
+
+- Flag: `--upstream.auth.source=<value>`; environment variable: `CORRAL_UPSTREAM_AUTH_SOURCE`
+- Type: string
+- Presence: default `admin`
+- Secret: no
+- Authentication database for the service identity.
+
+#### `upstream.auth.username`
+
+- Flag: not accepted as a literal value; file reference flag: `--upstream.auth.username_file=<path>`
+- Environment variable: `CORRAL_UPSTREAM_AUTH_USERNAME`; file reference: `CORRAL_UPSTREAM_AUTH_USERNAME_FILE`
+- Type: string
+- Presence: optional
+- Secret: yes
+- Service identity username.
+
+#### `upstream.auth.password`
+
+- Flag: not accepted as a literal value; file reference flag: `--upstream.auth.password_file=<path>`
+- Environment variable: `CORRAL_UPSTREAM_AUTH_PASSWORD`; file reference: `CORRAL_UPSTREAM_AUTH_PASSWORD_FILE`
+- Type: string
+- Presence: optional
+- Secret: yes
+- Service identity password.
+
+#### `upstream.connect_timeout`
+
+- Flag: `--upstream.connect_timeout=<value>`; environment variable: `CORRAL_UPSTREAM_CONNECT_TIMEOUT`
+- Type: duration
+- Presence: default `10s`
+- Secret: no
+- Time limit to connect, handshake and authenticate an upstream connection, and for one monitoring check.
+
+#### `upstream.heartbeat_interval`
+
+- Flag: `--upstream.heartbeat_interval=<value>`; environment variable: `CORRAL_UPSTREAM_HEARTBEAT_INTERVAL`
+- Type: duration
+- Presence: default `10s`
+- Secret: no
+- Interval between upstream health and topology checks.
+
+#### `upstream.max_idle_time`
+
+- Flag: `--upstream.max_idle_time=<value>`; environment variable: `CORRAL_UPSTREAM_MAX_IDLE_TIME`
+- Type: duration (zero allowed)
+- Presence: default `5m`
+- Secret: no
+- Close idle pool connections after this long, keeping `pool.min_size`.
+
+#### `upstream.tls.enabled`
+
+- Flag: `--upstream.tls.enabled=<value>`; environment variable: `CORRAL_UPSTREAM_TLS_ENABLED`
+- Type: bool
+- Presence: default `false`
+- Secret: no
+- Use verified TLS to the upstream.
+
+#### `upstream.tls.ca_path`
+
+- Flag: `--upstream.tls.ca_path=<value>`; environment variable: `CORRAL_UPSTREAM_TLS_CA_PATH`
+- Type: path to a PEM file, read once at startup
+- Presence: optional
+- Secret: no
+- CA bundle for verifying the upstream; unset uses system roots.
+
+Summary of the names:
+| Setting | Flag | Environment variable | Secret file forms |
+|---|---|---|---|
+| `proxy.listen` | `--proxy.listen=<value>` | `CORRAL_PROXY_LISTEN` | not applicable |
+| `proxy.max_client_connections` | `--proxy.max_client_connections=<value>` | `CORRAL_PROXY_MAX_CLIENT_CONNECTIONS` | not applicable |
+| `proxy.client_idle_timeout` | `--proxy.client_idle_timeout=<value>` | `CORRAL_PROXY_CLIENT_IDLE_TIMEOUT` | not applicable |
+| `proxy.client_io_timeout` | `--proxy.client_io_timeout=<value>` | `CORRAL_PROXY_CLIENT_IO_TIMEOUT` | not applicable |
+| `proxy.tls.enabled` | `--proxy.tls.enabled=<value>` | `CORRAL_PROXY_TLS_ENABLED` | not applicable |
+| `proxy.tls.cert_path` | `--proxy.tls.cert_path=<value>` | `CORRAL_PROXY_TLS_CERT_PATH` | not applicable |
+| `proxy.tls.key` | not accepted literally | `CORRAL_PROXY_TLS_KEY` | `--proxy.tls.key_file=<path>`, `CORRAL_PROXY_TLS_KEY_FILE` |
+| `proxy.tls.client_ca_path` | `--proxy.tls.client_ca_path=<value>` | `CORRAL_PROXY_TLS_CLIENT_CA_PATH` | not applicable |
+| `proxy.shutdown.listener_close_delay` | `--proxy.shutdown.listener_close_delay=<value>` | `CORRAL_PROXY_SHUTDOWN_LISTENER_CLOSE_DELAY` | not applicable |
+| `proxy.shutdown.drain_timeout` | `--proxy.shutdown.drain_timeout=<value>` | `CORRAL_PROXY_SHUTDOWN_DRAIN_TIMEOUT` | not applicable |
+| `pool.max_size` | `--pool.max_size=<value>` | `CORRAL_POOL_MAX_SIZE` | not applicable |
+| `pool.min_size` | `--pool.min_size=<value>` | `CORRAL_POOL_MIN_SIZE` | not applicable |
+| `pool.max_waiters` | `--pool.max_waiters=<value>` | `CORRAL_POOL_MAX_WAITERS` | not applicable |
+| `pool.checkout_timeout` | `--pool.checkout_timeout=<value>` | `CORRAL_POOL_CHECKOUT_TIMEOUT` | not applicable |
+| `upstream.hosts` | `--upstream.hosts=<value>` | `CORRAL_UPSTREAM_HOSTS` | not applicable |
+| `upstream.replica_set` | `--upstream.replica_set=<value>` | `CORRAL_UPSTREAM_REPLICA_SET` | not applicable |
+| `upstream.auth.mechanism` | `--upstream.auth.mechanism=<value>` | `CORRAL_UPSTREAM_AUTH_MECHANISM` | not applicable |
+| `upstream.auth.source` | `--upstream.auth.source=<value>` | `CORRAL_UPSTREAM_AUTH_SOURCE` | not applicable |
+| `upstream.auth.username` | not accepted literally | `CORRAL_UPSTREAM_AUTH_USERNAME` | `--upstream.auth.username_file=<path>`, `CORRAL_UPSTREAM_AUTH_USERNAME_FILE` |
+| `upstream.auth.password` | not accepted literally | `CORRAL_UPSTREAM_AUTH_PASSWORD` | `--upstream.auth.password_file=<path>`, `CORRAL_UPSTREAM_AUTH_PASSWORD_FILE` |
+| `upstream.connect_timeout` | `--upstream.connect_timeout=<value>` | `CORRAL_UPSTREAM_CONNECT_TIMEOUT` | not applicable |
+| `upstream.heartbeat_interval` | `--upstream.heartbeat_interval=<value>` | `CORRAL_UPSTREAM_HEARTBEAT_INTERVAL` | not applicable |
+| `upstream.max_idle_time` | `--upstream.max_idle_time=<value>` | `CORRAL_UPSTREAM_MAX_IDLE_TIME` | not applicable |
+| `upstream.tls.enabled` | `--upstream.tls.enabled=<value>` | `CORRAL_UPSTREAM_TLS_ENABLED` | not applicable |
+| `upstream.tls.ca_path` | `--upstream.tls.ca_path=<value>` | `CORRAL_UPSTREAM_TLS_CA_PATH` | not applicable |
+
+The table below adds the limits and the meaning of each value.
 
 | Logical name | Environment variable | Default | Meaning |
 |---|---|---|---|
