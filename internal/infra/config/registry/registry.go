@@ -9,6 +9,7 @@
 package registry
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -68,6 +69,13 @@ func (v FileValue) String() string             { return "file:" + v.Path }
 func (v FileValue) GoString() string           { return "registry.FileValue{Path:" + strconv.Quote(v.Path) + "}" }
 func (v FileValue) Format(f fmt.State, _ rune) { _, _ = f.Write([]byte(v.String())) }
 func (v FileValue) LogValue() slog.Value       { return slog.StringValue(v.String()) }
+
+// MarshalText and MarshalJSON keep the content out of every encoder: the path
+// only (a PEM key must never be serialised by accident).
+func (v FileValue) MarshalText() ([]byte, error) { return []byte(v.String()), nil }
+
+// MarshalJSON encodes the path-only form as a JSON string.
+func (v FileValue) MarshalJSON() ([]byte, error) { return json.Marshal(v.String()) }
 
 // CrossRule is a rule over several settings (FR-30). Primary names the setting
 // a failure is reported under; it must be among Involves.
