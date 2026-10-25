@@ -56,7 +56,9 @@ func TestFlagBitBeforeLocalSizeRule_FR5(t *testing.T) {
 }
 
 // FR-38 (review): a deciding key present in the prefix without its value bytes
-// is malformed_message (the value is outside the prefix too).
+// is malformed_message (the value is outside the prefix too). The collection
+// name is not a deciding field: when its value is cut at the prefix edge,
+// classification succeeds and the collection is left unset.
 func TestKeyWithoutValueBytesInPrefix_FR38(t *testing.T) {
 	pipe := eArray("pipeline", eDoc("0", doc(eDoc("$match", doc()))))
 	cases := map[string][]byte{
@@ -73,7 +75,14 @@ func TestKeyWithoutValueBytesInPrefix_FR38(t *testing.T) {
 				t.Fatal("setup: key not found")
 			}
 			cut := idx + len(keys[name]) + 1 // right after the key's NUL
-			if _, err := wire.ClassifyPrefix(m[:cut], int32(len(m))); detail(err) != "malformed_message" {
+			req, err := wire.ClassifyPrefix(m[:cut], int32(len(m)))
+			if name == "command value cut" || name == "getMore collection cut" {
+				if err != nil || req.HasCollection {
+					t.Fatalf("a cut collection value: err %v HasCollection %v, want success with the collection unset", err, req.HasCollection)
+				}
+				return
+			}
+			if detail(err) != "malformed_message" {
 				t.Fatalf("cut after the key: detail %q, want malformed_message", detail(err))
 			}
 		})
