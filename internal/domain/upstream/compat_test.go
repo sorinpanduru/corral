@@ -166,8 +166,9 @@ func TestReplicaSetPrimaryWireVersion_AC10(t *testing.T) {
 	}
 }
 
-// FR-18: a non-matching seed next to a matching member is ignored and no
-// longer checked.
+// FR-18 and the Owner rule (SPEC-002 Amendment 3): a non-matching seed next to
+// a matching member is ignored (never the target, no incompatibility) but is
+// still re-checked on schedule.
 func TestNonMatchingSeedIgnoredWithMatchingMember_AC10(t *testing.T) {
 	setup := func(c *fakeChecker) {
 		c.set(primary(A, "other-set", A))
@@ -182,16 +183,18 @@ func TestNonMatchingSeedIgnoredWithMatchingMember_AC10(t *testing.T) {
 	}
 	nA := len(h.chk.of(A))
 	h.advance(10 * 1e9)
+	h.waitCount(A, nA+1)
 	h.waitCount(B, 2)
-	h.quiet()
+	if got := len(h.chk.of(A)); got < nA+1 {
+		t.Fatalf("a non-matching seed is no longer re-checked (%d -> %d)", nA, got)
+	}
+	if st := h.m.State(); st.Incompatible || st.Target != B {
+		t.Fatalf("state: %+v", st)
+	}
+	// It is re-admitted when it starts matching (with a larger pair it wins).
+	h.chk.set(primaryAt(A, "rs0", 8, 1, A, B))
 	h.advance(10 * 1e9)
-	h.quiet()
-	if got := len(h.chk.of(A)); got != nA {
-		t.Fatalf("a non-matching seed is still checked (%d -> %d)", nA, got)
-	}
-	if h.m.State().Incompatible {
-		t.Fatal("became incompatible")
-	}
+	h.waitState("A re-admitted", func(s upstream.State) bool { return s.Target == A })
 }
 
 // FR-18: losing all matching members later is transient unavailability, not

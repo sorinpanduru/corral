@@ -396,3 +396,21 @@ func TestParseSaslReply_FR22(t *testing.T) {
 }
 
 func binData(v bson.RawValue) []byte { _, d := v.Binary(); return d }
+
+// Review fix: corral's own hello carries helloOk:true, so servers answer to
+// later `hello` commands consistently and the legacy-handshake path is not
+// taken.
+func TestHelloBodyHasHelloOK_FR28(t *testing.T) {
+	hello := bson.Raw(wire.HelloBody("corral", "1.2.3", "linux"))
+	v, err := hello.LookupErr("helloOk")
+	if err != nil {
+		t.Fatalf("HelloBody has no helloOk: %v", err)
+	}
+	if b, ok := v.BooleanOK(); !ok || !b {
+		t.Fatal("helloOk is not true")
+	}
+	monitor := bson.Raw(wire.HelloBody("corral-monitor", "1.2.3", "linux"))
+	if v, err := monitor.LookupErr("helloOk"); err != nil || !v.Boolean() {
+		t.Fatal("monitoring hello lacks helloOk:true")
+	}
+}

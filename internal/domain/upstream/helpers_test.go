@@ -103,6 +103,13 @@ func (f *fakeChecker) down(host string) {
 	f.fail[host] = netErr()
 }
 
+// failWith makes checks of host return err (any error type).
+func (f *fakeChecker) failWith(host string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fail[host] = err
+}
+
 func (f *fakeChecker) Check(ctx context.Context, req upstream.CheckRequest) upstream.Report {
 	f.mu.Lock()
 	hook := f.hook

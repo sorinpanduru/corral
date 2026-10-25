@@ -101,26 +101,67 @@ func TestDiscoveryFromSecondary_AC18(t *testing.T) {
 	}
 }
 
-// A server learned from a non-matching member's list is not added when its
-// own setName differs.
-func TestNonMatchingServerNotAdded_FR37(t *testing.T) {
+// Owner rule (SPEC-002 Amendment 3): a server learned from a member's list that
+// reports a different setName is ignored (never a candidate, never the target)
+// but stays known: it is re-checked on schedule and re-admitted when it matches.
+func TestNonMatchingServerIgnoredButRechecked_FR37(t *testing.T) {
 	setup := func(c *fakeChecker) {
 		c.set(primary(A, "rs0", A, D))
-		c.set(primary(D, "other", D)) // listed by A but belongs to another set
+		c.set(primaryAt(D, "other", 9, 9, D)) // listed by A, claims primary of another set
 	}
 	h := newHarness(t, rsCfg(A), setup, false).start()
 	h.waitState("target", func(s upstream.State) bool { return s.HasTarget })
 	h.waitCount(D, 1)
 	h.quiet()
-	h.advance(10 * time.Second)
-	h.waitCount(A, 2)
-	h.quiet()
-	if n := len(h.chk.of(D)); n != 1 {
-		t.Fatalf("non-matching server checked %d times", n)
+	nD := len(h.chk.of(D))
+	for i := 0; i < 3; i++ {
+		h.advance(10 * time.Second)
+		h.waitCount(D, nD+i+1)
 	}
 	if s := h.m.State(); s.Target != A || s.Incompatible {
+		t.Fatalf("a member of another set affected the state: %+v", s)
+	}
+	// D now reports the right set, with a larger (electionId, setVersion): it is
+	// re-admitted and wins.
+	h.chk.set(primaryAt(D, "rs0", 7, 1, A, D))
+	h.chk.set(secondary(A, "rs0", D, A, D))
+	h.advance(10 * time.Second)
+	h.waitState("D re-admitted as the target", func(s upstream.State) bool { return s.HasTarget && s.Target == D })
+}
+
+// Owner rule: a member reporting no setName, or failing, stays known and is
+// re-checked on schedule; it is admitted when it later matches.
+func TestUnreadyAndFailingMembersStayKnown_FR37(t *testing.T) {
+	setup := func(c *fakeChecker) {
+		c.set(primary(A, "rs0", A, B, C))
+		c.set(upstream.Report{Host: B, Params: params(0, 21)}) // reports no setName (not yet initialised)
+		// C is unreachable.
+	}
+	h := newHarness(t, rsCfg(A), setup, false).start()
+	h.waitState("target", func(s upstream.State) bool { return s.HasTarget })
+	h.waitCount(B, 1)
+	h.waitCount(C, 1)
+	h.quiet()
+	nB, nC := len(h.chk.of(B)), len(h.chk.of(C))
+	for i := 0; i < 3; i++ {
+		h.advance(10 * time.Second)
+		h.waitCount(B, nB+i+1)
+		h.waitCount(C, nC+i+1)
+	}
+	if s := h.m.State(); s.Incompatible || s.Target != A {
 		t.Fatalf("state: %+v", s)
 	}
+	// Both come up as members of the set and are then followed like any member.
+	h.chk.set(secondary(B, "rs0", A, A, B, C))
+	h.chk.set(secondary(C, "rs0", A, A, B, C))
+	h.advance(10 * time.Second)
+	h.waitCount(B, nB+4)
+	h.waitCount(C, nC+4)
+	// A steps down, B becomes primary with a larger pair: B is the target.
+	h.chk.set(secondary(A, "rs0", B, A, B, C))
+	h.chk.set(primaryAt(B, "rs0", 5, 1, A, B, C))
+	h.advance(10 * time.Second)
+	h.waitState("B is the target", func(s upstream.State) bool { return s.HasTarget && s.Target == B })
 }
 
 // AC-18: while no target is known every known member is checked at least

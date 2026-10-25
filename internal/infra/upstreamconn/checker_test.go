@@ -35,7 +35,7 @@ func TestCheckerMetadata_FR37(t *testing.T) {
 // FR-37, FR-9: the report carries the own-exchange fields from hello.
 func TestCheckerReportFields_FR9(t *testing.T) {
 	eid := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7}
-	cl := mongosim.StartReplicaSet(t, 3, mongosim.ClusterOptions{SetName: "rs0"})
+	cl := mongosim.StartReplicaSet(t, 3, mongosim.ClusterOptions{SetName: "rs0", Arbiters: 1})
 	c := upstreamconn.NewChecker(baseCfg(nil), upstream.Noop{})
 	cl.SetPrimary(1)
 	var prim, sec upstream.Report
@@ -61,11 +61,8 @@ func TestCheckerReportFields_FR9(t *testing.T) {
 	if r := check(c, st.Addr(), false, false); r.Err != nil || r.IsMongos || r.HasSetName || !r.IsWritablePrimary {
 		t.Fatalf("standalone report: %+v", r)
 	}
-	ab := cl.Arbiter(0)
-	if ab != nil {
-		if r := check(c, ab.Addr(), false, false); r.Err != nil || !r.ArbiterOnly {
-			t.Fatalf("arbiter report: %+v", r)
-		}
+	if r := check(c, cl.Arbiter(0).Addr(), false, false); r.Err != nil || !r.ArbiterOnly {
+		t.Fatalf("arbiter report: %+v", r)
 	}
 }
 

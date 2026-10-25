@@ -320,8 +320,9 @@ func TestFR61Order_AC40(t *testing.T) {
 			}
 		}
 	}
-	if n < 3000 {
-		t.Fatalf("only %d combinations evaluated", n)
+	// phases x views x commands x seen x lb x client x moreToCome.
+	if want := 2 * len(views) * len(cmds) * 16; n != want {
+		t.Fatalf("%d combinations evaluated, want %d", n, want)
 	}
 }
 

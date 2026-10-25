@@ -149,8 +149,26 @@ func TestLiveRegistryEmbeddedCatalog(t *testing.T) {
 		t.Fatal(err)
 	}
 	fams := corralFamilies(t, reg)
-	if len(fams) != 1 || fams[0].GetName() != metrics.NameTracingSpansDropped {
-		t.Fatalf("corral_ families = %v, want only %s", fams, metrics.NameTracingSpansDropped)
+	// Label-less metrics and histograms appear without observations: the
+	// spans-dropped counter and the 10 label-less SPEC-002 metrics. Labelled
+	// families appear once a series exists (catalog_spec002_test.go).
+	want := map[string]bool{
+		metrics.NameTracingSpansDropped: true, "corral_client_connections": true, "corral_client_connections_accepted_total": true,
+		"corral_client_auth_rejected_total": true, "corral_commands_blocked_total": true, "corral_requests_dropped_total": true,
+		"corral_pool_max_connections": true, "corral_pool_waiters": true, "corral_pool_checkout_wait_seconds": true,
+		"corral_upstream_available": true, "corral_upstream_primary_changes_total": true,
+	}
+	got := map[string]bool{}
+	for _, f := range fams {
+		got[f.GetName()] = true
+	}
+	if len(got) != len(want) {
+		t.Fatalf("corral_ families = %v, want %v", got, want)
+	}
+	for n := range want {
+		if !got[n] {
+			t.Fatalf("family %s missing: %v", n, got)
+		}
 	}
 }
 
