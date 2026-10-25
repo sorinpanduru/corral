@@ -448,6 +448,10 @@ func TestClassify_TLSHandshakeWrapper_FR45(t *testing.T) {
 	}{
 		{"ECONNRESET", &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}, errclass.ClassNetwork, errclass.DetailTLSHandshake},
 		{"EPIPE", &net.OpError{Op: "write", Net: "tcp", Err: os.NewSyscallError("write", syscall.EPIPE)}, errclass.ClassNetwork, errclass.DetailTLSHandshake},
+		// Deliberate (FR-45 classifies by phase): an ETIMEDOUT during the
+		// handshake is a network/tls_handshake failure; only deadline errors
+		// (context.DeadlineExceeded, os.ErrDeadlineExceeded) stay timeout.
+		{"ETIMEDOUT", &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ETIMEDOUT)}, errclass.ClassNetwork, errclass.DetailTLSHandshake},
 		{"EOF", io.EOF, errclass.ClassNetwork, errclass.DetailTLSHandshake},
 		{"unexpected EOF", io.ErrUnexpectedEOF, errclass.ClassNetwork, errclass.DetailTLSHandshake},
 		{"an alert", tls.AlertError(40), errclass.ClassNetwork, errclass.DetailTLSHandshake},
