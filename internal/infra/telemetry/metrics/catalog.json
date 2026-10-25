@@ -5,6 +5,399 @@
       "type": "counter",
       "help": "Spans dropped because the trace export queue was full.",
       "labels": []
+    },
+    {
+      "name": "corral_client_connections",
+      "type": "gauge",
+      "help": "Open client connections within proxy.max_client_connections; connections over the limit are not counted.",
+      "labels": []
+    },
+    {
+      "name": "corral_client_connections_accepted_total",
+      "type": "counter",
+      "help": "Client connections accepted by the listener, including those over the limit and those that fail the TLS handshake.",
+      "labels": []
+    },
+    {
+      "name": "corral_client_connections_closed_total",
+      "type": "counter",
+      "help": "Client connections closed, by the reason they were closed.",
+      "labels": [
+        {
+          "name": "reason",
+          "values": [
+            "client_closed",
+            "idle_timeout",
+            "io_timeout",
+            "protocol_error",
+            "upstream_failure",
+            "shutdown",
+            "tls_failure",
+            "limit_exceeded",
+            "internal_error"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "corral_client_auth_rejected_total",
+      "type": "counter",
+      "help": "Client authentication commands refused because clients do not authenticate to corral.",
+      "labels": []
+    },
+    {
+      "name": "corral_commands_blocked_total",
+      "type": "counter",
+      "help": "Cross-client administrative commands refused with Unauthorized.",
+      "labels": []
+    },
+    {
+      "name": "corral_handshakes_total",
+      "type": "counter",
+      "help": "Handshakes answered by corral, by opcode and outcome.",
+      "labels": [
+        {
+          "name": "opcode",
+          "values": [
+            "op_msg",
+            "op_query"
+          ]
+        },
+        {
+          "name": "outcome",
+          "values": [
+            "ok",
+            "error"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "corral_protocol_errors_total",
+      "type": "counter",
+      "help": "Protocol errors that close or discard a connection, by side and detail; the OP_QUERY 352 refusal is not counted.",
+      "labels": [
+        {
+          "name": "side",
+          "values": [
+            "client",
+            "upstream"
+          ]
+        },
+        {
+          "name": "error_detail",
+          "values": [
+            "unsupported_opcode",
+            "message_too_large",
+            "malformed_message",
+            "checksum_mismatch",
+            "unexpected_response"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "corral_requests_total",
+      "type": "counter",
+      "help": "Forwarded and refused requests by command and outcome.",
+      "labels": [
+        {
+          "name": "command",
+          "values": [
+            "find",
+            "hello",
+            "getMore",
+            "killCursors",
+            "insert",
+            "update",
+            "delete",
+            "findAndModify",
+            "aggregate",
+            "count",
+            "distinct",
+            "bulkWrite",
+            "createIndexes",
+            "dropIndexes",
+            "listIndexes",
+            "listCollections",
+            "listDatabases",
+            "create",
+            "drop",
+            "ping",
+            "buildInfo",
+            "endSessions",
+            "commitTransaction",
+            "abortTransaction",
+            "saslStart",
+            "saslContinue",
+            "authenticate",
+            "other"
+          ]
+        },
+        {
+          "name": "outcome",
+          "values": [
+            "ok",
+            "server_error",
+            "proxy_error"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "corral_request_duration_seconds",
+      "type": "histogram",
+      "help": "Request duration in seconds from receipt to the end of the reply, by command.",
+      "labels": [
+        {
+          "name": "command",
+          "values": [
+            "find",
+            "hello",
+            "getMore",
+            "killCursors",
+            "insert",
+            "update",
+            "delete",
+            "findAndModify",
+            "aggregate",
+            "count",
+            "distinct",
+            "bulkWrite",
+            "createIndexes",
+            "dropIndexes",
+            "listIndexes",
+            "listCollections",
+            "listDatabases",
+            "create",
+            "drop",
+            "ping",
+            "buildInfo",
+            "endSessions",
+            "commitTransaction",
+            "abortTransaction",
+            "saslStart",
+            "saslContinue",
+            "authenticate",
+            "other"
+          ]
+        }
+      ],
+      "buckets": [
+        0.0005,
+        0.001,
+        0.0025,
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1,
+        2.5,
+        5,
+        10,
+        30,
+        60
+      ]
+    },
+    {
+      "name": "corral_request_errors_total",
+      "type": "counter",
+      "help": "Requests that ended as proxy_error, by error class; server_error requests are not counted.",
+      "labels": [
+        {
+          "name": "error_class",
+          "values": [
+            "timeout",
+            "network",
+            "protocol",
+            "server",
+            "config",
+            "internal",
+            "rejected"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "corral_requests_dropped_total",
+      "type": "counter",
+      "help": "Requests dropped because the client set moreToCome and no reply is sent.",
+      "labels": []
+    },
+    {
+      "name": "corral_pool_connections",
+      "type": "gauge",
+      "help": "Upstream pool connections by state.",
+      "labels": [
+        {
+          "name": "state",
+          "values": [
+            "idle",
+            "in_use",
+            "connecting"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "corral_pool_max_connections",
+      "type": "gauge",
+      "help": "Configured maximum number of upstream pool connections.",
+      "labels": []
+    },
+    {
+      "name": "corral_pool_waiters",
+      "type": "gauge",
+      "help": "Requests waiting for an upstream connection.",
+      "labels": []
+    },
+    {
+      "name": "corral_pool_checkouts_total",
+      "type": "counter",
+      "help": "Pool checkouts by outcome.",
+      "labels": [
+        {
+          "name": "outcome",
+          "values": [
+            "ok",
+            "failed"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "corral_pool_checkout_failures_total",
+      "type": "counter",
+      "help": "Failed pool checkouts by error detail.",
+      "labels": [
+        {
+          "name": "error_detail",
+          "values": [
+            "pool_wait_timeout",
+            "pool_queue_full",
+            "upstream_unavailable",
+            "upstream_auth_failed",
+            "upstream_incompatible",
+            "shutting_down"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "corral_pool_checkout_wait_seconds",
+      "type": "histogram",
+      "help": "Time spent waiting for a pool connection, in seconds.",
+      "labels": [],
+      "buckets": [
+        0.0001,
+        0.0005,
+        0.001,
+        0.005,
+        0.01,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1,
+        2.5,
+        5,
+        10,
+        30
+      ]
+    },
+    {
+      "name": "corral_upstream_connections_opened_total",
+      "type": "counter",
+      "help": "Upstream connections opened, by kind.",
+      "labels": [
+        {
+          "name": "kind",
+          "values": [
+            "pool",
+            "monitor"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "corral_upstream_connections_closed_total",
+      "type": "counter",
+      "help": "Upstream connections closed, by kind and reason.",
+      "labels": [
+        {
+          "name": "kind",
+          "values": [
+            "pool",
+            "monitor"
+          ]
+        },
+        {
+          "name": "reason",
+          "values": [
+            "idle",
+            "error",
+            "not_primary",
+            "client_abandoned",
+            "shutdown",
+            "incompatible"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "corral_upstream_connect_errors_total",
+      "type": "counter",
+      "help": "Failed upstream connection attempts, including authentication failures, by kind and error class.",
+      "labels": [
+        {
+          "name": "kind",
+          "values": [
+            "pool",
+            "monitor"
+          ]
+        },
+        {
+          "name": "error_class",
+          "values": [
+            "timeout",
+            "network",
+            "protocol",
+            "server",
+            "config",
+            "internal",
+            "rejected"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "corral_upstream_auth_failures_total",
+      "type": "counter",
+      "help": "Upstream authentication failures (the upstream_auth_failed subset of connect errors), by kind.",
+      "labels": [
+        {
+          "name": "kind",
+          "values": [
+            "pool",
+            "monitor"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "corral_upstream_available",
+      "type": "gauge",
+      "help": "1 when a usable upstream target is known, else 0.",
+      "labels": []
+    },
+    {
+      "name": "corral_upstream_primary_changes_total",
+      "type": "counter",
+      "help": "Changes of the upstream primary target.",
+      "labels": []
     }
   ]
 }
