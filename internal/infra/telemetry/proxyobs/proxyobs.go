@@ -112,7 +112,7 @@ func New(logs *logging.Factory, mf *metrics.Factory, now func() time.Time) (*Ada
 		return nil, err
 	}
 	for _, msg := range []string{msgConnRejected, msgAuthRejected, msgBlocked, msgProtocolError, msgIOTimeout, msgTLSFailed,
-		msgCheckoutTimeout, msgQueueFull, msgUpConnFailed, msgUpAuthFailed, msgMarkedNP, msgUpProtocolError, msgUpBarrierFailed} {
+		msgCheckoutTimeout, msgQueueFull, msgUpConnFailed, msgUpAuthFailed, msgMarkedNP, msgUpProtocolError, msgUpBarrierFailed, msgPanic} {
 		a.limiters[msg] = ratelimit.New(limitWindow, now)
 	}
 	var errs []error
@@ -329,7 +329,11 @@ func (o *proxyObs) RequestCompleted(ctx context.Context, res proxy.RequestResult
 }
 
 func (o *proxyObs) PanicRecovered(ctx context.Context, err error) {
-	o.a.proxyLog.LogAttrs(ctx, slog.LevelError, msgPanic, errclass.LogAttrs(err)...)
+	// The record is rate-limited so a client that can trigger panics cannot
+	// flood the logs; there is no metric for it here.
+	if attrs, ok := o.a.allow(msgPanic, errclass.LogAttrs(err)); ok {
+		o.a.proxyLog.LogAttrs(ctx, slog.LevelError, msgPanic, attrs...)
+	}
 }
 
 // ---- pool port ----
