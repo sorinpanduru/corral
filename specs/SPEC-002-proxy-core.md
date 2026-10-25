@@ -1,8 +1,8 @@
 # SPEC-002: Proxy core (wire listener, handshake, multiplexing pool, upstream)
 
-Status: approved (Owner, 2026-10-24; revision 5); Amendment 1 approved (Owner, 2026-10-24); Amendment 2 approved (Owner, 2026-10-24)
+Status: approved (Owner, 2026-10-24; revision 5); Amendment 1 approved (Owner, 2026-10-24); Amendment 2 approved (Owner, 2026-10-24); Amendment 3 approved (Owner, 2026-10-25)
 Owner: Sorin Panduru
-Last updated: 2026-10-24 (Amendment 2)
+Last updated: 2026-10-25 (Amendment 3)
 
 ## Goal
 
@@ -111,6 +111,28 @@ the connection string pointing at corral.
   field (Amendment 1). *(Amendment 2)* The command name is included for the
   duplicate check inside the body. It is excluded from the comparison with
   kind-1 section identifiers (FR-60).
+- *(Amendment 3)* **Member states (replica-set mode, FR-37).** Each server
+  corral monitors is in one of these states:
+  - **matching:** its latest successful check reports `setName` equal to
+    `upstream.replica_set`;
+  - **ghost:** its latest successful check reports `isreplicaset: true`
+    without `setName`. This is the state of a member during startup or a
+    rolling restart, or of a server that is not yet initiated;
+  - **other non-matching:** after a matching member has been found, a known
+    member whose latest successful check reports a standalone server (no
+    `setName`, no `isreplicaset: true`, no `msg: "isdbgrid"`) or a `mongos`.
+    An example is a member restarted as a standalone for maintenance. It is
+    treated like a ghost: it stays known, is re-checked on the normal
+    schedule, is never the target, and contributes no discovery. Before any
+    matching member has been found, such a seed is an FR-18 incompatibility
+    instead;
+  - **unreachable:** its latest check failed;
+  - **foreign:** its latest successful check reports a *different*
+    `setName`.
+
+  Matching, ghost, other non-matching and unreachable members stay in the
+  known set. Foreign
+  servers are ignored as members but are not forgotten (FR-37).
 
 ## Functional requirements
 
@@ -272,6 +294,10 @@ the connection string pointing at corral.
     - the `getMore` cursor ID (span attribute only);
     - for `aggregate` only, the *name* of the first stage of the top-level
       `pipeline` array (FR-33), never its arguments;
+    - *(Amendment 3)* for `killSessions` only, whether its argument (the
+      value of the `killSessions` field) is an empty array or not an array
+      (FR-33). The session IDs in a non-empty array are never decoded or
+      kept;
     - *(Amendment 1)* the identifier of each kind-1 section, and whether an
       inspected field's name occurs more than once at the top level of the
       body. Both are used only for the FR-60 inspected-field integrity
@@ -295,6 +321,8 @@ the connection string pointing at corral.
     - the upstream parameters;
     - `isWritablePrimary`, `secondary`, `arbiterOnly`, `msg`, `setName`,
       `hosts`, `passives`, `primary`, `electionId` and `setVersion`;
+      *(Amendment 3)* also `isreplicaset`, to recognise a ghost member
+      (Terms);
     - `ok`, `code` and `codeName` of authentication replies (FR-22), and of
       the barrier `ping` reply (FR-29);
     - the authentication conversation fields corral needs for SCRAM. These
@@ -408,27 +436,33 @@ the connection string pointing at corral.
     | a `mongos` that fails the wire-version acceptance rule | `wire_version` |
   - **Replica-set mode** (`upstream.replica_set` set). A *matching member* is
     a checked server whose `setName` equals `upstream.replica_set`.
-    - The upstream is incompatible when no matching member has been found
-      since the last time one was known (or since startup), and at least one
-      reachable seed reports one of these:
+    - *(Changed by Amendment 3)* The upstream is incompatible when no
+      matching member has been found since startup, and at least one
+      reachable seed's latest successful check reports one of these:
 
       | Seed check result | `reason` |
       |---|---|
-      | a different `setName` | `replica_set_name_mismatch` |
-      | a standalone server | `standalone` |
+      | a different `setName` (a foreign server) | `replica_set_name_mismatch` |
+      | a standalone server: no `setName`, no `isreplicaset: true` and no `msg: "isdbgrid"` | `standalone` |
       | a `mongos` | `topology_mismatch` |
 
       When several seeds qualify, the reason comes from the first of them in
-      `upstream.hosts` order.
+      `upstream.hosts` order. A ghost seed (`isreplicaset: true` without
+      `setName`) or an unreachable seed never makes the upstream
+      incompatible.
     - The upstream is also incompatible, with `reason=wire_version`, when the
       current primary fails the wire-version acceptance rule.
-    - Non-matching servers found alongside at least one matching member are
-      ignored, and are not monitored further (FR-37).
+    - *(Changed by Amendment 3, Owner decision 2026-10-25)* Servers are no
+      longer dropped permanently. FR-37 defines how each state is handled:
+      a foreign server is ignored as a member but still re-checked, and is
+      re-admitted if it later reports the matching `setName`; ghost and
+      unreachable members stay in the known set.
   - The upstream becomes compatible again as soon as a later check result
     no longer meets any of these conditions.
-  - Once a matching member is known, non-matching seeds stop being checked.
-    If every matching member is later lost, that is transient unavailability
-    (FR-56), not incompatibility.
+  - *(Changed by Amendment 3)* Once a matching member has been found, seed
+    check results no longer make the upstream incompatible. If every
+    matching member is later lost, or reports a different `setName`, that is
+    transient unavailability (FR-56), not incompatibility.
 
   - **While incompatible:**
     - readiness is `upstream_incompatible` (FR-46);
@@ -437,7 +471,8 @@ the connection string pointing at corral.
     - one `upstream incompatible` error record is emitted on each transition
       into this state, carrying the `reason` (FR-49).
   - **Compatible → incompatible** (for example a rolling change to an
-    unsupported version, or a seed re-pointed at another deployment):
+    unsupported version, or a single-`mongos` host re-pointed at a replica
+    set):
     - open client connections stay open, and their later handshakes and
       requests fail fast as above;
     - waiting requests are failed the same way;
@@ -486,6 +521,16 @@ the connection string pointing at corral.
   - The authentication source database is `upstream.auth.source`.
   - Of the monitoring connections, only the one to the current target
     authenticates. Monitoring connections to other members do not.
+    - *(Amendment 3, clarification)* When a server becomes the target (a new
+      primary is selected, or the `mongos` is first reached), corral runs an
+      immediate check of it, still at least 500 ms after its previous check
+      (FR-37), and authenticates as part of that first check. It does this on
+      the existing monitoring connection if that has not yet authenticated,
+      or on a new one.
+    - Until that check finishes, the authentication state is the one from
+      the most recent attempt.
+    - A server that stops being the target does not de-authenticate. Its
+      later checks simply do not authenticate again.
   - **What counts as an authentication failure.** An attempt counts as
     `upstream_auth_failed` only when one of these happens:
     - the upstream replies to an authentication command with code 18
@@ -646,6 +691,19 @@ the connection string pointing at corral.
     `currentOp`, `killOp`, `killAllSessions`, `killAllSessionsByPattern`,
     and an `aggregate` whose top-level `pipeline` starts with a
     `$currentOp` stage.
+    - *(Amendment 3, Owner decision 2026-10-25)* It also blocks
+      `killSessions` whose argument is an empty array, or is not a non-empty
+      array (for example `killSessions: []`, `killSessions: 1` or
+      `killSessions: {}`). Under the shared upstream identity that form kills
+      every client's sessions, exactly like `killAllSessions`. It gets the
+      same reply: code 13 (`Unauthorized`), the same fixed message, and
+      detail `command_blocked`.
+    - `killSessions` with a non-empty array of session IDs is still
+      forwarded (residual exposure, Data and compliance).
+    - The "deciding fields must fit" rule of FR-38 applies to the
+      `killSessions` argument as it does to the `aggregate` pipeline: if the
+      start of the argument is not within L, the message is
+      `malformed_message`.
     - Matching is on the command name as received, which is case-sensitive.
     - A blocked command gets a synthesized error with code 13
       (`Unauthorized`), a fixed `errmsg` and detail `command_blocked`. It is
@@ -692,6 +750,12 @@ the connection string pointing at corral.
     has no usable target. Requests wait under FR-56,
     readiness is `upstream_unavailable` (FR-46), and corral checks all known
     members at the FR-37 fast interval until a target is found again.
+    - *(Amendment 3, clarification)* The single retry applies only to check
+      failures of class `network` or `timeout`, including TLS failures (SPEC-001
+      FR-29). Any other unsuccessful outcome is applied at once, with no
+      retry. That includes a `hello` error reply, a reply showing the target
+      is no longer primary or is now a ghost, foreign or incompatible server
+      (FR-18, FR-37), and an authentication outcome (FR-22).
   - **Primary change:** new leases go only to the new primary. Pool
     connections to the old primary are closed at once when idle, and when
     returned otherwise (`reason=not_primary`).
@@ -709,6 +773,9 @@ the connection string pointing at corral.
     - corral holds new leases (requests wait under FR-56) until a check
       confirms a primary or a usable target;
     - pool connections to that host are closed as for a primary change.
+  - *(Amendment 3, clarification)* `writeConcernError.code` is considered
+    only in an `ok: 1` reply. In an `ok: 0` reply only the top-level `code`
+    counts, and any `writeConcernError` it carries is ignored for marking.
   - *(Amendment 1, G-20)* These codes found only inside `writeErrors[]` do
     not mark the host. `writeErrors` is not read (FR-9).
   - **Single `mongos` target** *(replaced by Amendment 1, G-13)*. A `mongos`
@@ -723,16 +790,33 @@ the connection string pointing at corral.
 - **FR-36:** Read preference. `$readPreference` is forwarded unchanged. All
   requests run on the target, whatever read preference they ask for.
 - **FR-37:** Upstream monitoring.
-  - **Known members.** The known members are every seed in `upstream.hosts`,
-    plus every server learned from the check result of any matching member
-    (FR-18), primary or not. corral learns from that member's `hosts` and
-    `passives`, and from its `primary` field, which names the member it
-    believes is primary. Discovery therefore works while no primary is known.
+  - **Known members** *(changed by Amendment 3, Owner decision 2026-10-25)*.
+    The known members are every seed in `upstream.hosts`, plus every server
+    learned from the check result of any matching member (FR-18), primary or
+    not. corral learns from that member's `hosts` and `passives`, and from
+    its `primary` field, which names the member it believes is primary.
+    Discovery therefore works while no primary is known.
     - Servers listed only under `arbiters`, or reporting `arbiterOnly:
       true`, are not monitored.
-    - A server whose `setName` does not match is not added to the known
-      members. A non-matching seed is still checked so that FR-18 can report
-      why.
+    - **Ghost, other non-matching and unreachable members** (Terms) stay in
+      the known set. They
+      are re-checked on the normal schedule (the intervals below, including
+      the fast interval while no usable target is known). They become usable
+      again as soon as a check reports the matching `setName`. They are never
+      a target while ghost or unreachable, and they contribute no discovery.
+    - **Foreign servers** (a different `setName`) are ignored: they are
+      never a target, contribute no discovery, and are excluded from the
+      fast-interval checking.
+      - A foreign server is not forgotten while it is a seed or still listed
+        by a matching member. It is re-checked every
+        `upstream.heartbeat_interval`.
+      - It is re-admitted as a matching member as soon as a check reports
+        the matching `setName`.
+      - A foreign seed is still used by FR-18 only while no matching member
+        has been found since startup.
+    - A server is removed from monitoring only when it is neither a seed nor
+      listed by any matching member's latest check, and its own latest check
+      did not report the matching `setName`.
   - **Check intervals.**
     - While a usable target is known, each known member is checked every
       `upstream.heartbeat_interval`.
@@ -740,14 +824,18 @@ the connection string pointing at corral.
       marked not primary or unknown), *all* known members are checked
       repeatedly, at least 500 ms apart per member (the SDAM
       `minHeartbeatFrequencyMS`), until a usable target is found.
+      *(Amendment 3)* Foreign servers keep the
+      `upstream.heartbeat_interval` schedule.
   - **Connections.** corral uses at most one monitoring connection per host,
     with `client.application.name = "corral-monitor"`. Each check is a
     `hello` exchange limited by `upstream.connect_timeout`. Authentication
-    happens only on the target's monitoring connection (FR-22).
+    happens only on the target's monitoring connection (FR-22), and
+    *(Amendment 3)* on the first check after a server becomes the target.
   - **Immediate checks.** A failed pool connection attempt, a network error
     on a leased connection, or a not-primary error (FR-35) starts an
     *immediate check*: an immediate check of all known members, each still at
-    least 500 ms after its previous check.
+    least 500 ms after its previous check. *(Amendment 3)* A target change
+    starts an immediate authenticating check of the new target (FR-22).
   - **Results.** The checks provide the upstream parameters, compatibility
     (FR-18), the current primary (FR-35) and readiness (FR-46).
 
@@ -766,8 +854,9 @@ the connection string pointing at corral.
     answered locally, refused, blocked or forwarded from the buffered prefix
     alone.
     - If the command name, or for `aggregate` the first pipeline stage name,
-      is not within the prefix, the message is a client protocol error with
-      detail `malformed_message`.
+      or *(Amendment 3)* for `killSessions` the start of its argument, is not
+      within the prefix, the message is a client protocol error with detail
+      `malformed_message`.
     - A message that corral answers or refuses locally (handshake, auth
       command, blocked command) must fit entirely within the limit.
       Otherwise it is a client protocol error with detail
@@ -1014,7 +1103,8 @@ the connection string pointing at corral.
 - **FR-51:** Operator documentation (in the file named by FR-65) states:
   - that all clients share corral's single upstream identity. corral blocks
     `currentOp`, `$currentOp` (top-level stage only), `killOp`,
-    `killAllSessions` and `killAllSessionsByPattern`, but other commands such
+    `killAllSessions`, `killAllSessionsByPattern` and *(Amendment 3)*
+    `killSessions` with an empty session list, but other commands such
     as `connectionStatus`, `whatsmyuri` and other session-listing stages are
     forwarded, see and act as that identity, and may reveal its name
     (FR-24, FR-33);
@@ -1053,7 +1143,11 @@ the connection string pointing at corral.
   - *(Amendment 1)* that a second SIGTERM or SIGINT during shutdown ends the
     drain at once (FR-63);
   - *(Amendment 2)* that it also cuts `proxy.shutdown.listener_close_delay`
-    short when it arrives during that delay (FR-63).
+    short when it arrives during that delay (FR-63);
+  - *(Amendment 3)* how corral treats replica-set members during rolling
+    restarts and re-configurations: ghost and unreachable members stay
+    monitored, and a member reporting a different replica set name is
+    ignored but re-checked and re-admitted when it matches again (FR-37).
 
 ### Required amendment to SPEC-001
 
@@ -1244,6 +1338,8 @@ the connection string pointing at corral.
   3. **Client auth commands** (FR-23): 18 or 115. OP_MSG only (Amendment 2,
      R-1).
   4. **Blocked commands** (FR-33): 13. OP_MSG only (Amendment 2, R-1).
+     *(Amendment 3)* This includes `killSessions` with an empty or non-array
+     argument. Over OP_QUERY it gets 352, like any other blocked command.
   5. **Non-handshake OP_QUERY** (FR-8): 352. This includes OP_QUERY auth and
      blocked commands (Amendment 2, R-1).
   6. **Fail-fast states** (FR-56): 6.
@@ -1394,7 +1490,7 @@ Every row has a SPEC-001 FR-29 class and detail (Amendment 3):
 | shutting down | 91 | `ShutdownInProgress` | `shutting_down` | `rejected` | yes |
 | `saslStart`, `saslContinue`, `authenticate` (OP_MSG) | 18 | `AuthenticationFailed` | `client_auth_unsupported` | `rejected` | no |
 | `getnonce`, `logout` (OP_MSG) | 115 | `CommandNotSupported` | `client_auth_unsupported` | `rejected` | no |
-| blocked command (FR-33, OP_MSG) | 13 | `Unauthorized` | `command_blocked` | `rejected` | no |
+| blocked command (FR-33, OP_MSG), including `killSessions` with an empty or non-array argument (Amendment 3) | 13 | `Unauthorized` | `command_blocked` | `rejected` | no |
 | non-handshake OP_QUERY, including auth and blocked commands (Amendment 2, R-1) | 352 | `UnsupportedOpQueryCommand` | `unsupported_opcode` | `protocol` | no |
 | repeated client metadata | 186 | `ClientMetadataCannotBeMutated` | `handshake_rejected` | `rejected` | no |
 | `loadBalanced: true` handshake | 72 | `InvalidOptions` | `handshake_rejected` | `rejected` | no |
@@ -1616,8 +1712,8 @@ package and need Owner approval of the Amendment 3 text.
 
 Amendment 1 of this spec needs no further SPEC-001 change. It adds no
 metric, label, error detail, readiness reason or log key. Its one new
-record uses the existing `lifecycle` component. Amendment 2 needs no SPEC-001
-change either; it adds no new signal.
+record uses the existing `lifecycle` component. Amendments 2 and 3 of this
+spec need no SPEC-001 change either; neither adds a new signal.
 
 ## Behavior on failure
 
@@ -1630,12 +1726,13 @@ change either; it adds no new signal.
 | Malformed OP_QUERY (Amendment 1) | connection closed, no reply | `malformed_message` (FR-8) |
 | Non-handshake OP_QUERY, including auth and blocked commands (Amendment 2) | OP_REPLY `QueryFailure`, code 352 | connection stays open; not a protocol-error count (FR-8) |
 | Client sends auth command over OP_MSG | error 18 / 115 | not forwarded; counts; rate-limited warn (FR-23) |
-| Client sends a blocked admin command over OP_MSG | error 13 | not forwarded; counts; rate-limited warn (FR-33) |
+| Client sends a blocked admin command over OP_MSG, including `killSessions` with an empty list (Amendment 3) | error 13 | not forwarded; counts; rate-limited warn (FR-33) |
 | Pool full, wait exceeds `pool.checkout_timeout` | error 262 + labels | request read to its end and discarded; checkout span in error (FR-27, FR-38, FR-39) |
 | Wait queue full | error 262 + labels, at once | (FR-27, FR-39) |
 | Upstream never reached, auth failing, or incompatible | error 6 + labels at once; handshakes fail only when never reached or incompatible | readiness 503 with reason (FR-19, FR-56, FR-46) |
 | Election, target marked not primary, connect attempts failing | requests wait, then error 262 | checks the topology; backoff on reconnects (FR-35, FR-56) |
-| Not-primary error in a reply (including `writeConcernError`) | the reply, unchanged | marks the host, holds leases, re-checks (FR-35); in single-`mongos` mode only top-level 91 / 11600 mark; codes in `writeErrors` never mark (Amendment 1) |
+| Replica-set member in a ghost state, unreachable, or reporting a different `setName` during a rolling restart or re-configuration (Amendment 3) | nothing directly | ghost and unreachable members stay known and are re-checked; a foreign member is ignored but re-checked every heartbeat and re-admitted when it matches again (FR-37) |
+| Not-primary error in a reply (including `writeConcernError` in an `ok: 1` reply) | the reply, unchanged | marks the host, holds leases, re-checks (FR-35); in single-`mongos` mode only top-level 91 / 11600 mark; codes in `writeErrors`, and a `writeConcernError` inside an `ok: 0` reply, never mark (Amendments 1 and 3) |
 | Upstream connection fails after the request was sent, or late request validation failure | client connection closed | upstream connection discarded (FR-38, FR-40) |
 | Upstream protocol violation (unknown `responseTo`, `moreToCome` reply, oversize, bad checksum) | client connection closed | upstream connection discarded (FR-11, FR-58) |
 | Unsolicited bytes or close on an idle pool connection (Amendment 1) | nothing | connection discarded; the checkout uses another connection (FR-62) |
@@ -1681,6 +1778,8 @@ drivers, which the error codes and labels enable.
   - Transient unavailability waits instead of failing (FR-56).
   - Reconnects back off (FR-56).
   - Shutdown drains in-flight exchanges (FR-47).
+  - *(Amendment 3)* Rolling restarts and re-configurations never make corral
+    forget a replica-set member permanently (FR-37).
 - **Resource bounds:**
   - upstream connections ≤ `pool.max_size` + one monitoring connection per
     monitored host;
@@ -1717,25 +1816,33 @@ drivers, which the error codes and labels enable.
   service identity, so the database's own audit trail cannot tell them apart.
   Blocking the cross-client administrative commands (FR-33) prevents one
   application from listing or killing another's operations and sessions
-  through the most direct routes.
+  through the most direct routes. *(Amendment 3)* That now includes
+  `killSessions` with an empty or absent session list, which under the shared
+  identity would kill every client's sessions.
 
-  **Residual exposure routes** (flagged for review by security@emag.ro). The
-  first six are not blocked by corral, and work only if the service user has
-  the privileges FR-51 advises against:
+  **Residual exposure routes** (flagged for review by security@emag.ro).
+  corral does not block these. Each is mitigated by the FR-51
+  least-privilege guidance for the service user, and most work only if the
+  service user has privileges FR-51 advises against:
   - reading `system.profile`, which can show other clients' operations and
     their filters;
   - the `$queryStats` aggregation stage;
-  - `$listSessions` / `$listLocalSessions` with `allUsers: true`;
+  - `$listSessions` / `$listLocalSessions` (with or without
+    `allUsers: true`), and the `listSessions` route to the same data. Under
+    the shared identity these list every client's sessions;
   - `$currentOp` nested inside a sub-pipeline (for example `$unionWith` or
     `$lookup`), wherever the server allows it, which FR-33 does not inspect;
   - an `aggregate` with `$currentOp` wrapped in `explain`;
   - `connectionStatus`, which reveals the service identity's name.
 
-  *(Amendment 1, G-14)* Further routes that need no extra privilege, because
-  all clients share one identity:
-  - `killSessions`, `endSessions`, `abortTransaction` or `commitTransaction`
-    sent with another client's `lsid`. Session IDs are random 128-bit UUIDs,
-    so this needs a leaked ID, not a guess;
+  *(Amendment 1, G-14; updated by Amendment 3)* Further routes that need no
+  extra privilege, because all clients share one identity. These are also
+  least-privilege mitigated as far as roles allow:
+  - `killSessions` with explicit `lsid`s naming another client's sessions,
+    and `endSessions`, `abortTransaction` or `commitTransaction` sent with
+    another client's `lsid`. Session IDs are random 128-bit UUIDs, so this
+    needs a leaked ID, not a guess. Unlike the empty-list form, which FR-33
+    blocks, these are forwarded;
   - session-less cursors, which any client knowing the 64-bit cursor ID can
     `getMore` or `killCursors`. Official drivers always use (implicit)
     sessions, which bind cursors to an `lsid`;
@@ -2010,7 +2117,8 @@ hook" means a `corraltest`-build hook (FR-64).
       incompatible` error record;
     - a seed reporting a `mongos` gives `topology_mismatch`;
     - a non-matching seed alongside a matching member is ignored, and the
-      upstream stays compatible;
+      upstream stays compatible. *(Amendment 3)* It is still re-checked on
+      the `upstream.heartbeat_interval` schedule (AC-56);
   - **twin, single-`mongos` mode:** a host reporting a replica-set member
     gives `topology_mismatch`, and a standalone gives `standalone`;
   - **twin, both modes:**
@@ -2452,13 +2560,85 @@ Added by Amendment 2:
     whose identifier is `find` is not refused by corral. It is forwarded to
     the twin, and the twin's reply is returned to the client unchanged.
 
+Added by Amendment 3:
+
+- **AC-56** (FR-18, FR-37; Owner decision 2026-10-25): Unit (domain, fake
+  clock) and twin, replica-set mode with three members A (primary), B and C:
+  - **Ghost:** B restarts and answers `hello` with `isreplicaset: true` and no
+    `setName` for several checks.
+    - B stays in the known set and is re-checked on the normal schedule,
+      including the 500 ms fast interval while no usable target is known.
+    - The upstream does not become incompatible, and no `upstream
+      incompatible` record is emitted.
+    - When B reports the matching `setName` again, it is matching. If it then
+      reports primary, it becomes the target.
+  - **Standalone after a match:** C, after A has been found as a matching
+    member, answers as a standalone (no `setName`, no `isreplicaset`).
+    - C stays known and is re-checked on the normal schedule.
+    - It is never the target and adds no discovery.
+    - The upstream stays compatible, and no `upstream incompatible` record is
+      emitted.
+    - The same holds when C answers as a `mongos`.
+  - **Unreachable:** C stops answering. It stays in the known set, is
+    re-checked on the normal schedule, and is used again as soon as a check
+    succeeds with the matching `setName`.
+  - **Foreign:** B reports a different `setName`.
+    - It is never selected as a target, and its `hosts` are not used for
+      discovery.
+    - It is re-checked every `upstream.heartbeat_interval`, even while the
+      fast interval applies to the others.
+    - When it later reports the matching `setName`, it is re-admitted and
+      can become the target.
+    - Because a matching member had already been found, the upstream stays
+      compatible throughout.
+  - **All members lost after startup:** A, B and C all become unreachable or
+    foreign after a matching member had been found. The result is transient
+    unavailability: requests wait, readiness is `upstream_unavailable`, and
+    there is no `upstream_incompatible`.
+  - **Seed rules at startup unchanged:** with no matching member ever found,
+    a ghost or unreachable seed causes no incompatibility, while a foreign,
+    standalone or `mongos` seed causes it, as in AC-18.
+- **AC-57** (FR-22, FR-35, FR-37; Amendment 3 clarifications): Twin:
+  - **Retry only for network, TLS and timeout errors:**
+    - a target check that times out, and separately one that fails the TLS
+      handshake, is retried once before the target is marked unknown;
+    - a target check that returns a `hello` error reply, and separately one
+      reporting that the target is no longer primary, is applied at once,
+      with no retry. The twin records exactly one check in each case.
+  - **`writeConcernError` only in `ok: 1`:** an `ok: 0` reply with top-level
+    code 11000 that also carries `writeConcernError.code` 91 does not mark the
+    host. An `ok: 1` reply with `writeConcernError.code` 91 does (AC-33).
+  - **Authentication on target change:**
+    - when the twin makes member B the new primary, the next check of B runs
+      at once (at least 500 ms after its previous check) and authenticates on
+      B's monitoring connection;
+    - the twin records the authentication conversation on that check;
+    - before B became the target, its checks carried no authentication.
+- **AC-58** (FR-33, FR-9, FR-61; Owner decision 2026-10-25): Twin
+  (raw-socket client).
+  - `killSessions: []`, `killSessions: 1` and `killSessions: {}` (OP_MSG)
+    each get code 13 (`Unauthorized`) with the fixed blocked-command message
+    and detail `command_blocked`. The twin receives nothing,
+    `corral_commands_blocked_total` increases, and a `client command
+    blocked` record is emitted.
+  - `killSessions: [{id: <UUID>}]` is forwarded unchanged, and the twin's
+    reply is returned unchanged.
+  - Over OP_QUERY, `{killSessions: []}` gets the 352 reply (FR-8, R-1).
+  - With `moreToCome`, `killSessions: []` gets no reply, is never forwarded,
+    and increments `corral_requests_dropped_total` (FR-59).
+  - A `killSessions` whose argument starts after L gets `malformed_message`
+    (FR-38).
+  - The parser exposes only whether the argument is empty or not an array,
+    never the session IDs (AC-7).
+
 ## Open questions
 
 Must be empty before approval.
 
-None for Amendment 2. A-Q1 was decided by the Owner ("skip"). R-1 to R-6
-carry the spec-writer's recommended defaults, which the Owner approves or
-overrides with the text (Decisions log).
+None for Amendment 3. The member-retention rule and the `killSessions`
+block are Owner decisions of 2026-10-25. The remaining changes are
+clarifications of existing text, for Owner approval with the text
+(Decisions log).
 
 ## Decisions log
 
@@ -2502,3 +2682,5 @@ part of Q1 (standalone) and Q5 (cross-client commands), and refined Q11/Q9
 | 2026-10-24 | **Amendment 2.** <br>**A-Q1 (Owner decision "skip"):** FR-60 does not compare kind-1 section identifiers with the command name. That comparison would need unbounded memory and closes no bypass, because the server takes the command from the body's first key. A duplicated command name inside the body is still refused (FR-60, Terms, AC-55). <br>Recommended defaults, for Owner approval with the text: <br>**R-1:** an OP_QUERY whose command is an auth command or a blocked command gets the FR-8 352 OP_REPLY (`QueryFailure`), not 18, 115 or 13. OP_QUERY carries only the handshake, so FR-61 steps 3 and 4 apply to OP_MSG only. These refusals are not counted in the auth-rejected or blocked counters (FR-8, FR-23, FR-33, FR-61, AC-50). <br>**R-2:** the `corraltest` hook variables (`CORRALTEST_HOLD_DIR`, `CORRALTEST_HOLD_AT` with its points, `CORRALTEST_POOL_ORDER`, `CORRALTEST_PANIC_COMMAND`, `CORRALTEST_PROBE_LISTEN`) and the probe endpoints `/conns` and `/constants` are now normative in FR-64, taken from ADR-0014, ADR-0022 and `plans/SPEC-002.md`; JSON field names inside `/conns` stay with ADR-0022 (AC-51). <br>**R-3:** a client that closes mid-message after the first byte produces one `proxy_error` request (command label if read, else `other`), class `network` with the classified detail, close reason `client_closed`, and no protocol-error count. A partly streamed upstream connection is discarded with `client_abandoned` and never receives the complete message (FR-41, Metrics, AC-52). <br>**R-4:** a second signal during `listener_close_delay` skips the rest of the delay and the drain: listener closed at once, all client connections closed, step 5, one record, exit 0 (FR-63, AC-53). <br>**R-5:** a not-primary code in the barrier ping reply emits the `upstream target marked not primary` record (with that reply's code) as well as `upstream barrier failed` (FR-29, log table, AC-54). <br>**R-6:** each kind-1 document (and each OP_QUERY document) counts nesting from level 1 on its own; a duplicated first key such as `{find: "a", find: "b"}` is a duplicated inspected field (FR-60, AC-55). <br>**Also:** the stale FR-52 sentence pointing at the SPEC-001 Amendment 3 draft is replaced, since Amendment 3 is approved and promoted. No SPEC-001 change is needed. AC-50 to AC-55 added. | Owner decision on A-Q1 and Orchestrator request for R-1 to R-6, 2026-10-24. Promotion awaits Owner approval of the text. |
 | 2026-10-24 | Amendment 2, challenge-review fixes (spec-writer resolutions, no new product decision): <br>**M1:** AC-53 is now a twin test on the `corraltest` build. It holds at `shutdown_pool_close` to assert that new connections are refused and the held exchange was closed, then releases the hold and checks exit 0 and the single record. <br>**S1:** a `$query`-wrapped OP_QUERY takes its `command` label from the first key inside `$query`, the same key used for handshake detection and R-1 (FR-8 G-3 note, AC-50). <br>**S2:** every counted request is observed once in `corral_request_duration_seconds`; for requests ending in a close (including a mid-message client close), the duration ends when the close is detected or performed (Metrics definitions, FR-41, AC-52). <br>**S3:** AC-54 adds a ping-reply 91 case. <br>**S4:** AC-55 says the twin's reply is returned unchanged. | Challenge review of Amendment 2, relayed by the Orchestrator, 2026-10-24. |
 | 2026-10-24 | Amendment 2 (incl. challenge-review fixes M1, S1–S4) approved by the Owner and promoted; R-1 to R-6 resolutions confirmed. | Owner approval, 2026-10-24. |
+| 2026-10-25 | **Amendment 3.** <br>**Owner decision, member retention:** non-matching servers are no longer dropped permanently. Only a member reporting a *different* `setName` (foreign) is ignored. It is re-checked every `upstream.heartbeat_interval` and re-admitted when it reports the matching `setName` again. A member reporting no `setName` (ghost or startup state during a rolling restart, recognised by `isreplicaset`) or failing its check (unreachable) stays in the known set and is re-checked on the normal schedule. FR-18's replica-set incompatibility from seed results is kept consistent: it applies only while no matching member has been found since startup; ghost and unreachable seeds never cause it; after a matching member has been found, losing all of them is transient unavailability. This replaces the revision 4/5 text "not monitored further" and "non-matching seeds stop being checked" (Terms, FR-9, FR-18, FR-37, NFR, FR-51, AC-18, AC-56). <br>**Owner decision, `killSessions`:** `killSessions` with an empty array, or an argument that is not a non-empty array, is blocked like `killAllSessions`: code 13 `Unauthorized`, the fixed message, detail `command_blocked`. Under the shared identity it would kill every client's sessions. `killSessions` with explicit session IDs is still forwarded and is listed as residual exposure. FR-9 reads only whether the argument is empty or not an array. FR-38's deciding-field rule covers the argument (FR-9, FR-33, FR-38, FR-51, FR-61, Synthesized error replies, Behavior on failure, Data and compliance, AC-58). The residual-exposure list now states that every remaining route is mitigated by least privilege, and names `$listSessions` / `$listLocalSessions` / `listSessions`, explicit-`lsid` `killSessions`, and `explain`-wrapped or `$unionWith` / `$lookup`-nested `$currentOp`. <br>**Spec-writer clarifications of existing text (wave 2 code review), for Owner approval with the text:** <br>(a) the FR-35 single retry applies only to check failures of class `network` or `timeout` (including TLS); other unsuccessful outcomes are applied at once; <br>(b) `writeConcernError.code` marks a host only in an `ok: 1` reply, and in an `ok: 0` reply only the top-level `code` counts; <br>(c) when a server becomes the target, corral runs an immediate check of it (still at least 500 ms after the previous one) that authenticates on its monitoring connection (FR-22, FR-37). <br>AC-57 covers these. No SPEC-001 change is needed. AC-56 to AC-58 added; AC-18 adjusted. <br>**Challenge-review fixes (APPROVE with should-fixes):** <br>- S1: a ghost is defined exactly as `isreplicaset: true` without `setName`; a standalone-looking or `mongos` member after a match is "other non-matching", kept and re-checked but never the target and with no discovery; AC-56 gains the standalone-after-match case. <br>- S2: the "compatible → incompatible" example is now a single-`mongos` host re-pointed at a replica set. <br>- Nit: a foreign server is kept while it is a seed or still listed by a matching member. | Owner decisions of 2026-10-25 (member retention; `killSessions` block) and Orchestrator request from the wave 2 code review. Promotion awaits Owner approval of the text. |
+| 2026-10-25 | Amendment 3 (incl. challenge-review fixes S1, S2) approved by the Owner and promoted; clarifications confirmed. | Owner approval, 2026-10-25. |
