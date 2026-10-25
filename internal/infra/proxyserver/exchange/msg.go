@@ -2,9 +2,11 @@ package exchange
 
 import (
 	"context"
+	"encoding/binary"
 	"io"
 	"time"
 
+	"github.com/sorinpanduru/corral/internal/domain/bson"
 	"github.com/sorinpanduru/corral/internal/domain/pool"
 	"github.com/sorinpanduru/corral/internal/domain/proxy"
 	"github.com/sorinpanduru/corral/internal/domain/wire"
@@ -64,7 +66,10 @@ func (x *msg) run() (proxy.CloseReason, bool) {
 	if n > proxy.RequestBufferLimit {
 		n = proxy.RequestBufferLimit
 	}
-	if err := s.readBudget(s.buf[16:n]); err != nil {
+	if got, err := s.readBudgetN(s.buf[16:n]); err != nil {
+		// The client went away mid-message: label the request with the command
+		// name if it had already arrived (Amendment 2, R-3).
+		x.cmd = partialCommand(s.buf[:16+got])
 		return x.clientIOFail(err)
 	}
 	x.prefix = s.buf[:n]
@@ -285,3 +290,35 @@ func isProtocolErr(err error) bool {
 }
 
 func classOf(err error) string { c, _ := errclass.Classify(err); return string(c) }
+
+// partialCommand returns the command name of a partly received OP_MSG: the
+// first key of the kind-0 body, if the key is complete in the bytes received.
+// It returns "" otherwise. It reads no values, and keeps nothing.
+func partialCommand(b []byte) string {
+	if len(b) < 21 || wire.ParseHeader(b).OpCode != wire.OpMsg {
+		return ""
+	}
+	pos := 20 // the first section kind byte, after the flags
+	for i := 0; i < 8 && pos < len(b); i++ {
+		switch b[pos] {
+		case 0:
+			el, st, err := bson.FirstElementPartial(b[pos+1:])
+			if err != nil || (st != bson.PartialOK && st != bson.PartialKeyOnly) {
+				return ""
+			}
+			return el.Key()
+		case 1:
+			if pos+5 > len(b) {
+				return ""
+			}
+			size := int(int32(binary.LittleEndian.Uint32(b[pos+1:])))
+			if size < 4 {
+				return ""
+			}
+			pos += 1 + size
+		default:
+			return ""
+		}
+	}
+	return ""
+}

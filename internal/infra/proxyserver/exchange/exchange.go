@@ -204,10 +204,16 @@ func isTimeout(err error) bool {
 
 // readBudget reads exactly len(dst) bytes within the I/O budget.
 func (s *session) readBudget(dst []byte) error {
-	_ = s.cc.Conn.SetReadDeadline(s.budget.BeginRead())
-	_, err := io.ReadFull(s.cc.Conn, dst)
-	s.budget.EndRead()
+	_, err := s.readBudgetN(dst)
 	return err
+}
+
+// readBudgetN is readBudget that also reports how many bytes arrived.
+func (s *session) readBudgetN(dst []byte) (int, error) {
+	_ = s.cc.Conn.SetReadDeadline(s.budget.BeginRead())
+	n, err := io.ReadFull(s.cc.Conn, dst)
+	s.budget.EndRead()
+	return n, err
 }
 
 // exchange handles one message. It reports the close reason and whether the

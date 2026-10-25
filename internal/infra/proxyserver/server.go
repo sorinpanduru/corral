@@ -16,6 +16,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/sorinpanduru/corral/internal/domain/proxy"
 	"github.com/sorinpanduru/corral/internal/infra/config"
 	"github.com/sorinpanduru/corral/internal/infra/proxyserver/exchange"
+	"github.com/sorinpanduru/corral/internal/infra/telemetry/errclass"
 )
 
 // Hold-point names passed to Options.Hold (ADR-0022). The hook blocks the
@@ -201,8 +203,12 @@ func (s *Server) finish(ctx context.Context, c net.Conn, id int32, r proxy.Close
 func (s *Server) handle(ctx context.Context, raw net.Conn, id int32, ap netip.AddrPort) {
 	reason := proxy.CloseInternalError
 	defer func() {
-		// The engine recovers its own panics; this guards the rest.
-		_ = recover()
+		// The engine recovers its own panics; this guards the rest. Only the
+		// classified error reaches the observer, never the panic value.
+		if v := recover(); v != nil {
+			s.o.Obs.PanicRecovered(ctx, errclass.FromPanic(v, debug.Stack()))
+			reason = proxy.CloseInternalError
+		}
 		s.finish(ctx, raw, id, reason)
 	}()
 	conn := raw

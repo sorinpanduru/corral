@@ -347,8 +347,10 @@ func Run(ctx context.Context, in Inputs, hooks Hooks) int {
 	if hooks.Stopping != nil {
 		hooks.Stopping(ctx)
 	}
+	stopForce := watchForce(life, svc, in.Force)
+	defer stopForce()
 	if svc != nil {
-		stopProxy(life, svc, in.Force)
+		_ = svc.Shutdown(context.Background())
 	}
 	shutdownAdmin(life, admin)
 	if tr != nil {
@@ -363,13 +365,15 @@ const tracerName = "github.com/sorinpanduru/corral"
 // msgForced is the constant record for the second signal (FR-63).
 const msgForced = "shutdown forced by second signal"
 
-// stopProxy runs FR-47 and, on the second signal, ends the drain at once. The
-// record is written once; further signals change nothing.
-func stopProxy(life *slog.Logger, svc *proxyapp.Service, force <-chan struct{}) {
+// watchForce logs the second-signal record once and ends the drain at once
+// (FR-63). It runs for the whole shutdown, so a second signal that arrives
+// after the proxy has stopped (during admin or tracing shutdown) is still
+// recorded. Further signals change nothing. The returned func stops it.
+func watchForce(life *slog.Logger, svc *proxyapp.Service, force <-chan struct{}) (stop func()) {
 	done := make(chan struct{})
-	watched := make(chan struct{})
+	finished := make(chan struct{})
 	go func() {
-		defer close(watched)
+		defer close(finished)
 		if force == nil {
 			<-done
 			return
@@ -377,13 +381,13 @@ func stopProxy(life *slog.Logger, svc *proxyapp.Service, force <-chan struct{}) 
 		select {
 		case <-force:
 			life.Warn(msgForced)
-			svc.ForceDrainEnd()
+			if svc != nil {
+				svc.ForceDrainEnd()
+			}
 		case <-done:
 		}
 	}()
-	_ = svc.Shutdown(context.Background())
-	close(done)
-	<-watched
+	return func() { close(done); <-finished }
 }
 
 // lateReadiness is the readiness port the admin listener holds before the

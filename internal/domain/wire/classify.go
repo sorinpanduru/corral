@@ -237,9 +237,6 @@ func classifyMsg(h Header, prefix []byte, fits bool) (Request, error) {
 	r.Command = first.Key()
 	cmd := r.Command
 	whole := st == bson.PartialOK // the first value is complete
-	if !whole && (slices.Contains(collectionCommands, cmd) || cmd == "getMore") {
-		return Request{}, ErrMalformed() // a deciding value outside the prefix (FR-38)
-	}
 
 	var p capPlan
 	p.add("db", bson.CaptureValue, "$db")
@@ -294,10 +291,6 @@ func classifyMsg(h Header, prefix []byte, fits bool) (Request, error) {
 		}
 		if s := p.str(w, "collection"); s != "" {
 			r.Collection, r.HasCollection = s, true
-		} else if i, ok := p.idx["collection"]; ok && w.Matched(i) {
-			if _, found := w.Captured(i); !found && !w.Complete() {
-				return Request{}, ErrMalformed() // the collection value is outside the prefix
-			}
 		}
 	case cmd == "aggregate":
 		if v, ok := p.get(w, "stage"); ok {

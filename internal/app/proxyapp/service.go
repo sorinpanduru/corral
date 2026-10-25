@@ -119,7 +119,7 @@ func New(cfg settings.Proxy, d Deps) (*Service, error) {
 	}
 	s.pool = pool.New[*upstreamconn.Conn](pool.Config{MaxSize: cfg.Pool.MaxSize, MinSize: cfg.Pool.MinSize,
 		MaxWaiters: cfg.Pool.MaxWaiters, CheckoutTimeout: cfg.Pool.CheckoutTimeout, MaxIdleTime: u.MaxIdleTime, Order: order},
-		upstreamconn.NewOpener(ucfg), gate{s.mon}, d.Clock,
+		watchingOpener{inner: upstreamconn.NewOpener(ucfg), svc: s}, gate{s.mon}, d.Clock,
 		&poolObserver{Observer: ad.Pool(), mon: s.mon, auth: u.Mechanism != "none"})
 	s.mon.OnChange(s.onChange)
 
@@ -274,4 +274,21 @@ func (l leaser) Checkout(ctx context.Context) (exchange.Lease, error) {
 	}
 	ls.Conn().StopIdleWatch() // nothing may peek while the exchange reads
 	return &lease{l: ls, svc: l.svc}, nil
+}
+
+// watchingOpener starts the FR-62 idle watcher on every new connection, so a
+// connection that goes straight to idle (min_size refill, a waiter that gave
+// up) is watched too. A checkout stops the watch.
+type watchingOpener struct {
+	inner pool.Opener[*upstreamconn.Conn]
+	svc   *Service
+}
+
+func (o watchingOpener) Open(ctx context.Context, host string) (*upstreamconn.Conn, error) {
+	c, err := o.inner.Open(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	o.svc.startWatch(c)
+	return c, nil
 }
