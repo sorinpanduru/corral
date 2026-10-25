@@ -4,7 +4,7 @@ package tracing_test
 // Expected API (plans/SPEC-001.md T10, names of constants are the test-writer's
 // reading of the plan; see the task report):
 //
-//	tracing.LookupEnv, tracing.Resolve(config.Settings, LookupEnv) (bool, EnvConfig, error)
+//	tracing.LookupEnv, tracing.Resolve(ResolveInputs, LookupEnv, source.ReadFile) (bool, EnvConfig, []error)
 //	tracing.EnvConfig{Exporter, Protocol, Sampler, SamplerArg *float64, SampleRatio float64, Queue}
 //	tracing.ExporterOTLP/ExporterNone, tracing.ProtocolHTTPProtobuf/ProtocolGRPC,
 //	tracing.SamplerUnset/SamplerAlwaysOn/SamplerAlwaysOff/SamplerTraceIDRatio/
@@ -17,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sorinpanduru/corral/internal/infra/config"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/tracing"
 )
 
@@ -54,7 +53,7 @@ func TestResolve_SDKDisabledOtherValuesAreFalse(t *testing.T) {
 				t.Fatalf("OTEL_SDK_DISABLED=%q: enabled = false, want true (counts as false)", v)
 			}
 			// It cannot switch tracing on when tracing.enabled is false.
-			on, _, err = tracing.Resolve(config.Defaults(), envMap(map[string]string{"OTEL_SDK_DISABLED": v}))
+			on, _, err = envResolve(envOff(), envMap(map[string]string{"OTEL_SDK_DISABLED": v}))
 			if err != nil || on {
 				t.Fatalf("tracing.enabled=false: on=%v err=%v, want false/nil", on, err)
 			}
@@ -65,7 +64,7 @@ func TestResolve_SDKDisabledOtherValuesAreFalse(t *testing.T) {
 // AC-14 (unit) through the real process environment API: yes is false, no error.
 func TestResolve_SDKDisabledYesViaRealEnv(t *testing.T) {
 	t.Setenv("OTEL_SDK_DISABLED", "yes")
-	on, _, err := tracing.Resolve(envOn(1.0), lookupOS)
+	on, _, err := envResolve(envOn(1.0), lookupOS)
 	if err != nil || !on {
 		t.Fatalf("on=%v err=%v, want true/nil", on, err)
 	}
@@ -73,7 +72,7 @@ func TestResolve_SDKDisabledYesViaRealEnv(t *testing.T) {
 
 // FR-19: tracing is off by default.
 func TestResolve_OffByDefault(t *testing.T) {
-	on, _, err := tracing.Resolve(config.Defaults(), envMap(nil))
+	on, _, err := envResolve(envOff(), envMap(nil))
 	if err != nil || on {
 		t.Fatalf("defaults: on=%v err=%v, want false/nil", on, err)
 	}
@@ -84,11 +83,11 @@ func TestResolve_OffByDefault(t *testing.T) {
 func TestResolve_WhenOffOnlySDKDisabledIsRead(t *testing.T) {
 	cases := []struct {
 		name string
-		s    config.Settings
+		s    tracing.ResolveInputs
 		sdk  string
 	}{
-		{"tracing.enabled=false", config.Defaults(), "false"},
-		{"tracing.enabled=false SDK unset", config.Defaults(), ""},
+		{"tracing.enabled=false", envOff(), "false"},
+		{"tracing.enabled=false SDK unset", envOff(), ""},
 		{"SDK_DISABLED=TRUE", envOn(1.0), "TRUE"},
 	}
 	for _, c := range cases {
@@ -104,7 +103,7 @@ func TestResolve_WhenOffOnlySDKDisabledIsRead(t *testing.T) {
 				}
 				return "garbage", true
 			}
-			on, _, err := tracing.Resolve(c.s, lookup)
+			on, _, err := envResolve(c.s, lookup)
 			if err != nil || on {
 				t.Fatalf("on=%v err=%v, want false/nil", on, err)
 			}
@@ -125,7 +124,7 @@ func TestResolve_InvalidIgnoredWhenOff(t *testing.T) {
 			for k, v := range c.extra {
 				m[k] = v
 			}
-			if on, _, err := tracing.Resolve(config.Defaults(), envMap(m)); err != nil || on {
+			if on, _, err := envResolve(envOff(), envMap(m)); err != nil || on {
 				t.Fatalf("tracing.enabled=false: on=%v err=%v, want false/nil", on, err)
 			}
 			m["OTEL_SDK_DISABLED"] = "TRUE"
@@ -139,7 +138,7 @@ func TestResolve_InvalidIgnoredWhenOff(t *testing.T) {
 // FR-20 defaults: with no OTEL_* set, otlp, http/protobuf, FR-37 defaults and
 // the default sampler with tracing.sample_ratio.
 func TestResolve_Defaults(t *testing.T) {
-	on, cfg, err := tracing.Resolve(envOn(0.25), envMap(nil))
+	on, cfg, err := envResolve(envOn(0.25), envMap(nil))
 	if err != nil || !on {
 		t.Fatalf("on=%v err=%v, want true/nil", on, err)
 	}
@@ -320,29 +319,48 @@ func TestResolve_ClientPairing(t *testing.T) {
 	} {
 		t.Run(p.name, func(t *testing.T) {
 			envMustResolve(t, map[string]string{p.cert: good.Cert, p.key: good.Key})
-			for name, m := range map[string]map[string]string{
-				"cert without key": {p.cert: good.Cert},
-				"key without cert": {p.key: good.Key},
-				"mismatched key":   {p.cert: good.Cert, p.key: other.Key},
+			// FR-19 fixed names: a certificate without a key is reported under
+			// the key variable, a key without a certificate under the
+			// certificate variable, a mismatched pair under the key variable.
+			for name, c := range map[string]struct {
+				env  map[string]string
+				want string
+			}{
+				"cert without key": {map[string]string{p.cert: good.Cert}, p.key},
+				"key without cert": {map[string]string{p.key: good.Key}, p.cert},
+				"mismatched key":   {map[string]string{p.cert: good.Cert, p.key: other.Key}, p.key},
 			} {
 				t.Run(name, func(t *testing.T) {
 					marker := envMarker(t)
-					_, _, err := envResolveOn(m)
-					envRequireRejectedOneOf(t, err, marker, p.cert, p.key)
+					_, _, err := envResolveOn(c.env) // exactly one error, or the helper fails
+					envRequireRejected(t, err, c.want, marker)
 				})
 			}
 		})
 	}
 	t.Run("mixed prefixes", func(t *testing.T) {
+		// Each form is checked on its own, so a certificate under one prefix
+		// and a key under the other leave both forms unpaired: two errors,
+		// one per form (FR-19: the missing counterpart's variable).
 		g, tr := "OTEL_EXPORTER_OTLP_", "OTEL_EXPORTER_OTLP_TRACES_"
-		for name, m := range map[string]map[string]string{
-			"general cert, traces key": {g + "CLIENT_CERTIFICATE": good.Cert, tr + "CLIENT_KEY": good.Key},
-			"traces cert, general key": {tr + "CLIENT_CERTIFICATE": good.Cert, g + "CLIENT_KEY": good.Key},
+		for name, c := range map[string]struct {
+			env  map[string]string
+			want []string
+		}{
+			"general cert, traces key": {map[string]string{g + "CLIENT_CERTIFICATE": good.Cert, tr + "CLIENT_KEY": good.Key},
+				[]string{g + "CLIENT_KEY", tr + "CLIENT_CERTIFICATE"}},
+			"traces cert, general key": {map[string]string{tr + "CLIENT_CERTIFICATE": good.Cert, g + "CLIENT_KEY": good.Key},
+				[]string{g + "CLIENT_CERTIFICATE", tr + "CLIENT_KEY"}},
 		} {
 			t.Run(name, func(t *testing.T) {
-				_, _, err := envResolveOn(m)
-				envRequireRejectedOneOf(t, err, envMarker(t),
-					g+"CLIENT_CERTIFICATE", g+"CLIENT_KEY", tr+"CLIENT_CERTIFICATE", tr+"CLIENT_KEY")
+				marker := envMarker(t)
+				_, _, errs := envResolveAll(envOn(1.0), envMap(c.env))
+				if len(errs) != len(c.want) {
+					t.Fatalf("got %d errors, want %d", len(errs), len(c.want))
+				}
+				for i, w := range c.want {
+					envRequireRejected(t, errs[i], w, marker)
+				}
 			})
 		}
 	})
@@ -377,8 +395,10 @@ func TestResolve_EncryptedKeysRejected(t *testing.T) {
 	for name, path := range map[string]string{"ENCRYPTED PRIVATE KEY": enc8, "legacy Proc-Type": legacy} {
 		t.Run(name, func(t *testing.T) {
 			cert, key := "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", "OTEL_EXPORTER_OTLP_CLIENT_KEY"
+			// The key has its own error, so the pairing check is skipped and
+			// the one record names the key variable.
 			_, _, err := envResolveOn(map[string]string{cert: c.Cert, key: path})
-			envRequireRejectedOneOf(t, err, marker, cert, key)
+			envRequireRejected(t, err, key, marker)
 		})
 	}
 }
@@ -405,7 +425,7 @@ func TestResolve_SamplerAcceptsSixValues(t *testing.T) {
 
 // AC-16: OTEL_TRACES_SAMPLER=always_on wins over tracing.sample_ratio=0.0.
 func TestResolve_SamplerOverridesSettingsRatio(t *testing.T) {
-	on, cfg, err := tracing.Resolve(envOn(0.0), envMap(map[string]string{"OTEL_TRACES_SAMPLER": "always_on"}))
+	on, cfg, err := envResolve(envOn(0.0), envMap(map[string]string{"OTEL_TRACES_SAMPLER": "always_on"}))
 	if err != nil || !on {
 		t.Fatalf("on=%v err=%v", on, err)
 	}
@@ -440,7 +460,7 @@ func TestResolve_SamplerArgPrecedence(t *testing.T) {
 			if c.arg != "" {
 				m["OTEL_TRACES_SAMPLER_ARG"] = c.arg
 			}
-			on, cfg, err := tracing.Resolve(envOn(c.setting), envMap(m))
+			on, cfg, err := envResolve(envOn(c.setting), envMap(m))
 			if err != nil || !on {
 				t.Fatalf("on=%v err=%v", on, err)
 			}

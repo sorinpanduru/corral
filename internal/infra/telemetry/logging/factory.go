@@ -30,7 +30,7 @@ func (f *Factory) Logger(c Component) (*slog.Logger, error) {
 }
 
 // BootstrapLogger returns a JSON logger with component=config for errors
-// raised before configuration (FR-27). Level is info.
+// raised before configuration (FR-27). Level is debug, so it filters nothing (SPEC-003 FR-29).
 func BootstrapLogger(w io.Writer) *slog.Logger {
-	return slog.New(NewHandler(w, FormatJSON, slog.LevelInfo)).With(attr.Component, string(Config))
+	return slog.New(NewHandler(w, FormatJSON, slog.LevelDebug)).With(attr.Component, string(Config))
 }

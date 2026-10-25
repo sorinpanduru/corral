@@ -149,17 +149,30 @@ func TestAC30_AddressInUse(t *testing.T) {
 	_, port, _ := net.SplitHostPort(addr)
 
 	p := startProc(t, baseEnv(), "-admin.listen="+addr)
-	if code := p.waitExit(); code == 0 {
-		t.Fatalf("exit code = 0, want non-zero")
+	if code := p.waitExit(); code != 1 {
+		t.Fatalf("exit code = %d, want 1 (FR-24: a bind failure is exit 1, not 2)", code)
 	}
+	// SPEC-003: a valid configuration also emits the FR-20 info record
+	// ("configuration loaded") through the config logger before the bind
+	// fails, so only error-level config records are counted here.
 	var cfg []map[string]any
 	for _, r := range p.records() {
-		if str(r, "component") == "config" {
+		if str(r, "component") == "config" && str(r, "level") == "ERROR" {
 			cfg = append(cfg, r)
 		}
 	}
 	if len(cfg) != 1 || str(cfg[0], "setting") != "admin.listen" {
-		t.Fatalf("want exactly one component=config record with setting=admin.listen, got %d", len(cfg))
+		t.Fatalf("want exactly one component=config ERROR record with setting=admin.listen, got %d", len(cfg))
+	}
+	// FR-24: a bind failure is not a configuration error. Its record has a
+	// distinct constant message, and no "invalid configuration" record exists.
+	if got := str(cfg[0], "msg"); got != "admin listener bind failed" {
+		t.Errorf("msg = %q, want %q", got, "admin listener bind failed")
+	}
+	for _, r := range p.records() {
+		if str(r, "msg") == "invalid configuration" {
+			t.Errorf("an \"invalid configuration\" record on a bind failure")
+		}
 	}
 	if got := str(cfg[0], "corral.error.detail"); got != "EADDRINUSE" {
 		t.Errorf("corral.error.detail = %q, want EADDRINUSE", got)

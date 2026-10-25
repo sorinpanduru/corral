@@ -175,3 +175,9 @@ func TestFR1_SelfTest_BadDirReturnsError(t *testing.T) {
 		t.Fatal("expected Scan error for a missing directory")
 	}
 }
+
+// fixtureDirNamed returns tests/lint/testdata/<name>.
+func fixtureDirNamed(t *testing.T, name string) string {
+	t.Helper()
+	return filepath.Join(filepath.Dir(fixtureDir(t)), name)
+}

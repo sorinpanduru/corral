@@ -13,6 +13,9 @@ import (
 const (
 	// MsgInvalid is the FR-11 error record message (same as LogError's).
 	MsgInvalid = logMsg
+	// MsgAdminBindFailed is the record for a failed admin bind. It is not a
+	// configuration error (FR-24), so it is not MsgInvalid.
+	MsgAdminBindFailed = "admin listener bind failed"
 	// MsgUnknownEnv is the FR-8 warning for unknown CORRAL_ variables.
 	MsgUnknownEnv = "unknown CORRAL_ environment variables ignored"
 	// MsgLoaded is the FR-20 info record.
@@ -48,4 +51,14 @@ func LogUnknownEnv(l *slog.Logger, names []string) {
 func LogLoaded(l *slog.Logger, supplied []string) {
 	l.LogAttrs(context.Background(), slog.LevelInfo, MsgLoaded,
 		slog.String(attr.Setting, strings.Join(supplied, ",")))
+}
+
+// LogAdminBindFailed writes the admin bind failure record: error level, the
+// setting name and the errclass attributes, never the address or port. The
+// caller binds component=config.
+func LogAdminBindFailed(l *slog.Logger, err error) {
+	if err == nil {
+		return
+	}
+	l.LogAttrs(context.Background(), slog.LevelError, MsgAdminBindFailed, errorAttrs(err)...)
 }

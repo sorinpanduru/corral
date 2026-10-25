@@ -1,15 +1,16 @@
 # Observability and operations
 
 This guide covers corral's logging, metrics, tracing and admin listener, as
-implemented in `cmd/corral` and `internal/`. The configuration mechanism below
-is temporary (see "Settings"). The proxy itself is not yet built: today the
+implemented in `cmd/corral` and `internal/`. Configuration (flags, environment
+variables, secrets, exit codes, control flags) is described in
+[configuration.md](configuration.md). The proxy itself is not yet built: today the
 binary starts the admin listener and tracing, and serves until it is signalled.
 
 ## Running
 
 ```
 make build
-./bin/corral -log.level=info -admin.listen=127.0.0.1:9187
+./bin/corral --log.level=info --admin.listen=127.0.0.1:9187
 ```
 
 Send `SIGINT` or `SIGTERM` for a graceful shutdown (see "Startup and
@@ -21,12 +22,15 @@ The admin listener has no authentication or TLS; read Security and operational w
 
 Startup order:
 
-1. Parse and validate settings. A failure is written to stdout as JSON with
-   `component=config`.
+1. Load and validate all settings and, when tracing is on, the `OTEL_*`
+   variables. Every failure is written to stdout as JSON with
+   `component=config` and the process exits with status 2 (see
+   [configuration.md](configuration.md)).
 2. Build the logger from the settings and install the third-party log bridges
    (`otel`, `grpc`, `slog.Default()`, standard `log`).
-3. Resolve whether tracing is on and validate the `OTEL_*` variables (only when
-   tracing is on). A failure is logged with `component=config`.
+3. Emit the configuration records: the unknown `CORRAL_` variable warning, the
+   OTLP TLS-ignored warning if it applies, and the `configuration loaded` info
+   record.
 4. Emit the `lifecycle` record `corral starting`.
 5. Register metrics.
 6. Bind the admin listener and start serving. `/healthz` is live and `/readyz`
@@ -35,7 +39,8 @@ Startup order:
 8. Mark startup complete (`/readyz` becomes `200 ok`), then emit the
    `lifecycle` record `corral startup complete`.
 
-Any startup failure writes an error record to stdout and exits with status 1.
+A configuration error exits with status 2. Any other startup failure writes an
+error record to stdout and exits with status 1.
 
 Shutdown starts on `SIGINT`, `SIGTERM` or an admin listener serve failure.
 `/readyz` switches to `503 shutting_down` immediately before the `lifecycle`
@@ -48,6 +53,7 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | 0 | Graceful shutdown, including a signal received during startup (no failure record; `corral shutting down` is still emitted, `corral startup complete` is not if startup had not finished) |
+| 2 | Configuration error (the Go runtime also uses 2 for an unrecovered panic) |
 | 1 | Startup failure, or the admin listener failed while running (`admin listener serve failed` record, then the normal shutdown) |
 
 A step that fails during shutdown is logged at warn level
@@ -87,33 +93,17 @@ Logical settings and defaults:
 | `tracing.enabled` | `true`, `false` (case-insensitive) | `false` |
 | `tracing.sample_ratio` | number in [0, 1] | `1.0` |
 
-Settings are read once at startup. An invalid value stops startup with a
-non-zero exit. The error record has `component=config` and a `setting`
+Settings are read once at startup. An invalid value stops startup with exit
+status 2. The error record has `component=config` and a `setting`
 attribute naming the setting. The supplied value is never echoed.
 
-### Interim flag syntax (temporary)
+### How settings are supplied
 
-Until the configuration spec replaces it, settings are passed as command-line
-flags named exactly like the setting, as `-name=value` or `--name=value`, for
-example:
-
-```
-corral -log.level=debug --admin.listen=0.0.0.0:9187
-```
-
-Binding `0.0.0.0` as above exposes the unauthenticated admin listener (see
-security warnings).
-
-This syntax is temporary and may change when the configuration spec lands.
-
-- A known flag without a value, or given twice, is an error naming that setting.
-- `--` is not an end-of-flags marker. On its own it is a malformed flag.
-- Unknown or malformed flags (for example `-`, `--`, `-=x`) report
-  `setting=unknown`. The flag name is not echoed, because it may be a mistyped
-  secret.
-- Positional (non-flag) arguments report `setting=argument`.
-- Config errors never echo values.
-- `OTEL_*` variables are read from the process environment, not from flags.
+Flags, environment variables and secret file references, their precedence and
+syntax, and the error records are described in
+[configuration.md](configuration.md). The `OTEL_*` variables below are read
+from the environment, not from flags, and are validated in the same pass as the
+other settings.
 
 ### `admin.listen` rules
 
@@ -126,8 +116,9 @@ This syntax is temporary and may change when the configuration spec lands.
   `0`, `127.1` and `0x0`, which resolvers may read as unexpected addresses.
   Hostnames with whitespace or underscores are rejected.
 - If the address cannot be bound at startup, startup fails with a non-zero
-  exit. The error record has `component=config` and `setting=admin.listen`, and
-  does not contain the address.
+  exit 1. The error record has the message `admin listener bind failed`,
+  `component=config` and `setting=admin.listen`, and does not contain the
+  address.
 
 ## Admin endpoints
 
@@ -250,9 +241,11 @@ and is never an error.
 
 - Tracing on: every supported variable below is validated, in both its general
   (`OTEL_EXPORTER_OTLP_*`) and `_TRACES_` (`OTEL_EXPORTER_OTLP_TRACES_*`)
-  forms. An invalid value stops startup with a non-zero exit. The error record
-  has `component=config` and `setting=<variable name>`; the value is never
-  echoed.
+  forms. Every invalid variable is reported (as JSON, sorted by variable name, in
+  the same pass as the other configuration errors) and startup stops with exit
+  status 2. Each error record has `component=config` and
+  `setting=<variable name>`; the value is never echoed. PEM files are read once
+  each, at most 4 MiB.
 - Tracing off (including via `OTEL_SDK_DISABLED`): all `OTEL_*` variables other
   than `OTEL_SDK_DISABLED` are ignored and not validated.
 - An empty or whitespace-only value counts as unset.

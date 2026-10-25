@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sorinpanduru/corral/internal/app/settings"
 	"github.com/sorinpanduru/corral/internal/domain/health"
 	"github.com/sorinpanduru/corral/internal/infra/adminhttp"
 	"github.com/sorinpanduru/corral/internal/infra/config"
@@ -50,11 +51,11 @@ func TestListenAllIPv4(t *testing.T) {
 }
 
 // AC-11 (FR-16): no admin.listen configured -> 127.0.0.1:9187 only. The
-// default itself is owned by config (T9); here an empty Options.Addr must bind
+// default itself is declared by the SPEC-001 settings group (SPEC-003 T10); here an empty Options.Addr must bind
 // it. Skipped when the port is busy on the machine running the tests.
 func TestListenDefaultAddress(t *testing.T) {
-	if config.Defaults().AdminListen != "127.0.0.1:9187" {
-		t.Fatalf("config default = %q", config.Defaults().AdminListen)
+	if got := settings.DefaultObservability().AdminListen; got != "127.0.0.1:9187" {
+		t.Fatalf("admin.listen default = %q", got)
 	}
 	probe, err := net.Listen("tcp", "127.0.0.1:9187")
 	if err != nil {

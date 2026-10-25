@@ -9,8 +9,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/sorinpanduru/corral/internal/infra/telemetry/tracing"
 )
 
 var envFileVars = []string{
@@ -26,7 +24,7 @@ func envResolveWithin(tb testing.TB, m map[string]string) error {
 	type res struct{ err error }
 	ch := make(chan res, 1)
 	go func() {
-		_, _, err := tracing.Resolve(envOn(1.0), envMap(m))
+		_, _, err := envResolve(envOn(1.0), envMap(m))
 		ch <- res{err}
 	}()
 	select {

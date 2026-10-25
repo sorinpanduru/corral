@@ -1,8 +1,8 @@
 # SPEC-003: Configuration loading
 
-Status: approved (Owner, 2026-10-24); Amendment 1 approved (Owner, 2026-10-24)
+Status: approved (Owner, 2026-10-24); Amendment 1 approved (Owner, 2026-10-24); Amendment 2 approved (Owner, 2026-10-24); Amendment 3 approved (Owner, 2026-10-25)
 Owner: Sorin Panduru
-Last updated: 2026-10-24 (Amendment 1)
+Last updated: 2026-10-25 (Amendment 3)
 
 ## Goal
 
@@ -234,7 +234,9 @@ governs.
       (`upstream.password_file` or `CORRAL_UPSTREAM_PASSWORD_FILE`);
     - the logical name for a missing required setting;
     - `unknown` or `argument` per FR-8 and FR-6;
-    - the FR-30 rule for cross-setting errors;
+    - for a cross-setting error, the name of the rule's primary setting,
+      spelled for the source of that setting's effective value as FR-30
+      defines (Amendment 2);
     - the variable name for `OTEL_*` errors (FR-19);
     - the exact values pinned in FR-28 for conflicts and repeats;
   - never contains the supplied value, part of it, a file path or file
@@ -403,12 +405,18 @@ governs.
       same form;
     - a certificate and key that do not pair: the key variable of the same
       form;
+    - the sampler argument, checked against the effective sampler (SPEC-001
+      FR-21, because whether the argument is valid depends on the sampler):
+      `OTEL_TRACES_SAMPLER_ARG`. When `OTEL_TRACES_SAMPLER` itself has an
+      error, this check is skipped and produces no record (Amendment 2);
   - *skip rule for cross-variable checks* (consistent with FR-30): if any
     variable a check involves already has its own error, the check is
     skipped entirely and produces no record. It is not re-evaluated with
     that variable's default. For example:
     - an invalid `OTEL_BSP_MAX_QUEUE_SIZE` skips the batch-size check;
     - a non-PEM client certificate skips the pairing check for that form;
+    - an invalid `OTEL_TRACES_SAMPLER` skips the `OTEL_TRACES_SAMPLER_ARG`
+      check;
   - for validation, PEM files named by `OTEL_*` variables are read through
     the same injected file reader (FR-25), with a maximum size of 4 MiB
     (4,194,304 bytes, measured on the raw file). This is the limit the
@@ -495,14 +503,28 @@ governs.
     check-config;
   - `2`: config error found during loading or validation (FR-6 to FR-15,
     FR-19, FR-27, FR-28, FR-30), including control-flag misuse;
-  - `1`: any other startup or runtime failure, including admin listener bind
-    failure (SPEC-001 FR-35, still logged with `component=config` and
-    `setting=admin.listen`).
+  - `1`: any other startup or runtime failure. This includes admin listener
+    bind failure (SPEC-001 FR-35), which is logged with the distinct
+    *admin-bind record* (Amendment 3), never with `invalid configuration`.
+    The admin-bind record:
+    - has level error, `component=config`, `setting=admin.listen` and the
+      constant message `admin listener bind failed`;
+    - carries the SPEC-001 FR-29 `error` and `corral.error.detail`
+      attributes. The error class is `config`, and the detail comes from the
+      FR-29 enum, for example `EADDRINUSE`;
+    - never contains the address, host or port;
+    - is written through the configured logger, because binding happens
+      after configuration has loaded successfully (FR-29).
 
   The Go runtime also exits with code 2 on an unrecovered panic or fatal
   runtime error. Exit code 2 therefore does not by itself mean a config error;
   config errors are identified by their `invalid configuration` records
-  (FR-26).
+  (FR-26). *Identification is by message, not by class:* the admin-bind
+  record keeps error class `config` (SPEC-001 FR-29 and FR-35, so `error`
+  and `component` are unchanged), so the error class alone does not tell a
+  loading or validation error from a bind failure. Operators and tests tell
+  them apart by message: `invalid configuration` (exit 2) versus `admin
+  listener bind failed` (exit 1).
 
 ### Testability and documentation
 
@@ -747,8 +769,12 @@ See FR-27 for the grammar and combinations.
 | `unknown CORRAL_ environment variables ignored` | warn | `setting` (sorted, comma-joined names) | once, if any (FR-8) | bootstrap JSON on failure, configured on success (FR-29) |
 | `configuration loaded` | info | `setting` (sorted, comma-joined names) | once, on success (FR-20) | configured |
 | `configuration reload not supported; restart required` | warn | `suppressed_count` when some were dropped | SIGHUP in a normal run, rate-limited (FR-18); never in check-config mode | configured |
+| `admin listener bind failed` | error | `setting=admin.listen`, `error` (class `config`), `corral.error.detail` (FR-29 enum, for example `EADDRINUSE`); never the address, host or port | the admin listener cannot bind at startup (SPEC-001 FR-35); the process exits 1 (FR-24, Amendment 3) | configured |
 
-`invalid configuration` already exists. The other three messages are new.
+`invalid configuration` already exists. The other four messages are new.
+`admin listener bind failed` replaces the earlier use of `invalid
+configuration` for bind failures (Amendment 3). Its error class stays
+`config`, so it is identified by its message, not by its class (FR-24).
 
 ## Behavior on failure
 
@@ -766,7 +792,11 @@ See FR-27 for the grammar and combinations.
   `OTEL_TRACES_EXPORTER` itself is invalid. Exit 2.
 - **`tracing.enabled` itself invalid:** `OTEL_*` validation is skipped
   (FR-19).
-- **Admin listener bind failure:** SPEC-001 FR-35, exit 1.
+- **Admin listener bind failure:** SPEC-001 FR-35. One `admin listener bind
+  failed` record is emitted, with `component=config`,
+  `setting=admin.listen`, error class `config` and an FR-29 detail such as
+  `EADDRINUSE`. It has no address or port, and there is no `invalid
+  configuration` record. Exit 1 (FR-24, Amendment 3).
 - **SIGHUP:** never terminates corral once `main` has started; in a normal
   run, once logging is configured, a rate-limited warn record (FR-18).
 - **Unrecovered panic:** the Go runtime exits 2 (FR-24); this is not a
@@ -881,7 +911,10 @@ See FR-27 for the grammar and combinations.
       `localhost.:9187` (trailing dot) and `[fe80::1%eth0]:9187` (IPv6
       zone), and accepts `localhost:9187` and `[::1]:9187`;
     - `list` keeps a U+00A0 at the edge of an element (it is not trimmed),
-      so an `int` list `1, 2` is rejected;
+      so an `int` list consisting of `1`, a comma, U+00A0 and `2` is
+      rejected (Amendment 3: the example is now spelled out, because the
+      literal U+00A0 had been lost and the text showed an ordinary space,
+      which is trimmed);
     - `string` rejects a value containing U+007F and a value containing
       U+0085;
     - `text` accepts an inner `\n` and rejects U+0000;
@@ -1060,7 +1093,11 @@ See FR-27 for the grammar and combinations.
     `setting=OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`; there is no pairing
     record;
   - with a valid queue size of 100 and a batch size of 200, exactly one
-    record appears, with `setting=OTEL_BSP_MAX_EXPORT_BATCH_SIZE`.
+    record appears, with `setting=OTEL_BSP_MAX_EXPORT_BATCH_SIZE`;
+  - (Amendment 2) with `OTEL_TRACES_SAMPLER=x` and
+    `OTEL_TRACES_SAMPLER_ARG=9`, exactly one record appears, with
+    `setting=OTEL_TRACES_SAMPLER`; there is no `OTEL_TRACES_SAMPLER_ARG`
+    record.
 - **AC-21** (FR-19): Unit, with tracing on: `OTEL_TRACES_EXPORTER=console`
   together with an invalid `OTEL_EXPORTER_OTLP_PROTOCOL` and a malformed
   `OTEL_EXPORTER_OTLP_HEADERS` yields exactly three records, sorted by
@@ -1076,6 +1113,22 @@ See FR-27 for the grammar and combinations.
   - With tracing on and a CA certificate set, an `OTEL_EXPORTER_OTLP_ENDPOINT`
     consisting only of U+00A0 counts as not set, so no FR-41 record is
     emitted. This matches the SDK's `strings.TrimSpace` behaviour.
+
+### Added in Amendment 3
+
+- **AC-23** (FR-24): Functional (binary). The test pre-binds the port of a
+  valid `admin.listen` address whose host and port carry a distinctive
+  marker (for example a marker port number), with every other setting
+  valid. Then:
+  - the process exits 1;
+  - stdout holds exactly one record with message `admin listener bind
+    failed`, level error, `component=config`, `setting=admin.listen`,
+    `error=config` and `corral.error.detail=EADDRINUSE`;
+  - no record has the message `invalid configuration`;
+  - the address marker appears nowhere in stdout or stderr, in any encoding
+    the SPEC-001 AC-33 harness scans.
+
+  This also covers SPEC-001 AC-30.
 
 ## Open questions
 
@@ -1109,3 +1162,9 @@ was merged into Q-9 before the questions were asked.
 | 2026-10-24 | Re-check fixes N1 to N5:<br>N1: uniqueness is checked over two name sets, flag names (including `<name>_file`) and environment names (including `CORRAL_<NAME>_FILE`) (FR-2).<br>N2: injection covers validation only, and the OTLP exporter keeps SDK semantics over the real environment and files (FR-19, FR-25).<br>N3: the PEM validation size limit is 4 MiB (FR-19).<br>N4: three or more repeats, and repeated secret literals, each give one record at a fixed position (FR-28, AC-3).<br>N5: `CORRAL_<invalid-name>` is substituted before deduplication and sorting (FR-8).<br>Optional item applied: the tightening note now includes leading `+` on `int` and `float` (FR-12). | Re-check verdict APPROVE with small fixes, relayed by the Orchestrator, 2026-10-24. |
 | 2026-10-24 | Amendment 1 (approved by the Owner, 2026-10-24, together with the additional pins below) closes five gaps found while deriving acceptance tests:<br>(1) the SIGHUP handler is installed as the first action of `main`, before configuration loading. Signal behaviour before `main` starts running, while the Go runtime and package initialisation are still running, is out of scope. Package init code, such as the `earlyslog` package, does run in that window, but `main` has not yet installed the handler, so a SIGHUP there may still terminate the process (FR-18, Non-goals, AC-10).<br>(2) check-config mode never emits the SIGHUP record, even after the configured logger exists, so its output is deterministic (FR-18, FR-23, AC-19).<br>(3) an `OTEL_*` cross-variable check is skipped, not evaluated with a default, when any variable it involves has its own error, consistent with the FR-30 skip rule (FR-19, AC-20).<br>(4) an invalid `OTEL_TRACES_EXPORTER` does not stop validation of the other honoured or validated `OTEL_*` variables, consistent with Q-7's report-everything rule (FR-19, AC-21).<br>(5) "whitespace" in FR-7 is the `strings.TrimSpace` / `unicode.IsSpace` set that the OpenTelemetry Go SDK uses, so it matches SPEC-001 FR-41 (FR-7, FR-19, AC-22).<br>These are spec-writer resolutions that make existing decisions precise; the Owner may override any of them. | Gaps found while deriving acceptance tests, relayed by the Orchestrator, 2026-10-24. Drafted in `specs/drafts/` by the spec-writer, which may not edit approved specs. Promotion to `specs/` needs Owner approval. |
 | 2026-10-24 | Amendment 1, additional pins (spec-writer resolutions; the Owner may override any of them when approving the text):<br>(P2) a `hostport` host with a trailing dot (`localhost.`) is rejected, because it leaves an empty last label; IPv6 zone identifiers (`[fe80::1%eth0]`) are rejected. Both are listed as tightenings relative to the interim loader (FR-12, AC-4).<br>(P4) FR-28 row 1 now applies to a literal together with a *single* `--a.b_file=p`. `--a.b=v --a.b_file=p1 --a.b_file=p2` gives two group 1 records, `a.b` at the literal's position and `a.b_file` at the second `_file` position, and no file is read (FR-28, AC-8).<br>(P5) one general occurrence rule: every occurrence of a flag name counts toward repeats, with or without `=`. Two or more occurrences give one repeat record at the second occurrence, with no missing-value record. A single bare occurrence gives a missing-value record. A bare secret `--a.b` gives one `a.b` record at its position, counted as a missing value, not a literal. If any occurrence of a secret flag has `=`, the single secret-literal record (at the first such occurrence) takes precedence (FR-6, FR-28, AC-3).<br>(Optional) FR-12 list trimming (ASCII space and tab) is stated to be deliberately narrower than the FR-7 whitespace set (FR-12, AC-4).<br>(Nit) the pre-`main` rationale in the previous row now uses the Non-goals wording. | Challenge review of Amendment 1, relayed by the Orchestrator, 2026-10-24. |
+| 2026-10-24 | Amendment 2: when `OTEL_TRACES_SAMPLER` itself has an error, the `OTEL_TRACES_SAMPLER_ARG` check is skipped and produces no record, consistent with the FR-19 cross-variable skip rule, because whether the argument is valid depends on the sampler (SPEC-001 FR-21). This is listed as a cross-variable check in FR-19, and AC-20 gains the case `OTEL_TRACES_SAMPLER=x`, `OTEL_TRACES_SAMPLER_ARG=9`, which gives exactly one record, `OTEL_TRACES_SAMPLER` (FR-19, AC-20). | Owner decision, 2026-10-24, relayed by the Orchestrator. The Owner approved the content, and it is recorded here as Amendment 2. |
+| 2026-10-24 | Amendment 2, consistency fix: FR-11 previously gave the `setting` of a cross-setting error record as "the FR-30 rule", which contradicted FR-30 (and SPEC-002 AC-31). FR-11 now matches FR-30: `setting` is the name of the rule's primary setting, spelled for the source of its effective value (FR-11, FR-30). | Spec-writer consistency fix, requested by the Orchestrator, 2026-10-24. It is not part of the Owner's sampler decision and needs Owner approval when the amendment is promoted. |
+| 2026-10-24 | Amendment 2 promoted; the Owner also approved the FR-11 consistency fix (G-16). | Owner approval, 2026-10-24. |
+| 2026-10-25 | Amendment 3: an admin listener bind failure (SPEC-001 FR-35) is logged with a distinct constant message, `admin listener bind failed`. The record has level error, `component=config`, `setting=admin.listen`, the SPEC-001 FR-29 `error` attribute (class `config`) and a `corral.error.detail` from the FR-29 enum (for example `EADDRINUSE`), and never the address, host or port. The process exits 1. Its error class stays `config`, so config errors (exit 2) are identified by the message `invalid configuration`, not by class. The record is added to the Interfaces log-records table and referenced from FR-24 and Behavior on failure. AC-23 is added. This keeps FR-24 true, because using `invalid configuration` for bind failures had contradicted FR-24's identification rule (FR-24, Interfaces, Behavior on failure, AC-23). | Verification of SPEC-003 found the contradiction, and the implementation was fixed. Relayed by the Orchestrator, 2026-10-25. Drafted in `specs/drafts/` by the spec-writer, which may not edit approved specs. Promotion to `specs/` needs Owner approval. |
+| 2026-10-25 | Amendment 3, consistency fix: the AC-4 `list` example meant to contain U+00A0 had lost that character and showed an ordinary space. An ordinary space is trimmed under FR-12, so the example contradicted its own "is rejected". The example now spells out the characters (`1`, comma, U+00A0, `2`) (AC-4). | Spec-writer consistency fix, found while copying the approved text, 2026-10-25. It is not part of the bind-failure change and needs Owner approval when the amendment is promoted. |
+| 2026-10-25 | Amendment 3 approved by the Owner and promoted, including the AC-4 U+00A0 consistency fix. | Owner approval, 2026-10-25. |

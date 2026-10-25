@@ -110,7 +110,8 @@ func TestT23_TLSMaterialWithHTTPEndpoint(t *testing.T) {
 				}
 				assertTLSIgnoredWarn(t, pr, 1, ca, key)
 				for _, r := range pr.records() {
-					if (str(r, "component") == "config" && str(r, "level") != "WARN") || str(r, "level") == "ERROR" ||
+					// The FR-20 info record "configuration loaded" is expected (SPEC-003).
+					if (str(r, "component") == "config" && str(r, "level") != "WARN" && str(r, "msg") != "configuration loaded") || str(r, "level") == "ERROR" ||
 						strings.Contains(str(r, "msg"), "startup failed") {
 						t.Errorf("unexpected error record: component=%q level=%q msg=%q error=%q detail=%q",
 							str(r, "component"), str(r, "level"), str(r, "msg"), str(r, "error"), str(r, "corral.error.detail"))

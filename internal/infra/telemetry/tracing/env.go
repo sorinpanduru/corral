@@ -10,11 +10,13 @@ package tracing
 import (
 	"errors"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/sorinpanduru/corral/internal/infra/config"
+	"github.com/sorinpanduru/corral/internal/infra/config/source"
 )
 
 // LookupEnv looks up an environment variable, like os.LookupEnv.
@@ -112,26 +114,96 @@ var (
 	errBatchTooLarge  = errors.New("tracing: batch size exceeds queue size")
 )
 
+// ResolveInputs are the CORRAL settings Resolve needs (SPEC-003 FR-19).
+type ResolveInputs struct {
+	// Enabled is the effective tracing.enabled.
+	Enabled bool
+	// SampleRatio is the effective tracing.sample_ratio.
+	SampleRatio float64
+}
+
+// resolver collects per-variable errors and caches PEM reads for one Resolve
+// call. Cached bytes are discarded when Resolve returns.
+type resolver struct {
+	env    LookupEnv
+	read   source.ReadFile
+	errs   map[string]error
+	pem    map[string]pemEntry
+	failed map[string]bool
+}
+
+type pemEntry struct {
+	data []byte
+	ok   bool
+}
+
+func (r *resolver) get(name string) (string, bool) {
+	v, ok := r.env(name)
+	v = strings.TrimSpace(v) // whitespace-only counts as unset (FR-7 set)
+	return v, ok && v != ""
+}
+
+func (r *resolver) fail(name string, cause error) {
+	if _, dup := r.errs[name]; !dup {
+		r.errs[name] = config.NewError(name, cause)
+	}
+	r.failed[name] = true
+}
+
+// readPEM reads path through the injected reader at most once per call.
+func (r *resolver) readPEM(path string) ([]byte, bool) {
+	if e, ok := r.pem[path]; ok {
+		return e.data, e.ok
+	}
+	b, err := r.read(path, source.MaxPEMFileBytes)
+	e := pemEntry{data: b, ok: err == nil && len(b) > 0}
+	r.pem[path] = e
+	return e.data, e.ok
+}
+
 // Resolve decides whether tracing is on and, when it is, validates the OTEL_*
-// variables (FR-19, FR-20, FR-21, FR-27, FR-37).
+// variables (FR-19, FR-20, FR-21, FR-27, FR-37). All inputs are injected: env
+// for variables and read for PEM files (FR-25).
 //
-// Tracing is off when s.TracingEnabled is false or OTEL_SDK_DISABLED is "true"
+// Tracing is off when in.Enabled is false or OTEL_SDK_DISABLED is "true"
 // (case-insensitive). Any other OTEL_SDK_DISABLED value is false and never an
 // error. When off, no other variable is read. When on, every honoured or
 // validated variable is checked (both the general and _TRACES_ variants) and
-// the first failure is returned as a config.Error naming the variable. An empty
-// value counts as unset, as in the OpenTelemetry specification.
-func Resolve(s config.Settings, env LookupEnv) (bool, EnvConfig, error) {
+// every failure is returned, one config.Error per variable, sorted by setting.
+// A check that involves a variable with its own error is skipped (AC-20). An
+// invalid exporter does not stop other validation (AC-21). On any error the
+// returned enabled flag is false and cfg is zero. Whitespace-only values count
+// as unset.
+func Resolve(in ResolveInputs, env LookupEnv, read source.ReadFile) (bool, EnvConfig, []error) {
 	if v, ok := env(varSDKDisabled); ok && strings.EqualFold(v, "true") {
 		return false, EnvConfig{}, nil
 	}
-	if !s.TracingEnabled {
+	if !in.Enabled {
 		return false, EnvConfig{}, nil
 	}
+	r := &resolver{
+		env: env, read: read, errs: map[string]error{}, pem: map[string]pemEntry{},
+		failed: map[string]bool{},
+	}
+	cfg := r.resolve(in)
+	if len(r.errs) > 0 {
+		out := make([]error, 0, len(r.errs))
+		for _, e := range r.errs {
+			out = append(out, e)
+		}
+		sort.Slice(out, func(i, j int) bool {
+			return out[i].(*config.Error).Setting < out[j].(*config.Error).Setting
+		})
+		return false, EnvConfig{}, out
+	}
+	return true, cfg, nil
+}
+
+func (r *resolver) resolve(in ResolveInputs) EnvConfig {
 	cfg := EnvConfig{
 		Exporter:    ExporterOTLP,
 		Protocol:    ProtocolHTTPProtobuf,
-		SampleRatio: s.SampleRatio,
+		SampleRatio: in.SampleRatio,
 		Queue: QueueSettings{
 			MaxQueueSize:       2048,
 			MaxExportBatchSize: 512,
@@ -139,27 +211,19 @@ func Resolve(s config.Settings, env LookupEnv) (bool, EnvConfig, error) {
 			ExportTimeout:      30000 * time.Millisecond,
 		},
 	}
-	get := func(name string) (string, bool) {
-		v, ok := env(name)
-		v = strings.TrimSpace(v) // whitespace-only counts as unset
-		return v, ok && v != ""
-	}
-	fail := func(name string, cause error) (bool, EnvConfig, error) {
-		return false, EnvConfig{}, config.NewError(name, cause)
-	}
 
-	if v, ok := get(varExporter); ok {
+	if v, ok := r.get(varExporter); ok {
 		switch ExporterKind(strings.ToLower(v)) {
 		case ExporterOTLP, ExporterNone:
 			cfg.Exporter = ExporterKind(strings.ToLower(v))
 		default:
-			return fail(varExporter, errBadExporter)
+			r.fail(varExporter, errBadExporter)
 		}
 	}
 
 	// Protocol: the _TRACES_ variant wins, but both are validated.
 	for _, name := range []string{otlpPrefix + "PROTOCOL", otlpTracesPrefix + "PROTOCOL"} {
-		v, ok := get(name)
+		v, ok := r.get(name)
 		if !ok {
 			continue
 		}
@@ -167,97 +231,113 @@ func Resolve(s config.Settings, env LookupEnv) (bool, EnvConfig, error) {
 		case ProtocolHTTPProtobuf, ProtocolGRPC:
 			cfg.Protocol = Protocol(strings.ToLower(v)) // the later (_TRACES_) variant overrides
 		default:
-			return fail(name, errBadProtocol)
+			r.fail(name, errBadProtocol)
 		}
 	}
 
 	// Remaining exporter variables: both variants validated, nothing kept.
 	for _, suffix := range []string{"ENDPOINT", "HEADERS", "TIMEOUT", "COMPRESSION", "INSECURE", "CERTIFICATE", "CLIENT_CERTIFICATE", "CLIENT_KEY"} {
 		for _, name := range []string{otlpPrefix + suffix, otlpTracesPrefix + suffix} {
-			v, ok := get(name)
+			v, ok := r.get(name)
 			if !ok {
 				continue
 			}
-			if err := validateExporterVar(suffix, v); err != nil {
-				return fail(name, err)
+			if err := r.validateExporterVar(suffix, v); err != nil {
+				r.fail(name, err)
 			}
 		}
 	}
 
-	// Client certificate and key are paired under the same prefix.
+	// Client certificate and key are paired under the same prefix. The check
+	// is skipped when either variable has its own error (AC-20).
 	for _, prefix := range []string{otlpPrefix, otlpTracesPrefix} {
 		certName, keyName := prefix+"CLIENT_CERTIFICATE", prefix+"CLIENT_KEY"
-		cp, cok := get(certName)
-		kp, kok := get(keyName)
+		if r.failed[certName] || r.failed[keyName] {
+			continue
+		}
+		cp, cok := r.get(certName)
+		kp, kok := r.get(keyName)
 		switch {
 		case cok && !kok:
-			return fail(keyName, errBadPair)
+			r.fail(keyName, errBadPair)
 		case kok && !cok:
-			return fail(certName, errBadPair)
-		case cok && kok && !keyPairOK(cp, kp):
-			return fail(keyName, errBadPair)
+			r.fail(certName, errBadPair)
+		case cok && kok && !r.keyPairOK(cp, kp):
+			r.fail(keyName, errBadPair)
 		}
 	}
 
-	if v, ok := get(varResourceAttrs); ok {
+	if v, ok := r.get(varResourceAttrs); ok {
 		if !validKeyValueList(v, false) {
-			return fail(varResourceAttrs, errBadKVList)
+			r.fail(varResourceAttrs, errBadKVList)
 		}
 	}
 	// OTEL_SERVICE_NAME: any non-empty string is valid (empty is unset); nothing to check.
 
 	// Sampler.
-	if v, ok := get(varSampler); ok {
+	if v, ok := r.get(varSampler); ok {
 		switch k := SamplerKind(strings.ToLower(v)); k {
 		case SamplerAlwaysOn, SamplerAlwaysOff, SamplerTraceIDRatio,
 			SamplerParentBasedAlwaysOn, SamplerParentBasedAlwaysOff, SamplerParentBasedTraceIDRatio:
 			cfg.Sampler = k
 		default:
-			return fail(varSampler, errBadSampler)
+			r.fail(varSampler, errBadSampler)
 		}
 	}
 	usesRatio := cfg.Sampler == SamplerUnset || cfg.Sampler == SamplerTraceIDRatio || cfg.Sampler == SamplerParentBasedTraceIDRatio
-	if v, ok := get(varSamplerArg); ok && usesRatio {
+	if v, ok := r.get(varSamplerArg); ok && usesRatio && !r.failed[varSampler] {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f > 1 {
-			return fail(varSamplerArg, errBadSamplerArg)
+			r.fail(varSamplerArg, errBadSamplerArg)
+		} else {
+			cfg.SamplerArg = &f
+			cfg.SampleRatio = f
 		}
-		cfg.SamplerArg = &f
-		cfg.SampleRatio = f
 	}
 
 	// Batch processor (FR-37).
 	var err error
-	if v, ok := get(varBSPQueue); ok {
-		if cfg.Queue.MaxQueueSize, err = parsePositiveInt(v); err != nil {
-			return fail(varBSPQueue, err)
+	if v, ok := r.get(varBSPQueue); ok {
+		if n, err := parsePositiveInt(v); err != nil {
+			r.fail(varBSPQueue, err)
+		} else {
+			cfg.Queue.MaxQueueSize = n
 		}
 	}
-	if v, ok := get(varBSPBatch); ok {
-		if cfg.Queue.MaxExportBatchSize, err = parsePositiveInt(v); err != nil {
-			return fail(varBSPBatch, err)
+	batchSet := false
+	if v, ok := r.get(varBSPBatch); ok {
+		if n, err := parsePositiveInt(v); err != nil {
+			r.fail(varBSPBatch, err)
+		} else {
+			cfg.Queue.MaxExportBatchSize = n
+			batchSet = true
 		}
-	} else if cfg.Queue.MaxExportBatchSize > cfg.Queue.MaxQueueSize {
-		// Unset batch: effective value is min(default, queue).
-		cfg.Queue.MaxExportBatchSize = cfg.Queue.MaxQueueSize
 	}
-	if v, ok := get(varBSPDelay); ok {
+	if v, ok := r.get(varBSPDelay); ok {
 		if cfg.Queue.ScheduleDelay, err = parsePositiveMillis(v); err != nil {
-			return fail(varBSPDelay, err)
+			r.fail(varBSPDelay, err)
 		}
 	}
-	if v, ok := get(varBSPTimeout); ok {
+	if v, ok := r.get(varBSPTimeout); ok {
 		if cfg.Queue.ExportTimeout, err = parsePositiveMillis(v); err != nil {
-			return fail(varBSPTimeout, err)
+			r.fail(varBSPTimeout, err)
 		}
 	}
-	if cfg.Queue.MaxExportBatchSize > cfg.Queue.MaxQueueSize {
-		return fail(varBSPBatch, errBatchTooLarge)
+	// The batch check involves both variables; it is skipped when either has
+	// its own error (AC-20), never re-evaluated against a default.
+	if !r.failed[varBSPQueue] && !r.failed[varBSPBatch] {
+		switch {
+		case batchSet && cfg.Queue.MaxExportBatchSize > cfg.Queue.MaxQueueSize:
+			r.fail(varBSPBatch, errBatchTooLarge)
+		case !batchSet && cfg.Queue.MaxExportBatchSize > cfg.Queue.MaxQueueSize:
+			// Unset batch: effective value is min(default, queue).
+			cfg.Queue.MaxExportBatchSize = cfg.Queue.MaxQueueSize
+		}
 	}
-	return true, cfg, nil
+	return cfg
 }
 
-func validateExporterVar(suffix, v string) error {
+func (r *resolver) validateExporterVar(suffix, v string) error {
 	switch suffix {
 	case "ENDPOINT":
 		if !validEndpoint(v) {
@@ -281,11 +361,11 @@ func validateExporterVar(suffix, v string) error {
 			return errBadBool
 		}
 	case "CERTIFICATE", "CLIENT_CERTIFICATE":
-		if !certFileOK(v) {
+		if !r.certFileOK(v) {
 			return errBadFile
 		}
 	case "CLIENT_KEY":
-		if !keyFileOK(v) {
+		if !r.keyFileOK(v) {
 			return errBadFile
 		}
 	}

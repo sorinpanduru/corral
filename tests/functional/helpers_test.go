@@ -67,8 +67,14 @@ func baseEnv(extra ...string) []string {
 
 func startProc(t *testing.T, env []string, args ...string) *proc {
 	t.Helper()
+	return startProcBin(t, binPath, env, args...)
+}
+
+// startProcBin starts the given binary (the default one, or testBinPath).
+func startProcBin(t *testing.T, bin string, env []string, args ...string) *proc {
+	t.Helper()
 	p := &proc{t: t, done: make(chan struct{})}
-	p.cmd = exec.Command(binPath, args...)
+	p.cmd = exec.Command(bin, args...)
 	p.cmd.Env = env
 	p.cmd.Stdout = &p.stdout
 	p.cmd.Stderr = &p.stderr

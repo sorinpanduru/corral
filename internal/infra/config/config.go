@@ -1,26 +1,19 @@
-// Package config parses and validates the SPEC-001 logical settings
-// (FR-5, FR-6, FR-16, FR-19, FR-21, FR-27) and provides the interim flag
-// loader from ADR-0003.
+// Package config holds the configuration error type and the FR-11 record
+// emitters shared by the loader, the runtime and the admin listener. Parsing
+// and validation live in internal/infra/config/{types,registry,loader}.
 //
-// Compliance (FR-24, FR-27, GDPR data minimisation): a rejected value is never
-// echoed into an error text, a log record or an errclass attribute. Errors name
-// the setting only.
+// Compliance (SPEC-003 FR-11, SPEC-001 FR-24, GDPR data minimisation): a
+// rejected value is never echoed into an error text, a log record or an
+// errclass attribute. Errors name the setting only.
 package config
 
 import (
 	"context"
 	"errors"
 	"log/slog"
-	"math"
-	"net"
-	"net/netip"
-	"sort"
-	"strconv"
-	"strings"
 
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/attr"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/errclass"
-	"github.com/sorinpanduru/corral/internal/infra/telemetry/logging"
 )
 
 // Logical setting names (SPEC-001 Interfaces).
@@ -36,36 +29,6 @@ const (
 	SettingUnknown = "unknown"
 	// SettingArgument names errors for positional command-line arguments.
 	SettingArgument = "argument"
-)
-
-// Settings is the validated set of logical settings. It is comparable.
-type Settings struct {
-	LogFormat      logging.Format
-	LogLevel       slog.Level
-	AdminListen    string
-	TracingEnabled bool
-	SampleRatio    float64
-}
-
-// Defaults returns the default settings (FR-5, FR-6, FR-16, FR-19, FR-21).
-func Defaults() Settings {
-	return Settings{
-		LogFormat:      logging.FormatJSON,
-		LogLevel:       slog.LevelInfo,
-		AdminListen:    "127.0.0.1:9187",
-		TracingEnabled: false,
-		SampleRatio:    1.0,
-	}
-}
-
-var (
-	errNotBool       = errors.New("config: not a boolean")
-	errBadListen     = errors.New("config: invalid listen address")
-	errBadRatio      = errors.New("config: invalid sample ratio")
-	errUnknown       = errors.New("config: unknown setting")
-	errMissingValue  = errors.New("config: missing value")
-	errRepeated      = errors.New("config: repeated setting")
-	errPositionalArg = errors.New("config: unexpected argument")
 )
 
 // Error is a configuration error (FR-27). Its text carries the setting name
@@ -91,113 +54,6 @@ func (e *Error) Unwrap() error { return e.cause }
 // ConfigSetting names the setting; errclass uses it to classify as config.
 func (e *Error) ConfigSetting() string { return e.Setting }
 
-// Parse turns raw logical-setting values into Settings. An absent key uses the
-// default. Any invalid value or unknown key is a *Error naming the setting.
-func Parse(raw map[string]string) (Settings, error) {
-	s := Defaults()
-	keys := make([]string, 0, len(raw))
-	for k := range raw {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys) // deterministic first error
-	for _, k := range keys {
-		v := raw[k]
-		var err error
-		switch k {
-		case SettingLogFormat:
-			s.LogFormat, err = logging.ParseFormat(v)
-		case SettingLogLevel:
-			s.LogLevel, err = logging.ParseLevel(v)
-		case SettingAdminListen:
-			err = validateListen(v)
-			if err == nil {
-				s.AdminListen = v
-			}
-		case SettingTracingEnabled:
-			s.TracingEnabled, err = parseBool(v)
-		case SettingSampleRatio:
-			s.SampleRatio, err = parseRatio(v)
-		default:
-			err = errUnknown
-		}
-		if err != nil {
-			if err == errUnknown {
-				k = SettingUnknown // never echo an unknown key
-			}
-			return Settings{}, NewError(k, err)
-		}
-	}
-	return s, nil
-}
-
-func parseBool(v string) (bool, error) {
-	switch strings.ToLower(v) {
-	case "true":
-		return true, nil
-	case "false":
-		return false, nil
-	}
-	return false, errNotBool
-}
-
-func parseRatio(v string) (float64, error) {
-	f, err := strconv.ParseFloat(v, 64)
-	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f > 1 {
-		return 0, errBadRatio
-	}
-	return f, nil
-}
-
-// validateListen requires host:port with a non-empty host and port 0..65535
-// (FR-16). The host is an IP literal or a syntactically valid DNS hostname.
-// Errors never echo the address.
-func validateListen(v string) error {
-	host, port, err := net.SplitHostPort(v)
-	if err != nil || host == "" {
-		return errBadListen
-	}
-	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
-		return errBadListen
-	}
-	if _, err := netip.ParseAddr(host); err == nil {
-		return nil
-	}
-	if !validHostname(host) {
-		return errBadListen
-	}
-	return nil
-}
-
-// validHostname: letters, digits, '-' and '.'; labels 1..63 chars without a
-// leading or trailing '-'; total <= 253; the last label must not look numeric
-// (rejects "0", "127.1" and "0x0", which resolvers read as addresses).
-func validHostname(h string) bool {
-	h = strings.TrimSuffix(h, ".")
-	if h == "" || len(h) > 253 {
-		return false
-	}
-	labels := strings.Split(h, ".")
-	for _, l := range labels {
-		if len(l) < 1 || len(l) > 63 || l[0] == '-' || l[len(l)-1] == '-' {
-			return false
-		}
-		for i := 0; i < len(l); i++ {
-			c := l[i]
-			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
-				return false
-			}
-		}
-	}
-	last := strings.ToLower(labels[len(labels)-1])
-	if strings.Trim(last, "0123456789") == "" {
-		return false
-	}
-	if strings.HasPrefix(last, "0x") && strings.Trim(last[2:], "0123456789abcdef") == "" {
-		return false
-	}
-	return true
-}
-
 // logMsg is the constant message of the FR-27 error record.
 const logMsg = "invalid configuration"
 
@@ -210,43 +66,15 @@ func LogError(l *slog.Logger, err error) {
 	if err == nil {
 		return
 	}
+	l.LogAttrs(context.Background(), slog.LevelError, logMsg, errorAttrs(err)...)
+}
+
+// errorAttrs returns the setting and errclass attributes of err; never values.
+func errorAttrs(err error) []slog.Attr {
 	var attrs []slog.Attr
 	var ce errclass.ConfigError
 	if errors.As(err, &ce) {
 		attrs = append(attrs, slog.String(attr.Setting, ce.ConfigSetting()))
 	}
-	attrs = append(attrs, errclass.LogAttrs(err)...)
-	l.LogAttrs(context.Background(), slog.LevelError, logMsg, attrs...)
-}
-
-var knownSettings = map[string]struct{}{
-	SettingLogFormat: {}, SettingLogLevel: {}, SettingAdminListen: {},
-	SettingTracingEnabled: {}, SettingSampleRatio: {},
-}
-
-// FromArgs is the interim loader (ADR-0003, D1): -name=value or --name=value
-// flags named like the logical settings. Values are passed through
-// unvalidated. Unknown or malformed flags give SettingUnknown, positional
-// arguments SettingArgument, and a known flag with no value or repeated names
-// that flag. "--" is not an end-of-flags marker. Supplied text is never echoed.
-func FromArgs(args []string) (map[string]string, error) {
-	out := make(map[string]string, len(args))
-	for _, a := range args {
-		if !strings.HasPrefix(a, "-") {
-			return nil, NewError(SettingArgument, errPositionalArg)
-		}
-		body := strings.TrimPrefix(strings.TrimPrefix(a, "-"), "-")
-		name, val, hasVal := strings.Cut(body, "=")
-		if _, ok := knownSettings[name]; !ok {
-			return nil, NewError(SettingUnknown, errUnknown)
-		}
-		if !hasVal {
-			return nil, NewError(name, errMissingValue)
-		}
-		if _, dup := out[name]; dup {
-			return nil, NewError(name, errRepeated)
-		}
-		out[name] = val
-	}
-	return out, nil
+	return append(attrs, errclass.LogAttrs(err)...)
 }

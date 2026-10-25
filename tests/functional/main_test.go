@@ -16,6 +16,10 @@ import (
 
 var binPath string
 
+// testBinPath is the `-tags corraltest` binary (ADR-0014): test registries and
+// hold points. Only the tests that need them use it.
+var testBinPath string
+
 func TestMain(m *testing.M) {
 	os.Exit(realMain(m))
 }
@@ -39,6 +43,15 @@ func realMain(m *testing.M) int {
 	build.Stdout, build.Stderr = os.Stdout, os.Stderr
 	if err := build.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "go build ./cmd/corral failed:", err)
+		return 2
+	}
+	testBinPath = filepath.Join(dir, "corral-test")
+	tbuild := exec.Command("go", "build", "-tags", "corraltest", "-o", testBinPath, "./cmd/corral")
+	tbuild.Dir = root
+	tbuild.Env = hermeticEnv()
+	tbuild.Stdout, tbuild.Stderr = os.Stdout, os.Stderr
+	if err := tbuild.Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "go build -tags corraltest ./cmd/corral failed:", err)
 		return 2
 	}
 	return m.Run()

@@ -9,10 +9,12 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -20,8 +22,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/sorinpanduru/corral/internal/app/configload"
+	"github.com/sorinpanduru/corral/internal/app/settings"
 	"github.com/sorinpanduru/corral/internal/infra/adminhttp"
 	"github.com/sorinpanduru/corral/internal/infra/config"
+	"github.com/sorinpanduru/corral/internal/infra/config/loader"
+	"github.com/sorinpanduru/corral/internal/infra/config/registry"
+	"github.com/sorinpanduru/corral/internal/infra/config/source"
+	"github.com/sorinpanduru/corral/internal/infra/config/usage"
+	"github.com/sorinpanduru/corral/internal/infra/sighup"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/errclass"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logbridge"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logging"
@@ -46,14 +55,37 @@ const tracingShutdownTimeout = 5 * time.Second
 
 const adminShutdownTimeout = 5 * time.Second
 
-// Exit codes.
+// Exit codes (FR-24).
 const (
 	exitOK      = 0
 	exitFailure = 1
+	exitConfig  = 2
 )
 
-// Hooks are in-process test hooks. Both may be nil.
+// Inputs are everything Run needs from the outside (FR-25): no process
+// global is read.
+type Inputs struct {
+	Args     []string
+	Env      []string // KEY=VALUE entries
+	ReadFile source.ReadFile
+	Stdout   io.Writer
+	// HUP delivers SIGHUP; the entry point owns signal.Notify.
+	HUP     <-chan os.Signal
+	Version string
+	// Registry selects the settings; nil means settings.Registry().
+	Registry *registry.Registry
+	// Now is the SIGHUP limiter clock; nil means time.Now.
+	Now func() time.Time
+}
+
+// Hooks are in-process test hooks. All may be nil.
 type Hooks struct {
+	// BeforeLogger runs before the configuration is loaded, so before the
+	// configured logger exists (AC-10). Help and version never reach it.
+	BeforeLogger func(ctx context.Context)
+	// BeforeCheckConfigExit runs in check-config mode after the FR-20 record
+	// and before exit (AC-19).
+	BeforeCheckConfigExit func(ctx context.Context)
 	// BeforeLastStep runs after the admin listener serves and before it is
 	// marked started (AC-31).
 	BeforeLastStep func(ctx context.Context)
@@ -72,54 +104,101 @@ type Handles struct {
 }
 
 // Run starts corral and blocks until ctx is cancelled or startup fails. It
-// returns the process exit code: 0 after a graceful shutdown (including a
-// cancel during startup), non-zero on any startup or serve failure.
+// returns the process exit code (ADR-0013): 0 after help, version, a
+// successful check-config or a graceful shutdown (including a cancel during
+// startup); 2 for a configuration error; 1 for any other startup or serve
+// failure.
 //
 // Shutdown bound: after the "shutting down" record and the Stopping hook, the
 // admin server gets at most adminShutdownTimeout and tracing at most
 // tracingShutdownTimeout, so the whole shutdown takes about 10 s at worst.
-func Run(ctx context.Context, args []string, env tracing.LookupEnv, stdout io.Writer, hooks Hooks) int {
-	// ADR-0006 step 0: settings (stdlib-only logging until the factory exists).
-	raw, err := config.FromArgs(args)
-	var settings config.Settings
-	if err == nil {
-		settings, err = config.Parse(raw)
+func Run(ctx context.Context, in Inputs, hooks Hooks) int {
+	stdout := in.Stdout
+	if stdout == nil {
+		stdout = io.Discard
 	}
-	if err != nil {
-		config.LogError(logging.BootstrapLogger(stdout), err)
+	// ADR-0013 step A: drain SIGHUP from the start, with no logger.
+	watcher := sighup.Start(in.HUP, in.Now)
+	defer watcher.Stop()
+
+	settingsReg := in.Registry
+	if settingsReg == nil {
+		var err error
+		if settingsReg, err = settings.Registry(); err != nil {
+			logProgramming(stdout, err)
+			return exitFailure
+		}
+	}
+
+	// Step B: modes that start nothing.
+	switch loader.SelectMode(in.Args) {
+	case loader.ModeHelp:
+		if err := usage.Write(stdout, settingsReg); err != nil {
+			return exitFailure
+		}
+		return exitOK
+	case loader.ModeVersion:
+		version := in.Version
+		if version == "" {
+			version = "devel"
+		}
+		if _, err := fmt.Fprintf(stdout, "corral %s\n", version); err != nil {
+			return exitFailure
+		}
+		return exitOK
+	}
+
+	// Step C: hold point before the configured logger exists.
+	if hooks.BeforeLogger != nil {
+		hooks.BeforeLogger(ctx)
+	}
+
+	// Step D: load and validate everything a run would.
+	out := configload.Load(settingsReg, configload.Inputs{Args: in.Args, Env: in.Env, ReadFile: in.ReadFile})
+	if out.Err != nil {
+		logProgramming(stdout, out.Err)
 		return exitFailure
 	}
+	if len(out.Errors) > 0 {
+		// Failure path: the bootstrap JSON logger only (FR-29).
+		boot := logging.BootstrapLogger(stdout)
+		config.LogUnknownEnv(boot, out.Result.UnknownEnv)
+		config.LogErrors(boot, out.Errors)
+		return exitConfig
+	}
+	obs := out.Observability
+	env := source.NewEnv(in.Env).Lookup
 
-	// Resolve is pure environment parsing; it runs before the handler is built
-	// so trace correlation is wrapped only when tracing is really on. Its error
-	// is logged after Install (step 3).
-	enabled, tcfg, resolveErr := tracing.Resolve(settings, env)
-
-	// Step 1: logging factory.
-	var h slog.Handler = logging.NewHandler(stdout, settings.LogFormat, settings.LogLevel)
-	if resolveErr == nil && enabled {
+	// Success path, step 1: logging factory.
+	var h slog.Handler = logging.NewHandler(stdout, obs.LogFormat, obs.LogLevel)
+	if out.TracingEnabled {
 		h = logging.WithTraceCorrelation(h)
 	}
 	factory := logging.NewFactory(h)
 
 	// Step 2: third-party log bridges before any grpc/otel/tracing/admin code.
-	logbridge.Install(factory, settings.LogLevel, time.Now)
+	logbridge.Install(factory, obs.LogLevel, time.Now)
 
 	cfgLog := mustLogger(factory, logging.Config)
 	life := mustLogger(factory, logging.Lifecycle)
 
-	// Step 3: tracing environment validation result.
-	if resolveErr != nil {
-		config.LogError(cfgLog, resolveErr)
-		return exitFailure
+	// Step 3: FR-8, FR-41 and FR-20 records (names only, never values).
+	config.LogUnknownEnv(cfgLog, out.Result.UnknownEnv)
+	if len(out.TLSIgnored) > 0 {
+		cfgLog.Warn(msgOTLPTLSIgnored, slog.String("setting", strings.Join(out.TLSIgnored, ",")))
 	}
+	config.LogLoaded(cfgLog, out.Result.Supplied)
 
-	// Amendment 2: TLS material with an http:// traces endpoint is withheld
-	// from the exporter (see tracing.newOTLP); say so once, constant text.
-	if names := tracing.TLSIgnoredSettings(tcfg, env); enabled && len(names) > 0 {
-		// Only variable names, never values (which are file paths).
-		cfgLog.Warn(msgOTLPTLSIgnored, slog.String("setting", strings.Join(names, ",")))
+	// Check-config: validated, nothing starts. The watcher gets no logger, so
+	// a SIGHUP never produces a record (FR-18, AC-19).
+	if out.Mode == loader.ModeCheckConfig {
+		if hooks.BeforeCheckConfigExit != nil {
+			hooks.BeforeCheckConfigExit(ctx)
+		}
+		return exitOK
 	}
+	watcher.SetLogger(cfgLog)
+	enabled, tcfg := out.TracingEnabled, out.Tracing
 
 	// Step 4: lifecycle starting record.
 	life.Info(msgStarting)
@@ -141,14 +220,14 @@ func Run(ctx context.Context, args []string, env tracing.LookupEnv, stdout io.Wr
 
 	// Step 6: admin listener (Listen + Serve), not yet ready.
 	admin := adminhttp.New(adminhttp.Options{
-		Addr:     settings.AdminListen,
+		Addr:     obs.AdminListen,
 		Gatherer: reg,
 		ErrorLog: logbridge.NewHTTPErrorLog(factory, time.Now),
 	})
 	if err := admin.Listen(); err != nil {
 		// The error is a config.Error: constant text, the net error only as
 		// the hidden cause for errclass detail (never the address).
-		config.LogError(cfgLog, err)
+		config.LogAdminBindFailed(cfgLog, err)
 		return exitFailure
 	}
 	serveErr := make(chan error, 1)
@@ -175,12 +254,11 @@ func Run(ctx context.Context, args []string, env tracing.LookupEnv, stdout io.Wr
 	if ctx.Err() == nil {
 		// Step 8: tracing.Start (last step).
 		tr, err = tracing.Start(ctx, tracing.Options{
-			Settings: settings,
-			Env:      env,
-			Config:   tcfg,
-			Enabled:  enabled,
-			Metrics:  mf,
-			Logger:   mustLogger(factory, logging.Tracing),
+			Env:     env,
+			Config:  tcfg,
+			Enabled: enabled,
+			Metrics: mf,
+			Logger:  mustLogger(factory, logging.Tracing),
 		})
 		switch {
 		case err != nil && ctx.Err() != nil:
@@ -216,6 +294,12 @@ func Run(ctx context.Context, args []string, env tracing.LookupEnv, stdout io.Wr
 		shutdownTracing(life, tr)
 	}
 	return code
+}
+
+// logProgramming reports a programming error (never a configuration error)
+// through the bootstrap logger: constant message, errclass attributes only.
+func logProgramming(w io.Writer, err error) {
+	logging.BootstrapLogger(w).LogAttrs(context.Background(), slog.LevelError, msgStartupFailed, errclass.LogAttrs(err)...)
 }
 
 // errServePanic is the constant failure delivered when the Serve goroutine panics.

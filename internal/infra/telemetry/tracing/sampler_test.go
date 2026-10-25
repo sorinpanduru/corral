@@ -197,7 +197,7 @@ func TestSamplerAlwaysOnOverridesZeroRatio(t *testing.T) {
 // FR-21, AC-16: OTEL_TRACES_SAMPLER_ARG=0 with sample_ratio=1.0 samples no
 // roots. The config goes through tracing.Resolve (T10), then NewSampler.
 func TestSamplerArgZeroOverridesSampleRatioOne(t *testing.T) {
-	on, cfg, err := tracing.Resolve(envOn(1.0), envMap(map[string]string{"OTEL_TRACES_SAMPLER_ARG": "0"}))
+	on, cfg, err := envResolve(envOn(1.0), envMap(map[string]string{"OTEL_TRACES_SAMPLER_ARG": "0"}))
 	if err != nil || !on {
 		t.Fatalf("Resolve: on=%v err=%v", on, err)
 	}
