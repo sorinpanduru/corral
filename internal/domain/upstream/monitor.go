@@ -604,6 +604,27 @@ func (m *Monitor) HandshakeAdmission() (Params, string) {
 
 var notPrimaryCodes = []int32{10107, 13435, 13436, 11602, 11600, 189, 91}
 
+// notPrimaryCodeName is the fixed table of FR-35 code names.
+func notPrimaryCodeName(c int32) string {
+	switch c {
+	case 10107:
+		return "NotWritablePrimary"
+	case 13435:
+		return "NotPrimaryNoSecondaryOk"
+	case 13436:
+		return "NotPrimaryOrSecondary"
+	case 11602:
+		return "InterruptedDueToReplStateChange"
+	case 11600:
+		return "InterruptedAtShutdown"
+	case 189:
+		return "PrimarySteppedDown"
+	case 91:
+		return "ShutdownInProgress"
+	}
+	return ""
+}
+
 func isNotPrimaryCode(c int32) bool {
 	for _, x := range notPrimaryCodes {
 		if x == c {
@@ -620,23 +641,24 @@ func isNotPrimaryCode(c int32) bool {
 // ok:0 reply. Barrier replies use the top-level code only.
 func (m *Monitor) ReplyCodes(ctx context.Context, hostAddr string, src ReplySource, f ReplyCodeInfo) bool {
 	var code int32
-	var name string
 	switch {
 	case !m.cfg.HasReplicaSet:
 		if f.HasTop && f.OKZero && (f.Top == 91 || f.Top == 11600) {
-			code, name = f.Top, f.TopName
+			code = f.Top
 		} else {
 			return false
 		}
 	case f.HasTop && f.OKZero && isNotPrimaryCode(f.Top):
-		code, name = f.Top, f.TopName
+		code = f.Top
 	case src == Forwarded && f.HasWCE && !f.OKZero && isNotPrimaryCode(f.WCE):
 		code = f.WCE
 	default:
 		return false
 	}
 
-	name = safeCodeName(name)
+	// FR-35 (Amendment 6): the record's code name always comes from the fixed
+	// table, never from the reply, so one code gives one name in every form.
+	name := notPrimaryCodeName(code)
 	m.mu.Lock()
 	h := m.byAdr[hostAddr]
 	if h == nil || m.stopped {
