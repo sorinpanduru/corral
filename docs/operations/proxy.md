@@ -161,6 +161,12 @@ reply has been written to the client. So:
 - a slow client that reads a large reply slowly also holds a lease for as long
   as it takes to write the reply.
 
+A large reply to a client on a slow network can hit `proxy.client_io_timeout`
+before it is fully written: the whole reply must be written within one
+timeout, and when it is not, corral closes that client connection
+(`io_timeout`) and discards the upstream connection. Raise the timeout, or
+use smaller batches, for such clients.
+
 `proxy.client_io_timeout` bounds only client I/O: receiving a started message,
 writing a reply (the whole reply shares one budget, so a slow reader cannot
 stretch it chunk by chunk), and the TLS handshake. It does not bound the time
@@ -301,15 +307,29 @@ the applications need:
 ## Residual exposure
 
 corral does not close every route by which one client can see or affect
-another's operations under a shared identity. These remain, and most of them
-work only if the service user has privileges the guidance above advises
-against (report concerns to security@emag.ro):
+another's operations under a shared identity. Most of these routes work only
+if the service user has privileges the guidance above advises against, but
+the session route below does not, and least privilege does not prevent it
+(report concerns to security@emag.ro).
+
+**Session enumeration and kill, with no special privilege.** `$listSessions`
+and `$listLocalSessions` need no privilege beyond the service user's own
+sessions, and every client runs as that one user. So any client can list the
+session ids of all clients, and then end them with `killSessions` naming
+explicit ids, which corral forwards (only the empty-list form is blocked).
+Granting less to the service user does not stop this. Treat every client of
+one corral instance as able to disrupt every other client's sessions, and
+keep mutually untrusting tenants on separate corral instances and separate
+service users.
+
+The other routes:
 
 - reading `system.profile`, which can show other clients' operations and
   filters;
 - the `$queryStats` aggregation stage;
 - `$listSessions` and `$listLocalSessions` (with or without `allUsers: true`),
-  and the `listSessions` route to the same data;
+  and the `listSessions` route to the same data (see above: no special
+  privilege is needed for the service user's own sessions);
 - `$currentOp` nested inside a sub-pipeline (for example `$unionWith` or
   `$lookup`) wherever the server allows it, because corral inspects only the
   top-level stage;
