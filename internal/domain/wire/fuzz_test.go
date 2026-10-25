@@ -20,6 +20,18 @@ func seeds(f *testing.F) {
 		opQuery(1, 0, "admin.$cmd", 0, -1, doc(eInt32("isMaster", 1))),
 		opQuery(1, 0, "admin.$cmd", 0, -1, doc(eDoc("$query", doc(eInt32("hello", 1))))),
 		{}, {1, 2, 3}, hdrBytes(26, 1, 0, 2013),
+		// Kind-1 sections: body then sequences, sequences then body, and huge
+		// or negative section sizes (security regression).
+		opMsg(1, 0, sec0(ins), sec1("documents", doc(eInt32("_id", 1)), doc(eInt32("_id", 2)))),
+		opMsg(1, 0, sec0(doc(eString("update", "c"), eString("$db", "d"))), sec1("updates", doc(eDoc("q", doc()), eDoc("u", doc())))),
+		opMsg(1, 0, sec0(doc(eString("delete", "c"), eString("$db", "d"))), sec1("deletes", doc(eDoc("q", doc()), eInt32("limit", 0)))),
+		opMsg(1, 0, sec0(doc(eInt32("bulkWrite", 1), eString("$db", "admin"))), sec1("ops", doc(eInt32("insert", 0))), sec1("nsInfo", doc(eString("ns", "d.c")))),
+		opMsg(1, 0, sec1("documents", doc(eInt32("_id", 1))), sec0(ins)),
+		opMsg(1, 0, sec0(ins), rawSec1(0x7FFFFFFF, "documents", doc())),
+		opMsg(1, 0, rawSec1(0x7FFFFFFF, "documents", doc()), sec0(ins)),
+		opMsg(1, 0, sec0(ins), rawSec1(0xFFFFFFFB, "documents", doc())),
+		opMsg(1, 0, rawSec1(0x80000000, "documents"), sec0(ins)),
+		opMsg(1, 0, sec0(ins), cat([]byte{1}, le32(18), cstr("documents"), le32(0x7FFFFFFF))),
 	} {
 		f.Add(m, uint16(len(m)/2))
 	}
