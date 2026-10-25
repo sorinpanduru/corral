@@ -164,7 +164,7 @@ func TestUnreachableSeedCountsWhenItFails_AC61(t *testing.T) {
 	})
 	h.waitCount(A, 1)
 	h.assertNotYetJudged("B has not answered")
-	h.clk.Advance(10 * time.Second) // upstream.connect_timeout elapses; the checker fails B
+	h.clk.Advance(5 * time.Second) // time passes (below the heartbeat); the checker then fails B at its connect timeout
 	g.release(B)
 	waitIncompat(h, "replica_set_name_mismatch", A)
 	h.quiet()
