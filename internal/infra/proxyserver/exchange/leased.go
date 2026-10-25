@@ -39,6 +39,9 @@ func (x *msg) watch(nc net.Conn) (stop func() bool) {
 		case <-closed:
 			gone.Store(true)
 			_ = nc.SetReadDeadline(time.Unix(1, 0))
+		case <-x.s.ctx.Done(): // the drain ended: the exchange is cut (FR-47)
+			gone.Store(true)
+			_ = nc.SetReadDeadline(time.Unix(1, 0))
 		case <-stopCh:
 		}
 	}()
