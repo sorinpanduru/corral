@@ -255,3 +255,85 @@ func Lookup(doc []byte, path ...string) (Element, bool, error) {
 		doc = hit.val
 	}
 }
+
+// PartialStatus says what FirstElementPartial found.
+type PartialStatus int
+
+const (
+	// PartialOK means the first element is complete.
+	PartialOK PartialStatus = iota
+	// PartialNeedMore means the bytes end before the first element does.
+	PartialNeedMore
+	// PartialEmpty means the document is complete and has no elements.
+	PartialEmpty
+)
+
+// FirstElementPartial reads the first element of a document of which only a
+// prefix may be available (FR-38 classification). It returns ErrMalformed only
+// for input that is wrong whatever bytes follow.
+func FirstElementPartial(b []byte) (Element, PartialStatus, error) {
+	if len(b) < 5 {
+		return Element{}, PartialNeedMore, nil
+	}
+	l := int(int32(binary.LittleEndian.Uint32(b)))
+	if l < 5 {
+		return Element{}, PartialNeedMore, ErrMalformed
+	}
+	complete := len(b) >= l
+	if complete {
+		b = b[:l]
+	}
+	if b[4] == 0 {
+		if l == 5 {
+			return Element{}, PartialEmpty, nil
+		}
+		return Element{}, PartialNeedMore, ErrMalformed
+	}
+	limit := len(b)
+	if complete {
+		limit = l - 1
+	}
+	t := Type(b[4])
+	if !validType(t) {
+		return Element{}, PartialNeedMore, ErrMalformed
+	}
+	ke := 5
+	for ke < limit && b[ke] != 0 {
+		ke++
+	}
+	if ke >= limit {
+		if complete {
+			return Element{}, PartialNeedMore, ErrMalformed
+		}
+		return Element{}, PartialNeedMore, nil
+	}
+	vs := ke + 1
+	size, err := payloadSize(t, b[vs:limit])
+	if err != nil {
+		if complete {
+			return Element{}, PartialNeedMore, ErrMalformed
+		}
+		return Element{}, PartialNeedMore, nil
+	}
+	return Element{key: b[5:ke], typ: t, val: b[vs : vs+size : vs+size]}, PartialOK, nil
+}
+
+// ForEach calls fn for each top-level element of doc until fn returns false.
+// Elements are bounds-checked but nested documents are not validated.
+func ForEach(doc []byte, fn func(Element) bool) error {
+	if err := checkHeader(doc); err != nil {
+		return err
+	}
+	limit := len(doc) - 1
+	for p := 4; p < limit; {
+		e, next, err := elementAt(doc, p, limit)
+		if err != nil {
+			return err
+		}
+		if !fn(e) {
+			return nil
+		}
+		p = next
+	}
+	return nil
+}

@@ -153,6 +153,7 @@ type Walker struct {
 	counts      []int
 	topFirst    [MaxCaptureBytes]byte // first top-level key, bounded
 	topFirstLen int
+	topFirstSet bool
 	topRepeats  int
 	capMask     uint64 // captures recording the current element's payload
 	pendLive    uint64
@@ -177,6 +178,64 @@ func NewWalker(captures []Capture) *Walker {
 	}
 	return w
 }
+
+// Reset returns the walker to its initial state with new captures (may be
+// nil), reusing its memory. It lets a caller validate many documents (for
+// example a kind-1 sequence) without one allocation per document.
+func (w *Walker) Reset(captures []Capture) {
+	stack := w.stack[:0]
+	found, vals, counts := w.found, w.vals, w.counts
+	*w = Walker{stack: stack}
+	if n := len(captures); n > 0 {
+		if n > 64 {
+			n = 64
+		}
+		w.caps = captures[:n]
+		w.found = resetBool(found, n)
+		w.vals = resetVals(vals, n)
+		w.counts = resetInts(counts, n)
+	}
+}
+
+func resetBool(b []bool, n int) []bool {
+	if cap(b) < n {
+		return make([]bool, n)
+	}
+	b = b[:n]
+	clear(b)
+	return b
+}
+
+func resetVals(v []Value, n int) []Value {
+	if cap(v) < n {
+		return make([]Value, n)
+	}
+	v = v[:n]
+	clear(v)
+	return v
+}
+
+func resetInts(c []int, n int) []int {
+	if cap(c) < n {
+		return make([]int, n)
+	}
+	c = c[:n]
+	clear(c)
+	return c
+}
+
+// FirstKey returns the first top-level key once it has been read (truncated to
+// MaxCaptureBytes). ok is false before that, and for an empty document.
+func (w *Walker) FirstKey() (key string, ok bool) {
+	if !w.topFirstSet {
+		return "", false
+	}
+	return string(w.topFirst[:min(w.topFirstLen, MaxCaptureBytes)]), true
+}
+
+// Complete reports whether the walker has accepted one whole document with no
+// error. Close still decides the final verdict.
+func (w *Walker) Complete() bool { return w.err == nil && w.st == sDone }
 
 // Consumed returns the number of bytes accepted so far.
 func (w *Walker) Consumed() int64 { return w.pos }
@@ -485,6 +544,7 @@ func (w *Walker) onKey() error {
 	if d == 0 {
 		if f.first {
 			w.topFirstLen = w.keyLen
+			w.topFirstSet = true
 			copy(w.topFirst[:], w.key[:w.keyN])
 		} else if w.keyLen == w.topFirstLen && string(w.key[:w.keyN]) == string(w.topFirst[:min(w.topFirstLen, MaxCaptureBytes)]) {
 			w.topRepeats++
