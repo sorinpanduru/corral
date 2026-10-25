@@ -28,6 +28,7 @@ import (
 	"github.com/sorinpanduru/corral/internal/domain/pool"
 	"github.com/sorinpanduru/corral/internal/domain/upstream"
 	"github.com/sorinpanduru/corral/internal/domain/wire"
+	"github.com/sorinpanduru/corral/internal/infra/telemetry/errclass"
 	"github.com/sorinpanduru/corral/internal/infra/upstreamconn/scram"
 	"github.com/sorinpanduru/corral/internal/infra/upstreamnet"
 )
@@ -307,7 +308,7 @@ func connect(ctx context.Context, cfg Config, host string) (*Conn, error) {
 		t := tls.Client(raw, tc)
 		if err := t.HandshakeContext(ctx); err != nil {
 			raw.Close()
-			return nil, fmt.Errorf("upstreamconn: TLS handshake failed: %w", err)
+			return nil, fmt.Errorf("upstreamconn: TLS handshake failed: %w", errclass.TLSHandshake(err))
 		}
 		nc = t
 	}

@@ -264,7 +264,7 @@ func (s *Server) handle(ctx context.Context, raw net.Conn, id int32, ap netip.Ad
 		tc := tls.Server(raw, s.o.TLS)
 		_ = raw.SetDeadline(time.Now().Add(s.o.IOTimeout))
 		if err := tc.Handshake(); err != nil {
-			s.o.Obs.TLSFailed(ctx, err)
+			s.o.Obs.TLSFailed(ctx, errclass.TLSHandshake(err))
 			reason = proxy.CloseTLSFailure
 			return
 		}

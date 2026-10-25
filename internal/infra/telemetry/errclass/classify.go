@@ -319,9 +319,30 @@ func detailOf(nodes []error) Detail {
 	return DetailOther
 }
 
+// tlsHandshakeError marks an error as coming from the TLS handshake step, so
+// it classifies as network/tls_handshake whatever its type: Go reports a
+// version mismatch ("no supported versions", "protocol version not supported")
+// as a plain error that is neither an alert nor an x509 error. Its text is
+// constant; the cause stays reachable through Unwrap, so deadline and
+// timeout detection still see it.
+type tlsHandshakeError struct{ cause error }
+
+func (*tlsHandshakeError) Error() string   { return "TLS handshake failed" }
+func (e *tlsHandshakeError) Unwrap() error { return e.cause }
+
+// TLSHandshake wraps an error returned by a TLS handshake. It returns nil for
+// nil.
+func TLSHandshake(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &tlsHandshakeError{cause: err}
+}
+
 func isTLSNode(n error) bool {
 	switch n.(type) {
-	case tls.RecordHeaderError, *tls.RecordHeaderError,
+	case *tlsHandshakeError,
+		tls.RecordHeaderError, *tls.RecordHeaderError,
 		*tls.CertificateVerificationError, tls.AlertError,
 		x509.UnknownAuthorityError, *x509.UnknownAuthorityError,
 		x509.HostnameError, *x509.HostnameError,
