@@ -19,6 +19,7 @@ import (
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/sorinpanduru/corral/internal/domain/proxy"
@@ -113,26 +114,57 @@ func (s *Server) Serve(ctx context.Context) error {
 		s.forceClose()
 	})
 	defer stop()
+	var delay time.Duration
 	for {
 		c, err := s.ln.Accept()
 		if err != nil {
 			s.mu.Lock()
 			closed := s.lnClosed
 			s.mu.Unlock()
-			if closed || ctx.Err() != nil {
+			if closed || ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
+			if retryableAccept(err) {
+				// A transient failure (out of descriptors, an aborted
+				// connection) must not end the listener: back off 5 ms
+				// doubling to 1 s, like net/http.
+				if delay == 0 {
+					delay = acceptBackoffMin
+				} else if delay *= 2; delay > acceptBackoffMax {
+					delay = acceptBackoffMax
+				}
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					return nil
+				}
 				continue
-			}
-			if errors.Is(err, net.ErrClosed) {
-				return nil
 			}
 			return err
 		}
+		delay = 0
 		s.admit(c)
 	}
+}
+
+// Accept retry bounds (net/http uses the same).
+const (
+	acceptBackoffMin = 5 * time.Millisecond
+	acceptBackoffMax = time.Second
+)
+
+// retryableAccept reports whether an Accept error is transient.
+func retryableAccept(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) && (ne.Timeout() || ne.Temporary()) { //nolint:staticcheck // Temporary is how net/http classifies accept errors
+		return true
+	}
+	for _, e := range []error{syscall.EMFILE, syscall.ENFILE, syscall.ENOBUFS, syscall.ENOMEM, syscall.ECONNABORTED, syscall.EINTR} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) closeListener() {
@@ -250,7 +282,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.closeListener()
 	sd.ListenerClosed()
 	s.hold(ctx, HoldListenerClosed)
-	// Step 3: idle connections close at once; exchanges in progress finish.
+	// Step 3: from here a first byte read gets 91; idle connections close at
+	// once; exchanges in progress finish.
+	sd.Step3()
 	s.hold(ctx, HoldStep3)
 	s.o.Engine.CloseIdle()
 	// Step 4: the drain. A held drain stays open as if an exchange were in

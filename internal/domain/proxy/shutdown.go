@@ -78,12 +78,19 @@ func (s *Shutdown) Begin() {
 	})
 }
 
-// ListenerClosed records FR-47 step 2: the phase becomes Late and the drain
-// timer starts.
+// Step3 records the start of FR-47 step 3: from now on a message whose first
+// byte is read gets code 91 (PhaseLate).
+func (s *Shutdown) Step3() {
+	s.mu.Lock()
+	s.phase = PhaseLate
+	s.mu.Unlock()
+}
+
+// ListenerClosed records FR-47 step 2: the drain timer starts. The phase stays
+// Serving until Step3, so a message read between the two is served normally.
 func (s *Shutdown) ListenerClosed() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.phase = PhaseLate
 	if s.forced || s.drain <= 0 {
 		s.closeDrain()
 		return

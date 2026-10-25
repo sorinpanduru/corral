@@ -51,6 +51,8 @@ const (
 	msgStartupFailed   = "corral startup failed"
 	msgShutdownFailed  = "corral shutdown step failed"
 	msgServeFailed     = "admin listener serve failed"
+	// msgWireServeFailed is constant: the accept loop failed permanently.
+	msgWireServeFailed = "wire listener serve failed"
 	msgPanic           = "recovered panic in runtime goroutine"
 	// msgOTLPTLSIgnored is constant: no path, value or endpoint (FR-24, FR-29).
 	msgOTLPTLSIgnored = "OTLP TLS settings ignored because the traces endpoint uses http://"
@@ -280,6 +282,7 @@ func Run(ctx context.Context, in Inputs, hooks Hooks) int {
 	svcCtx, svcCancel := context.WithCancel(context.Background())
 	defer svcCancel()
 	code := exitOK
+	wireErr := make(chan error, 1)
 	if ctx.Err() == nil {
 		// Step 8: tracing.Start.
 		tr, err = tracing.Start(ctx, tracing.Options{
@@ -323,7 +326,12 @@ func Run(ctx context.Context, in Inputs, hooks Hooks) int {
 				svc.Start(svcCtx)
 				go func() {
 					defer recoverPanic(life)
-					_ = svc.Serve(svcCtx)
+					// Serve retries transient accept errors itself; an error
+					// here is permanent, and the process exits 1 (below)
+					// rather than keep reporting ready with a dead listener.
+					if err := svc.Serve(svcCtx); err != nil {
+						wireErr <- err
+					}
 				}()
 			}
 			// Step 9: ready.
@@ -336,6 +344,9 @@ func Run(ctx context.Context, in Inputs, hooks Hooks) int {
 			case <-ctx.Done():
 			case err := <-serveErr:
 				logServe(life, err)
+				code = exitFailure
+			case err := <-wireErr:
+				life.LogAttrs(context.Background(), slog.LevelError, msgWireServeFailed, errclass.LogAttrs(err)...)
 				code = exitFailure
 			}
 		}
