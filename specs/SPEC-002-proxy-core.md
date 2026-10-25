@@ -1,8 +1,8 @@
 # SPEC-002: Proxy core (wire listener, handshake, multiplexing pool, upstream)
 
-Status: approved (Owner, 2026-10-24; revision 5); Amendment 1 approved (Owner, 2026-10-24); Amendment 2 approved (Owner, 2026-10-24); Amendment 3 approved (Owner, 2026-10-25); Amendment 4 approved (Owner, 2026-10-25)
+Status: approved (Owner, 2026-10-24; revision 5); Amendment 1 approved (Owner, 2026-10-24); Amendment 2 approved (Owner, 2026-10-24); Amendment 3 approved (Owner, 2026-10-25); Amendment 4 approved (Owner, 2026-10-25); Amendment 5 approved (Owner, 2026-10-25)
 Owner: Sorin Panduru
-Last updated: 2026-10-25 (Amendment 4)
+Last updated: 2026-10-25 (Amendment 5)
 
 ## Goal
 
@@ -157,6 +157,8 @@ the connection string pointing at corral.
       (exit 2), separately from bind failures (exit 1).
   - Binding the wire listener is the last startup step for SPEC-001 FR-18.
     Startup does not wait for the upstream to be reachable (FR-46).
+  - *(Amendment 5)* Errors from accepting connections on the bound wire
+    listener after startup are handled by FR-66.
 - **FR-2:** At most `proxy.max_client_connections` client connections are open
   at once. A connection over the limit is accepted and closed straight away
   with no bytes sent, and is counted (FR-48, `reason=limit_exceeded`).
@@ -459,6 +461,29 @@ the connection string pointing at corral.
       `upstream.hosts` order. A ghost seed (`isreplicaset: true` without
       `setName`) or an unreachable seed never makes the upstream
       incompatible.
+    - *(Amendment 5, clarification)* **When seed results are judged.**
+      Incompatibility from seed results is judged only once every seed in
+      `upstream.hosts` has finished its first check, successfully or not.
+      - An unreachable seed counts as finished once its first check fails.
+        The FR-35 single retry does not apply, because a seed is not yet a
+        usable target.
+      - The reason then comes from the first qualifying seed in
+        `upstream.hosts` order, as above.
+      - Until every seed has finished its first check, the upstream is not
+        incompatible from seed results. It has not been reached, so
+        readiness is `upstream_unavailable` (FR-46), handshakes and requests
+        fail fast with detail `upstream_unavailable` (FR-19, FR-56), and no
+        `upstream incompatible` record is emitted.
+      - *(Owner decision 2026-10-25)* The first checks of all seeds start
+        concurrently at startup (FR-37), and each is bounded by
+        `upstream.connect_timeout`. So this period lasts at most about one
+        `upstream.connect_timeout`.
+      - If a matching member is found first, seed results never make the
+        upstream incompatible (Amendment 3 rule above).
+      - Rationale: the reason no longer depends on the order in which seed
+        checks finish, and a foreign seed that answers first no longer
+        causes a spurious `upstream incompatible` record.
+      - Single-`mongos` mode has one host, so this changes nothing there.
     - The upstream is also incompatible, with `reason=wire_version`, when the
       current primary fails the wire-version acceptance rule.
     - *(Changed by Amendment 3, Owner decision 2026-10-25)* Servers are no
@@ -827,6 +852,9 @@ the connection string pointing at corral.
       listed by any matching member's latest check, and its own latest check
       did not report the matching `setName`.
   - **Check intervals.**
+    - *(Amendment 5, Owner decision 2026-10-25)* At startup, the first
+      checks of all seeds in `upstream.hosts` start concurrently. No seed's
+      first check waits for another's to finish (FR-18).
     - While a usable target is known, each known member is checked every
       `upstream.heartbeat_interval`.
     - While no usable target is known (never reached, election, target
@@ -1070,6 +1098,11 @@ the connection string pointing at corral.
   sessions or cursors; those belong to the clients. A second SIGTERM or
   SIGINT during shutdown, including during step 1, is handled by FR-63
   (Amendments 1 and 2).
+
+  *(Amendment 5)* The accept error that results from closing the listener in
+  step 2 is not an error (FR-66). A permanent accept error also ends the
+  process. It runs this sequence without step 1 and exits with code 1
+  instead of 0 (FR-66).
 
 ### Observability (extends SPEC-001)
 
@@ -1396,6 +1429,9 @@ the connection string pointing at corral.
     - The same single record is emitted, and the process exits 0.
   - corral emits one warn record with `component=lifecycle` and the fixed
     message `shutdown forced by second signal`. Further signals are ignored.
+  - *(Amendment 5, Owner decision 2026-10-25)* When the shutdown was started
+    by a permanent accept error (FR-66), a second signal still exits with
+    code 1, not 0.
 - **FR-64:** Test hooks (G-11).
   - The test hooks used by the acceptance criteria exist only in binaries
     built with the `corraltest` build tag, as defined by ADR-0014 and
@@ -1432,6 +1468,41 @@ the connection string pointing at corral.
   `docs/operations/proxy.md`. The FR-38 request buffer limit L and the FR-58
   reply chunk K are both 65,536 bytes; this is normative, and the document
   states both values.
+
+### Added by Amendment 5
+
+- **FR-66:** Wire listener accept errors after startup.
+  - **Transient errors are retried.** These accept errors are transient:
+    timeouts, errors the platform reports as temporary, `EMFILE`, `ENFILE`,
+    `ENOBUFS`, `ENOMEM`, `ECONNABORTED` and `EINTR`. After one, the
+    listener stays open, and corral tries to accept again after a delay.
+    - The delay starts at 5 ms and doubles after each further consecutive
+      transient error, up to a cap of 1 s.
+    - It resets after a successful accept.
+    - *(Owner decision 2026-10-25)* The delay has no jitter. Transient
+      errors produce no record and no metric.
+  - **A closed listener during shutdown is not an error.** When shutdown
+    closes the wire listener (FR-47 step 2, FR-63), the resulting accept
+    error produces no record and does not change the exit code.
+  - **Any other accept error is permanent.** corral then:
+    - emits exactly one record: level error, `component=lifecycle`, the
+      fixed message `wire listener serve failed`, and `error` and
+      `corral.error.detail` classified per SPEC-001 FR-29. It has no other
+      attributes, and in particular no address, host or port;
+    - stops accepting client connections;
+    - *(Owner decision 2026-10-25)* runs the FR-47 graceful shutdown
+      sequence without step 1. `proxy.shutdown.listener_close_delay` is not
+      applied, because the listener can no longer accept:
+      - `/readyz` reports `shutting_down` (SPEC-001 FR-18);
+      - the wire listener is closed (step 2);
+      - client connections are handled and drained as in steps 3 and 4,
+        within `proxy.shutdown.drain_timeout`;
+      - pool and monitoring connections are closed, and the SPEC-001 FR-34
+        tracing flush runs (step 5);
+    - exits with code 1, not 0.
+    - A second SIGTERM or SIGINT during this shutdown is handled as in FR-63
+      (the drain ends at once, then step 5, and one `shutdown forced by
+      second signal` record), but the process still exits with code 1.
 
 ## Interfaces
 
@@ -1686,13 +1757,14 @@ declares its enumeration. Records carrying `error` also carry
 | `upstream` | warn | `upstream connection failed` | `error`, `corral.error.detail`, `server.address`, `server.port` | rate-limited |
 | `upstream` | warn | `upstream authentication failed` | `error`, `corral.error.detail`, `server.address`, `server.port`, and `db.response.status_code` / `corral.db.response.code_name` from the upstream's reply, when there is one | rate-limited; no username; warn per SPEC-001 FR-32 |
 | `upstream` | warn | `upstream unavailable` | `reason` (readiness reasons) | on transition only |
-| `upstream` | error | `upstream incompatible` | `reason` (incompatibility reasons), `server.address`, `server.port` | on transition only |
+| `upstream` | error | `upstream incompatible` | `reason` (incompatibility reasons), `server.address`, `server.port` | on transition only; *(Amendment 5)* in replica-set mode, not before every seed has finished its first check (FR-18) |
 | `upstream` | info | `upstream available` | none | on transition only |
 | `upstream` | info | `upstream primary changed` | `server.address`, `server.port` | |
 | `upstream` | warn | `upstream target marked not primary` | `error` (`server`), `corral.error.detail` (`other`), `server.address`, `server.port`, `db.response.status_code`, `corral.db.response.code_name` (from the forwarded upstream reply or, per Amendment 2 R-5, from the barrier `ping` reply, so SPEC-001 FR-23 allows them) | rate-limited; an error record reporting the upstream's error |
 | `upstream` | warn | `upstream protocol error` | `error`, `corral.error.detail`, `server.address`, `server.port` | rate-limited; also used for FR-62 unsolicited data |
 | `upstream` | warn | `upstream barrier failed` | `error`, `corral.error.detail`, `server.address`, `server.port` | rate-limited |
 | `lifecycle` | warn | `shutdown forced by second signal` | none | FR-63 (Amendments 1 and 2); once per process |
+| `lifecycle` | error | `wire listener serve failed` | `error`, `corral.error.detail` (SPEC-001 FR-29); no address, host or port | FR-66 (Amendment 5); once, on a permanent accept error after startup; then shutdown and exit 1. Not emitted for transient errors or for the listener closed by shutdown |
 
 ### SPEC-001 amendments requested by this spec (SPEC-001 Amendment 3; package approved by the Owner, 2026-10-24)
 
@@ -1738,6 +1810,10 @@ record uses the existing `lifecycle` component. Amendments 2 and 3 of this
 spec need no SPEC-001 change either; neither adds a new signal.
 Amendment 4 needs none either: its record uses the existing `config`
 component and the existing keys `setting`, `error` and `corral.error.detail`.
+Amendment 5 needs none either: its record uses the existing `lifecycle`
+component and the existing keys `error` and `corral.error.detail`, and the
+FR-18 clarification adds no signal. Transient accept errors produce no
+record and no metric (Owner decision 2026-10-25).
 
 ## Behavior on failure
 
@@ -1745,6 +1821,8 @@ component and the existing keys `setting`, `error` and `corral.error.detail`.
 |---|---|---|
 | Invalid or missing setting, secret on the command line, cross-setting rule broken, unreadable PEM | n/a | exit 2 with SPEC-003 records, before binding anything (FR-55) |
 | Wire listener cannot bind | n/a | one record: level error, `component=config`, message `wire listener bind failed`, `setting=proxy.listen`, class `config` with the bind error's detail, no address; exit 1 (FR-1, Amendment 4) |
+| Transient accept error on the wire listener after startup (Amendment 5) | new connections are accepted after a short delay | retried after 5 ms, doubling to a 1 s cap, no jitter, reset after a successful accept; no record, no metric (FR-66) |
+| Permanent accept error on the wire listener after startup (Amendment 5) | no new connections; in-flight exchanges finish, then connections are closed, as in graceful shutdown | one record: level error, `component=lifecycle`, message `wire listener serve failed`, `error` and `corral.error.detail` only, no address; FR-47 sequence without `listener_close_delay`; exit 1, also after a second signal (FR-66) |
 | Malformed frame, bad length, OP_COMPRESSED, legacy opcode, bad flags or checksum, invalid body, deciding field beyond the buffer | connection closed, no reply | counts; rate-limited warn (FR-5 to FR-7, FR-38) |
 | Duplicated inspected field (including the command name), or a kind-1 section named like an inspected field other than the command name (Amendments 1 and 2) | connection closed, no reply | nothing forwarded when detected before a lease; otherwise the upstream connection is discarded and never receives the complete message; `malformed_message` (FR-38, FR-60) |
 | Malformed OP_QUERY (Amendment 1) | connection closed, no reply | `malformed_message` (FR-8) |
@@ -1754,6 +1832,7 @@ component and the existing keys `setting`, `error` and `corral.error.detail`.
 | Pool full, wait exceeds `pool.checkout_timeout` | error 262 + labels | request read to its end and discarded; checkout span in error (FR-27, FR-38, FR-39) |
 | Wait queue full | error 262 + labels, at once | (FR-27, FR-39) |
 | Upstream never reached, auth failing, or incompatible | error 6 + labels at once; handshakes fail only when never reached or incompatible | readiness 503 with reason (FR-19, FR-56, FR-46) |
+| Replica-set seeds still finishing their first checks at startup, no matching member yet (Amendment 5) | error 6 with detail `upstream_unavailable` | readiness `upstream_unavailable`; incompatibility is judged only after every seed's first check (FR-18) |
 | Election, target marked not primary, connect attempts failing | requests wait, then error 262 | checks the topology; backoff on reconnects (FR-35, FR-56) |
 | Replica-set member in a ghost state, unreachable, or reporting a different `setName` during a rolling restart or re-configuration (Amendment 3) | nothing directly | ghost and unreachable members stay known and are re-checked; a foreign member is ignored but re-checked every heartbeat and re-admitted when it matches again (FR-37) |
 | Not-primary error in a reply (including `writeConcernError` in an `ok: 1` reply) | the reply, unchanged | marks the host, holds leases, re-checks (FR-35); in single-`mongos` mode only top-level 91 / 11600 mark; codes in `writeErrors`, and a `writeConcernError` inside an `ok: 0` reply, never mark (Amendments 1 and 3) |
@@ -1807,6 +1886,9 @@ drivers, which the error codes and labels enable.
   - Shutdown drains in-flight exchanges (FR-47).
   - *(Amendment 3)* Rolling restarts and re-configurations never make corral
     forget a replica-set member permanently (FR-37).
+  - *(Amendment 5)* Transient accept errors, such as running out of file
+    descriptors, do not stop the wire listener; corral backs off and keeps
+    accepting (FR-66).
 - **Resource bounds:**
   - upstream connections ≤ `pool.max_size` + one monitoring connection per
     monitored host;
@@ -2175,6 +2257,9 @@ hook" means a `corraltest`-build hook (FR-64).
     - a non-matching seed alongside a matching member is ignored, and the
       upstream stays compatible. *(Amendment 3)* It is still re-checked on
       the `upstream.heartbeat_interval` schedule (AC-56);
+    - *(Amendment 5)* the single-seed cases above are judged as soon as
+      that seed's first check finishes. With several seeds, timing follows
+      AC-61;
   - **twin, single-`mongos` mode:** a host reporting a replica-set member
     gives `topology_mismatch`, and a standalone gives `standalone`;
   - **twin, both modes:**
@@ -2701,17 +2786,95 @@ Added by Amendment 4:
   - The record contains no host, address or port (marker check, as in
     AC-1).
 
+Added by Amendment 5:
+
+- **AC-60** (FR-66, FR-47, FR-63, FR-49): Unit (accept loop and shutdown
+  orchestration, with an injected listener, a fake clock and an injected
+  exit-status sink; plus the twin where it says so):
+  - **Transient errors:**
+    - the listener returns `EMFILE` three times, then a connection. corral
+      retries after exactly 5 ms, 10 ms and 20 ms (no jitter), accepts the
+      connection, keeps serving, and emits no `wire listener serve failed`
+      record and no other record. No metric changes;
+    - the next transient error after that success is retried after 5 ms
+      again;
+    - a long run of transient errors reaches a 1 s delay and stays there;
+    - a timeout, a temporary error, `ENFILE`, `ENOBUFS`, `ENOMEM`,
+      `ECONNABORTED` and `EINTR` are each retried the same way.
+  - **Listener closed by shutdown:** when the shutdown sequence closes the
+    listener (FR-47 step 2), and separately on a second signal (FR-63), no
+    `wire listener serve failed` record is emitted and the exit status is 0.
+  - **Permanent error:** the listener returns an error not in the transient
+    list (for example `EBADF` or `EINVAL`). Then:
+    - exactly one record is emitted, with level error,
+      `component=lifecycle`, message `wire listener serve failed`, and
+      `error` and `corral.error.detail` values from the SPEC-001 FR-29
+      enums;
+    - the record has no attribute other than those, which the AC-27
+      allowed-keys check covers;
+    - with the listen address's port used as a marker, the marker appears
+      in no output (marker harness);
+    - no further accept is attempted;
+    - **no delay:** with `proxy.shutdown.listener_close_delay=60s`, the
+      shutdown sequence starts at once. The FR-47 step 1 delay is not
+      waited, and `/readyz` reports `shutting_down`;
+    - **drain:** an exchange in progress at the time (held by the twin)
+      completes normally and its connection is then closed; an idle client
+      connection is closed at once;
+    - pool and monitoring connections are closed, and the tracing flush
+      runs;
+    - the run ends with exit status 1, well before the 60 s delay would
+      have ended (within the drain and the SPEC-001 FR-34 flush bound, plus
+      a tolerance).
+  - **Second signal during that shutdown:** with an exchange held in the
+    drain after a permanent accept error, a SIGTERM ends the drain at once.
+    Exactly one `shutdown forced by second signal` record and exactly one
+    `wire listener serve failed` record are emitted, and the exit status is
+    1, not 0.
+- **AC-61** (FR-18, FR-19, FR-46, FR-49, FR-56; Amendment 5 clarification):
+  Unit (domain, fake clock) and twin, replica-set mode, seeds A then B in
+  `upstream.hosts` order, upstream never reached:
+  - **Foreign seed answers first, matching seed later:**
+    - A answers at once with a different `setName`;
+    - B answers with the matching `setName` after a delay shorter than
+      `upstream.connect_timeout`;
+    - until B answers, readiness is `upstream_unavailable`, and a request
+      and a handshake each get code 6 with detail `upstream_unavailable`;
+    - no `upstream incompatible` record is emitted at any point.
+  - **The reason does not depend on the order checks finish:**
+    - B answers at once with a different `setName`, and A answers later as
+      a standalone;
+    - readiness is `upstream_unavailable` until A answers;
+    - then exactly one `upstream incompatible` record is emitted, with
+      `reason=standalone`, and requests and handshakes get detail
+      `upstream_incompatible`;
+    - in a second run where A answers first and B later, the outcome is the
+      same: one record with `reason=standalone`, emitted after both checks
+      have finished.
+  - **Unreachable seed:**
+    - A answers at once with a different `setName`, and B never answers;
+    - readiness stays `upstream_unavailable` until B's first check fails at
+      `upstream.connect_timeout`, with no retry;
+    - then the upstream is incompatible, with one record and
+      `reason=replica_set_name_mismatch`.
+  - **Ghost seed:** with A foreign and B a ghost, the upstream becomes
+    incompatible with `reason=replica_set_name_mismatch` once both first
+    checks have finished. The ghost seed itself never causes incompatibility
+    (FR-18).
+  - **Concurrent first checks (FR-37, Owner decision 2026-10-25):**
+    - seeds A, B and C never answer, and the twin records when each first
+      check connection attempt arrives;
+    - all three arrive before any of them reaches `upstream.connect_timeout`;
+    - in the unit variant (fake clock), all three first checks are started
+      at startup, before any of them completes.
+
 ## Open questions
 
 Must be empty before approval.
 
-None for Amendment 4.
-- The bind-failure record names a record the implementation already emits
-  and that FR-1 already required, so it involves no product decision.
-- The correction to the session-enumeration exposure follows the Owner
-  decision of 2026-10-25 ("document only").
-
-The Owner approves the text.
+None for Amendment 5. The Owner answered OPEN-B1 to OPEN-B3 on 2026-10-25
+(Decisions log), and the text is updated to match. The Owner still approves
+the text.
 
 ## Decisions log
 
@@ -2759,3 +2922,4 @@ part of Q1 (standalone) and Q5 (cross-client commands), and refined Q11/Q9
 | 2026-10-25 | Amendment 3 (incl. challenge-review fixes S1, S2) approved by the Owner and promoted; clarifications confirmed. | Owner approval, 2026-10-25. |
 | 2026-10-25 | **Amendment 4.** A gap found in code review: FR-1 required a record when the wire listener cannot bind, but did not name it. The record is now declared as the implementation emits it: level error, `component=config`, the fixed message `wire listener bind failed`, `setting=proxy.listen`, `error` (class `config`) and `corral.error.detail` from the bind error (for example `EADDRINUSE`), and no address, host or port; exit 1. It mirrors SPEC-003 Amendment 3's `admin listener bind failed`, so that `invalid configuration` alone still identifies load-time config errors (exit 2). FR-1, the log events table (new `config` row), Behavior on failure, AC-1 (adjusted) and new AC-59 are updated. No SPEC-001 change is needed: the record uses an existing component and existing keys. <br>**Owner decision 2026-10-25 ("document only"), session-enumeration exposure:** <br>- The Amendment 3 residual-exposure text was wrong to say least privilege mitigates `$listSessions` / `$listLocalSessions`. For the caller's own user these stages need no special privilege. <br>- Under the shared upstream identity, any client can therefore list every client's session IDs, then end those sessions through `killSessions` with explicit IDs, which FR-33 forwards. `endSessions` and `abortTransaction` / `commitTransaction` with another client's `lsid` work the same way. <br>- Least privilege does not prevent this. corral does not block it, by Owner decision. FR-51 operator documentation must state it. <br>- Changes: Data and compliance (the first residual list now has only the `allUsers` / other-users forms; a new session enumeration and termination route; the explicit-`lsid` bullet no longer says a leaked ID is needed; the closing mitigation paragraph), NFR Security "Cross-client effects", and a new FR-51 bullet. FR-33 and blocking behaviour are unchanged, and no AC changes, because the change is documentation only. | Gap found in code review, relayed by the Orchestrator, 2026-10-25; Owner decision "document only" on the session-enumeration exposure, relayed by the Orchestrator, 2026-10-25. Promotion awaits Owner approval of the text. |
 | 2026-10-25 | Amendment 4 approved by the Owner and promoted (bind-failure record; session enumeration/termination residual exposure documented by Owner decision, flagged for security@emag.ro). | Owner approval, 2026-10-25. |
+| 2026-10-25 | **Amendment 5.** Two points from code review. <br>**(1) Wire listener accept errors (new FR-66):** <br>- Transient accept errors (timeouts, temporary errors, `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`, `ECONNABORTED`, `EINTR`) are retried after 5 ms, doubling to a 1 s cap, and the delay resets after a successful accept. <br>- A listener closed by shutdown is not an error. <br>- Any other accept error is permanent. It produces one record (level error, `component=lifecycle`, fixed message `wire listener serve failed`, `error` and `corral.error.detail` only, no address, host or port), then shutdown and exit 1. This declares a record that was emitted but not declared, in the same way as Amendment 4. <br>- Also updated: FR-1 cross-reference, FR-47 note, log events table (new `lifecycle` row), Behavior on failure (two rows), NFR Availability, and new AC-60. <br>**(2) FR-18 clarification:** <br>- In replica-set mode, incompatibility from seed results is judged only once every seed has finished its first check. An unreachable seed counts once its check fails, with no FR-35 retry. The reason comes from the first qualifying seed in `upstream.hosts` order. <br>- Until then, readiness and fail-fast report `upstream_unavailable`, for at most about one `upstream.connect_timeout`. <br>- Rationale: the reason no longer depends on the order checks finish, and there is no spurious `upstream incompatible` record when a foreign seed answers first. <br>- Also updated: log events table note on `upstream incompatible`, Behavior on failure (one row), AC-18 (note), and new AC-61. <br>No SPEC-001 change is needed. <br>**Owner decisions 2026-10-25 on the open questions:** <br>- **OPEN-B1 = (a):** after a permanent accept error, corral runs the FR-47 graceful sequence without the listener-close delay (`/readyz` `shutting_down`, drain within `proxy.shutdown.drain_timeout`, pools closed, tracing flushed), then exits 1. A second signal during it ends the drain per FR-63 but still exits 1 (FR-47 note, FR-63, FR-66, Behavior on failure, AC-60). <br>- **OPEN-B2:** transient accept errors produce no record and no metric, and the backoff has no jitter (FR-66, SPEC-001 note, Behavior on failure, AC-60). <br>- **OPEN-B3:** every seed's first check starts concurrently at startup, so the FR-18 "not yet judged" period lasts at most about one `upstream.connect_timeout` (FR-18, FR-37, AC-61). | Gaps from code review, relayed by the Orchestrator, 2026-10-25; Owner decisions on OPEN-B1 to OPEN-B3, relayed by the Orchestrator, 2026-10-25. Promotion awaits Owner approval of the text. |
