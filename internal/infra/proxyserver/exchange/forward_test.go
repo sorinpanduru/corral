@@ -74,7 +74,7 @@ func TestForwardingByteFaithful_AC6(t *testing.T) {
 		"plain find":           rawwire.OpMsg(rawwire.OpMsgOpts{RequestID: 11, Body: find("c", bson.E{Key: "filter", Value: bson.D{{Key: "a", Value: 1}}})}),
 		"exhaustAllowed":       rawwire.OpMsg(rawwire.OpMsgOpts{RequestID: 12, Flags: flagExhaust | 1<<17, Body: find("c")}),
 		"valid checksum":       rawwire.OpMsg(rawwire.OpMsgOpts{RequestID: 13, Checksum: rawwire.ChecksumValid, Body: find("c")}),
-		"checksum+exhaust":     rawwire.OpMsg(rawwire.OpMsgOpts{RequestID: 14, Flags: flagExhaust, Checksum: rawwire.ChecksumValid, Body: find("c")}),
+		"checksum+exhaust":     rawwire.OpMsg(rawwire.OpMsgOpts{RequestID: 14, Flags: flagExhaust | 1<<17, Checksum: rawwire.ChecksumValid, Body: find("c")}),
 		"readPreference":       rawwire.OpMsg(rawwire.OpMsgOpts{RequestID: 15, Body: find("c", bson.E{Key: "$readPreference", Value: bson.D{{Key: "mode", Value: "secondary"}}})}),
 		"kind-1 sequence":      rawwire.OpMsg(rawwire.OpMsgOpts{RequestID: 16, Body: bson.D{{Key: "insert", Value: "c"}, {Key: "$db", Value: "shop"}}, Sequences: []rawwire.Sequence{{ID: "documents", Docs: []bson.D{{{Key: "_id", Value: 1}}, {{Key: "_id", Value: 2}}}}}}),
 		"kind-1 first":         rawwire.OpMsg(rawwire.OpMsgOpts{RequestID: 17, SequencesFirst: true, Body: bson.D{{Key: "insert", Value: "c"}, {Key: "$db", Value: "shop"}}, Sequences: []rawwire.Sequence{{ID: "documents", Docs: []bson.D{{{Key: "_id", Value: 1}}}}}}),
