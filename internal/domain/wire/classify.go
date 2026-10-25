@@ -201,13 +201,21 @@ func classifyMsg(h Header, prefix []byte, fits bool) (Request, error) {
 		if kind != 1 || pos+5 > len(prefix) {
 			return Request{}, ErrMalformed()
 		}
-		size := int(int32(binary.LittleEndian.Uint32(prefix[pos+1:])))
-		if size < 5 || pos+1+size > len(prefix) {
+		// int64 arithmetic: a hostile size must not wrap on 32-bit platforms.
+		size := int64(int32(binary.LittleEndian.Uint32(prefix[pos+1:])))
+		if size < 5 || size > int64(len(prefix))-int64(pos)-1 {
 			return Request{}, ErrMalformed()
 		}
-		pos += 1 + size
+		pos += 1 + int(size)
 	}
 	doc := prefix[pos:]
+	// The body may be followed by kind-1 sections: cut it to its declared
+	// length (bounded by the prefix).
+	if len(doc) >= 4 {
+		if l := int64(int32(binary.LittleEndian.Uint32(doc))); l >= 5 && l <= int64(len(doc)) {
+			doc = doc[:l]
+		}
+	}
 	first, st, err := bson.FirstElementPartial(doc)
 	if err != nil || st != bson.PartialOK {
 		return Request{}, ErrMalformed()

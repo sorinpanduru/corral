@@ -549,6 +549,7 @@ func (m *Monitor) ReplyCodes(ctx context.Context, hostAddr string, src ReplySour
 		return false
 	}
 
+	name = safeCodeName(name)
 	m.mu.Lock()
 	h := m.byAdr[hostAddr]
 	if h == nil || m.stopped {
@@ -605,4 +606,20 @@ func (m *Monitor) PoolAuthResult(ctx context.Context, hostAddr string, err error
 	m.pump()
 	m.mu.Unlock()
 	m.run(ev)
+}
+
+// safeCodeName keeps an upstream codeName only if it looks like one (letters,
+// digits, underscore, at most 64 bytes); anything else would be upstream text
+// on its way to logs and is dropped (SPEC-001 FR-24).
+func safeCodeName(s string) string {
+	if len(s) == 0 || len(s) > 64 {
+		return ""
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_') {
+			return ""
+		}
+	}
+	return s
 }

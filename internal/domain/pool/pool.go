@@ -74,7 +74,9 @@ const (
 	OrderRoundRobin
 )
 
-// Config bounds the pool.
+// Config bounds the pool. CheckoutTimeout 0 means no timeout and is not a
+// valid setting: SPEC-002 requires pool.checkout_timeout > 0, enforced by the
+// settings rule (T17); the pool only tolerates 0 for tests.
 type Config struct {
 	MaxSize, MinSize, MaxWaiters int
 	CheckoutTimeout, MaxIdleTime time.Duration
