@@ -18,9 +18,10 @@ type host struct {
 
 	checking bool
 	retrying bool
-	checked  bool // has been checked at least once
-	reported bool // a check has finished at least once (success or failure)
-	last     time.Time
+	checked  bool      // has been checked at least once
+	reported bool      // a check has finished at least once (success or failure)
+	last     time.Time // when the latest check started
+	done     time.Time // when the latest check finished
 
 	override    time.Time // immediate-check time (FR-37); zero when none
 	hasOverride bool
@@ -29,7 +30,11 @@ type host struct {
 	hasReport bool
 	rep       Report // latest successful report
 
-	dropped   bool          // an arbiter: not monitored
+	dropped bool // an arbiter: not monitored
+	// authBad: an authenticating check of this host failed (a transient
+	// authentication failure is a failed check, FR-22); it is not a usable
+	// target until an authenticating check succeeds.
+	authBad   bool
 	markedNP  bool          // marked not primary or unusable by a reply code (FR-35)
 	markSeq   uint64        // launches with a sequence above this started after the marking
 	authDelay time.Duration // FR-22, FR-56: added to the heartbeat while authentication fails
@@ -180,6 +185,11 @@ func (m *Monitor) dueAt(h *host, now time.Time) (time.Time, bool) {
 		return now, true
 	}
 	due := h.last.Add(m.interval(h))
+	// SDAM: checks are at least MinHeartbeat apart, counted from the end of
+	// the previous one, so a check that took long is not followed at once.
+	if f := h.done.Add(MinHeartbeat); !h.done.IsZero() && due.Before(f) {
+		due = f
+	}
 	if m.authFailing && m.cur.HasTarget && m.cur.Target == h.addr {
 		due = due.Add(h.authDelay)
 	}
@@ -237,7 +247,7 @@ func (m *Monitor) launch(h *host, retry, fresh bool) {
 		h.hasOverride = false
 	}
 	isTarget := m.cur.HasTarget && m.cur.Target == h.addr
-	req := CheckRequest{Host: h.addr, Authenticate: m.cfg.Authenticate && isTarget}
+	req := CheckRequest{Host: h.addr, Authenticate: m.cfg.Authenticate && (isTarget || h.authBad)}
 	req.Fresh = fresh || (isTarget && m.authFailing)
 	ctx := m.ctx
 	m.seq++
@@ -294,6 +304,7 @@ func (m *Monitor) apply(h *host, req CheckRequest, rep Report, seq uint64) {
 	}
 	ctx := m.ctx
 	ev := &events{}
+	h.done = m.clk.Now()
 	if rep.Err != nil {
 		isTarget := m.cur.HasTarget && m.cur.Target == h.addr
 		if isTarget && !h.retrying && rep.Transient {
@@ -306,7 +317,13 @@ func (m *Monitor) apply(h *host, req CheckRequest, rep Report, seq uint64) {
 		}
 		h.retrying, h.checking, h.up = false, false, false
 		h.reported = true
+		if req.Authenticate {
+			h.authBad = true
+		}
 	} else {
+		if req.Authenticate && rep.Err == nil && (rep.AuthErr == nil || IsAuthFailed(rep.AuthErr)) {
+			h.authBad = false
+		}
 		h.reported = true
 		h.retrying, h.checking, h.up = false, false, true
 		h.hasReport, h.rep = true, rep
@@ -382,7 +399,7 @@ func (m *Monitor) scheduleHost(h *host) {
 	now := m.clk.Now()
 	at := now
 	if h.checked {
-		if floor := h.last.Add(MinHeartbeat); floor.After(at) {
+		if floor := h.floor(); floor.After(at) {
 			at = floor
 		}
 	}
@@ -435,7 +452,7 @@ func (m *Monitor) evaluate() evalResult {
 	var chosen *host
 	cand := func(h *host) bool {
 		return h.up && h.hasReport && m.matching(h.rep) && h.rep.IsWritablePrimary &&
-			!h.rep.ArbiterOnly && !h.markedNP && !m.stale(h.rep)
+			!h.rep.ArbiterOnly && !h.markedNP && !h.authBad && !m.stale(h.rep)
 	}
 	if m.cur.HasTarget {
 		if h := m.byAdr[m.cur.Target]; h != nil && cand(h) {
@@ -505,7 +522,7 @@ func (m *Monitor) evaluateMongos() evalResult {
 		case rep.IsMongos && !WireAccepted(rep.Params.MinWire, rep.Params.MaxWire):
 			r.incompat, r.reason = true, ReasonWireVersion
 		case rep.IsMongos:
-			if !r.hasTarget && h.up && !h.markedNP {
+			if !r.hasTarget && h.up && !h.markedNP && !h.authBad {
 				r.target, r.hasTarget, r.params = h.addr, true, rep.Params
 			}
 			continue
@@ -749,4 +766,14 @@ func (m *Monitor) prune(ev *events) {
 		kept = append(kept, h)
 	}
 	m.hosts = kept
+}
+
+// floor is the earliest time of the next check: MinHeartbeat after the later
+// of the previous check's start and end.
+func (h *host) floor() time.Time {
+	t := h.last
+	if h.done.After(t) {
+		t = h.done
+	}
+	return t.Add(MinHeartbeat)
 }
