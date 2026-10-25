@@ -150,7 +150,9 @@ func CheckReplyHeader(h Header, maxLen int32) error {
 		return ErrMessageTooLarge()
 	}
 	if h.OpCode != OpMsg {
-		return ErrUnexpectedResponse()
+		// FR-58: unexpected_response is for moreToCome and unmatched
+		// responseTo; any other opcode is a malformed header.
+		return ErrMalformed()
 	}
 	if h.Length < minOpMsgLen {
 		return ErrMalformed()

@@ -349,6 +349,18 @@ func classifyQuery(h Header, prefix []byte, fits bool) (Request, error) {
 					return Request{}, ErrMalformed()
 				}
 			}
+		} else if fits {
+			// FR-8: a `$query` field anywhere in the query document wraps the
+			// command; other wrapper fields (such as $readPreference, which
+			// may come first) are ignored. Find its first inner key.
+			pw := bson.NewWalker([]bson.Capture{{Path: []string{"$query"}, Mode: bson.CaptureFirstKey}})
+			if pw.Write(qdoc) == nil && pw.Close() == nil {
+				if v, ok := pw.Captured(0); ok {
+					if k, isStr := v.StringValue(); isStr && k != "" {
+						wrapped, cmd = true, k
+					}
+				}
+			}
 		}
 	case bson.PartialNeedMore:
 		if fits {

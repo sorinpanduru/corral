@@ -25,6 +25,8 @@ const (
 var inspected = [...]string{"$db", "lsid", "txnNumber", "autocommit", "startTransaction", "pipeline", "collection"}
 
 const (
+	idxTxnNumber  = 2
+	idxAutocommit = 3
 	idxPipeline   = 5
 	idxCollection = 6
 	maxIDLen      = 16 // longest candidate name ("startTransaction")
@@ -35,6 +37,9 @@ func requestCaptures() []bson.Capture {
 	for i, n := range inspected {
 		c[i] = bson.Capture{Path: []string{n}, Mode: bson.CapturePresence}
 	}
+	// autocommit's value feeds the FR-39 error labels, which are determined
+	// from the whole message (FR-38).
+	c[idxAutocommit].Mode = bson.CaptureValue
 	return c
 }
 
@@ -444,6 +449,30 @@ func (v *MsgValidator) rules() error {
 		}
 	}
 	return nil
+}
+
+// TxnNumberPresent reports whether the body carried a top-level txnNumber, as
+// far as the bytes written so far show.
+func (v *MsgValidator) TxnNumberPresent() bool {
+	if v.body == nil {
+		return false
+	}
+	_, ok := v.body.Captured(idxTxnNumber)
+	return ok
+}
+
+// AutocommitFalse reports whether the body carried a top-level
+// `autocommit: false`, as far as the bytes written so far show.
+func (v *MsgValidator) AutocommitFalse() bool {
+	if v.body == nil {
+		return false
+	}
+	val, ok := v.body.Captured(idxAutocommit)
+	if !ok {
+		return false
+	}
+	b, isBool := val.Bool()
+	return isBool && !b
 }
 
 // Close ends the message: it must be complete, and the checksum must match.
