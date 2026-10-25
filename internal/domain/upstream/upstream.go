@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/sorinpanduru/corral/internal/domain/health"
+	"github.com/sorinpanduru/corral/internal/domain/pool"
 )
 
 // Fixed constants.
@@ -34,6 +35,9 @@ type Config struct {
 	HasReplicaSet     bool // false: single-mongos mode
 	HeartbeatInterval time.Duration
 	Authenticate      bool // mechanism is not "none"
+	// Rand supplies jitter in [0,1) for the authentication backoff; nil uses
+	// math/rand.
+	Rand func() float64
 }
 
 // Params are the upstream parameters read from a hello reply.
@@ -59,15 +63,22 @@ type Report struct {
 	Secondary         bool
 	ArbiterOnly       bool
 	IsMongos          bool
-	SetName           string
-	HasSetName        bool
-	Hosts, Passives   []string
-	Primary           string
-	ElectionID        [12]byte
-	HasElectionID     bool
-	SetVersion        int64
-	HasSetVersion     bool
-	Params            Params
+	// IsReplicaSet is hello's isreplicaset: true without a setName marks a
+	// ghost member (starting up, restarting or not yet initiated).
+	IsReplicaSet bool
+	// Transient says a failed check (Err) was a network, TLS or timeout error.
+	// Only transient failures of the target are retried once (FR-35). The
+	// checker classifies; the domain does not inspect transport errors.
+	Transient       bool
+	SetName         string
+	HasSetName      bool
+	Hosts, Passives []string
+	Primary         string
+	ElectionID      [12]byte
+	HasElectionID   bool
+	SetVersion      int64
+	HasSetVersion   bool
+	Params          Params
 }
 
 // CheckRequest asks the Checker for one check.
@@ -81,6 +92,9 @@ type CheckRequest struct {
 // on failure.
 type Checker interface {
 	Check(ctx context.Context, req CheckRequest) Report
+	// CloseHost closes the monitoring connection to a host that left the
+	// known set (FR-37), with reason pool.CloseIdle.
+	CloseHost(host string, reason pool.CloseReason)
 }
 
 // AuthFailed is an authentication failure that counts for the authentication

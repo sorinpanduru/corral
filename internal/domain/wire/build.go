@@ -99,6 +99,7 @@ type HelloReply struct {
 	Secondary         bool
 	ArbiterOnly       bool
 	IsMongos          bool
+	IsReplicaSet      bool // isreplicaset: a ghost member when there is no setName
 	SetName           string
 	Hosts             []string
 	Passives          []string
@@ -176,6 +177,8 @@ func ParseHelloReply(doc []byte) (HelloReply, error) {
 			if s, ok := e.StringValue(); ok && s == "isdbgrid" {
 				r.IsMongos = true
 			}
+		case "isreplicaset":
+			r.IsReplicaSet, _ = e.Bool()
 		case "setName":
 			r.SetName, _ = e.StringValue()
 		case "hosts":

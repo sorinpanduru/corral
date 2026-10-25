@@ -8,6 +8,7 @@ import (
 	"github.com/sorinpanduru/corral/internal/domain/pool"
 	"github.com/sorinpanduru/corral/internal/domain/upstream"
 	"github.com/sorinpanduru/corral/internal/domain/wire"
+	"github.com/sorinpanduru/corral/internal/infra/telemetry/errclass"
 )
 
 // Checker runs the monitoring checks (FR-37). It keeps one monitoring
@@ -119,7 +120,7 @@ func (k *Checker) Check(ctx context.Context, req upstream.CheckRequest) upstream
 		}
 		if err != nil {
 			k.obs.MonitorConnFailed(ctx, host, err)
-			rep.Err = err
+			rep.Err, rep.Transient = err, transient(err)
 			return rep
 		}
 		m.c = c
@@ -129,7 +130,7 @@ func (k *Checker) Check(ctx context.Context, req upstream.CheckRequest) upstream
 		if err != nil {
 			m.drop(k, ctx, host, pool.CloseError)
 			k.obs.MonitorConnFailed(ctx, host, err)
-			rep.Err = err
+			rep.Err, rep.Transient = err, transient(err)
 			return rep
 		}
 	}
@@ -137,14 +138,14 @@ func (k *Checker) Check(ctx context.Context, req upstream.CheckRequest) upstream
 
 	if req.Authenticate && k.auth.enabled() && !m.c.authed {
 		if aerr := k.auth.authenticate(ctx, m.c); aerr != nil {
+			// The monitor reports authentication outcomes (one reporter). A
+			// transient failure is a failed attempt to make the connection
+			// ready: report it as a connect error and drop the connection.
 			rep.AuthErr = aerr
-			if upstream.IsAuthFailed(aerr) {
-				k.obs.AuthFailed(ctx, "monitor", host, aerr)
-			} else {
+			if !upstream.IsAuthFailed(aerr) {
 				m.drop(k, ctx, host, pool.CloseError)
+				k.obs.MonitorConnFailed(ctx, host, aerr)
 			}
-		} else {
-			k.obs.AuthSucceeded(ctx, "monitor", host)
 		}
 	}
 	return rep
@@ -155,6 +156,7 @@ func fillReport(r *upstream.Report, h wire.HelloReply) {
 	r.Secondary = h.Secondary
 	r.ArbiterOnly = h.ArbiterOnly
 	r.IsMongos = h.IsMongos
+	r.IsReplicaSet = h.IsReplicaSet
 	r.SetName, r.HasSetName = h.SetName, h.SetName != ""
 	r.Hosts, r.Passives, r.Primary = h.Hosts, h.Passives, h.Primary
 	r.ElectionID, r.HasElectionID = h.ElectionID, h.HasElectionID
@@ -164,4 +166,11 @@ func fillReport(r *upstream.Report, h wire.HelloReply) {
 		MaxWriteBatchSize: h.MaxWriteBatchSize, LogicalSessionTimeoutMinutes: h.LogicalSessionTimeoutMinutes,
 		HasLSTM: h.HasLSTM, MinWire: h.MinWire, MaxWire: h.MaxWire,
 	}
+}
+
+// transient reports whether a failed check was a network, TLS or timeout
+// error, the only kind the monitor retries (FR-35).
+func transient(err error) bool {
+	c, _ := errclass.Classify(err)
+	return c == errclass.ClassNetwork || c == errclass.ClassTimeout
 }
