@@ -57,6 +57,13 @@ func (p *probe) ReplyHeld(id int32, n int) {
 	p.mu.Unlock()
 }
 
+// ConnClosed forgets a closed connection: /conns lists open connections only.
+func (p *probe) ConnClosed(id int32) {
+	p.mu.Lock()
+	delete(p.conns, id)
+	p.mu.Unlock()
+}
+
 var _ exchange.Probe = (*probe)(nil)
 
 // startProbe serves the loopback-only probe endpoints and writes the address

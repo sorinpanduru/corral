@@ -175,6 +175,10 @@ func (s *session) endIdle() bool {
 func (e *Engine) Serve(ctx context.Context, cc *ClientConn) (reason proxy.CloseReason) {
 	s := &session{e: e, ctx: ctx, cc: cc, budget: proxy.NewIOBudget(e.d.IOTimeout, e.d.Clock),
 		ids: wire.NewClientIDs(), buf: make([]byte, proxy.RequestBufferLimit)}
+	if cl, ok := e.d.Probe.(interface{ ConnClosed(connID int32) }); ok {
+		// The probe lists only open connections (FR-64).
+		defer cl.ConnClosed(cc.ID)
+	}
 	defer func() {
 		if v := recover(); v != nil {
 			if s.lease != nil {
