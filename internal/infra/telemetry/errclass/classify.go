@@ -289,6 +289,11 @@ func detailOf(nodes []error) Detail {
 		return DetailDeadlineExceeded
 	case hasTarget(nodes, context.Canceled):
 		return DetailCanceled
+	case anyNode(nodes, func(n error) bool { _, ok := n.(*tlsHandshakeError); return ok }):
+		// The phase decides (FR-45): a peer that resets or closes during the
+		// handshake, such as a plaintext server, is still a TLS failure.
+		// Timeouts and cancellation win, above.
+		return DetailTLSHandshake
 	}
 	for _, e := range errnoDetails {
 		if hasTarget(nodes, e.errno) {
