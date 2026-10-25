@@ -336,3 +336,57 @@ Summary:
 | `log.level` | `--log.level=<value>` | `CORRAL_LOG_LEVEL` | enum (debug, info, warn, error) | default `info` | no |
 | `tracing.enabled` | `--tracing.enabled=<value>` | `CORRAL_TRACING_ENABLED` | bool | default `false` | no |
 | `tracing.sample_ratio` | `--tracing.sample_ratio=<value>` | `CORRAL_TRACING_SAMPLE_RATIO` | float | default `1.0` | no |
+
+### Proxy settings (SPEC-002)
+
+These settings configure the MongoDB wire listener, the upstream connection
+pool and the upstream. `upstream.hosts` is required. With the default
+`upstream.auth.mechanism` (`SCRAM-SHA-256`) the service credentials are
+required too; use `--upstream.auth.mechanism=none` for an upstream without
+authentication. All of them are read once at startup, and changing any of
+them (including credentials and TLS material) needs a restart. See
+[proxy.md](proxy.md) for what they mean for operations.
+
+| Logical name | Environment variable | Default | Meaning |
+|---|---|---|---|
+| `proxy.listen` | `CORRAL_PROXY_LISTEN` | `127.0.0.1:27017` | Wire listener address, `host:port`, port 1 to 65535. |
+| `proxy.max_client_connections` | `CORRAL_PROXY_MAX_CLIENT_CONNECTIONS` | `10000` | Maximum open client connections, 1 to 1,000,000. A connection over the limit is closed with no bytes written. |
+| `proxy.client_idle_timeout` | `CORRAL_PROXY_CLIENT_IDLE_TIMEOUT` | `0s` | Close a client connection idle this long. `0s` disables it. |
+| `proxy.client_io_timeout` | `CORRAL_PROXY_CLIENT_IO_TIMEOUT` | `30s` | Maximum time to receive a started client message, to write a reply to a client, or to complete a client TLS handshake. It does not bound the wait for the upstream. |
+| `proxy.tls.enabled` | `CORRAL_PROXY_TLS_ENABLED` | `false` | Require TLS on the wire listener. Needs `proxy.tls.cert_path` and `proxy.tls.key`. |
+| `proxy.tls.cert_path` | `CORRAL_PROXY_TLS_CERT_PATH` | unset | Certificate chain (PEM file), read once at startup. |
+| `proxy.tls.key` | `CORRAL_PROXY_TLS_KEY` | unset | Private key (PEM). A secret setting: supply it with `proxy.tls.key_file` (`--proxy.tls.key_file=<path>`) or `CORRAL_PROXY_TLS_KEY_FILE`. |
+| `proxy.tls.client_ca_path` | `CORRAL_PROXY_TLS_CLIENT_CA_PATH` | unset | CA bundle (PEM file). When set, clients must present a certificate it verifies (mutual TLS). |
+| `proxy.shutdown.listener_close_delay` | `CORRAL_PROXY_SHUTDOWN_LISTENER_CLOSE_DELAY` | `0s` | Keep serving this long after shutdown starts before closing the listener. |
+| `proxy.shutdown.drain_timeout` | `CORRAL_PROXY_SHUTDOWN_DRAIN_TIMEOUT` | `20s` | Maximum time, from closing the listener, to let exchanges in progress finish. |
+| `pool.max_size` | `CORRAL_POOL_MAX_SIZE` | `10` | Maximum upstream connections in the pool, 1 to 10,000. |
+| `pool.min_size` | `CORRAL_POOL_MIN_SIZE` | `0` | Connections kept open while the upstream is available. Must not exceed `pool.max_size`. |
+| `pool.max_waiters` | `CORRAL_POOL_MAX_WAITERS` | `proxy.max_client_connections` | Maximum requests waiting for an upstream connection. |
+| `pool.checkout_timeout` | `CORRAL_POOL_CHECKOUT_TIMEOUT` | `5s` | Maximum wait for an upstream connection. |
+| `upstream.hosts` | `CORRAL_UPSTREAM_HOSTS` | required | Comma-separated seed addresses (`host:port`), never a connection string. Exactly one when `upstream.replica_set` is unset. |
+| `upstream.replica_set` | `CORRAL_UPSTREAM_REPLICA_SET` | unset | Replica set name. When set, corral targets that set's current primary. When unset, the single host must be a `mongos`. |
+| `upstream.auth.mechanism` | `CORRAL_UPSTREAM_AUTH_MECHANISM` | `SCRAM-SHA-256` | `SCRAM-SHA-256` or `none`. |
+| `upstream.auth.source` | `CORRAL_UPSTREAM_AUTH_SOURCE` | `admin` | Authentication database. It must not contain `/`, `\`, `.`, `"`, `$` or a space. |
+| `upstream.auth.username` | `CORRAL_UPSTREAM_AUTH_USERNAME` | unset | Service identity username. A secret setting: `upstream.auth.username_file`, `CORRAL_UPSTREAM_AUTH_USERNAME_FILE`. |
+| `upstream.auth.password` | `CORRAL_UPSTREAM_AUTH_PASSWORD` | unset | Service identity password. A secret setting: `upstream.auth.password_file`, `CORRAL_UPSTREAM_AUTH_PASSWORD_FILE`. Use `/run/secrets/<name>` rather than a literal `<YOUR_DB_PASSWORD>`. |
+| `upstream.connect_timeout` | `CORRAL_UPSTREAM_CONNECT_TIMEOUT` | `10s` | Limit to connect, handshake and authenticate an upstream connection, and for one monitoring check. |
+| `upstream.heartbeat_interval` | `CORRAL_UPSTREAM_HEARTBEAT_INTERVAL` | `10s` | Interval between upstream health and topology checks, 500 ms to 1 hour. |
+| `upstream.max_idle_time` | `CORRAL_UPSTREAM_MAX_IDLE_TIME` | `5m` | Close idle pool connections after this long, keeping `pool.min_size`. `0s` disables it. |
+| `upstream.tls.enabled` | `CORRAL_UPSTREAM_TLS_ENABLED` | `false` | Use verified TLS to the upstream. |
+| `upstream.tls.ca_path` | `CORRAL_UPSTREAM_TLS_CA_PATH` | unset | CA bundle (PEM file) for verifying the upstream; with `upstream.tls.enabled` and no path, system roots are used. |
+
+Cross-setting rules (a violation is a configuration error naming the primary
+setting):
+
+- `proxy.tls.enabled` needs both `proxy.tls.cert_path` and `proxy.tls.key`,
+  and the two must form a usable key pair;
+- `proxy.tls.client_ca_path` needs `proxy.tls.enabled`;
+- `pool.min_size` must not exceed `pool.max_size`;
+- with `upstream.auth.mechanism=SCRAM-SHA-256`, both username and password
+  are required; with `none`, neither may be set;
+- `upstream.tls.ca_path` needs `upstream.tls.enabled`.
+
+The PEM file settings (`proxy.tls.cert_path`, `proxy.tls.client_ca_path`,
+`upstream.tls.ca_path`) are read once, in full, during loading. A missing,
+oversized or invalid file is a configuration error that names the setting and
+never shows the path or the content.

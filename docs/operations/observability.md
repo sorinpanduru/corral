@@ -370,3 +370,9 @@ This counter counts only queue-full drops. Spans lost to failed exports or to
 the shutdown flush deadline are not counted. Metrics are registered in a
 private registry and served by `/metrics`. Names must be in the embedded
 catalog; label values come from fixed sets.
+
+## Proxy telemetry
+
+The wire proxy (SPEC-002) adds its own metrics, log events, readiness reasons
+and spans. They are listed, with the operational guidance that goes with
+them, in [proxy.md](proxy.md).
