@@ -149,13 +149,19 @@ func TestOpenConnectionsSurviveUpstreamOutage_AC23(t *testing.T) {
 	}
 }
 
-// RC5 (FR-42, FR-49): the "request handler panic recovered" record is
-// rate-limited (one per 30 s), while every panic is still counted: each closes
-// its connection with reason internal_error.
+// AC-22 / RC5 (FR-42, FR-49; Amendment 7), twin: the "request handler panic
+// recovered" record is rate-limited (one per 30 s), while every panic still
+// closes its connection and is counted (internal_error closes rise by exactly
+// the number of panics); a concurrent client still completes its request. The
+// fake-clock window behaviour (the 11th panic after the window gives
+// suppressed_count 9) is the proxyobs unit test.
 func TestPanicRecordRateLimitedMetricsCountAll_RC5(t *testing.T) {
-	c, _ := startMongos(t, opts{panicCmd: "boomRC5"})
+	c, tw := startMongos(t, opts{panicCmd: "boomRC5"})
 	c.waitReady()
-	const n = 6
+	tw.AddRule(mongosim.Match{Marker: "concurrent"}, mongosim.Delay(1500*time.Millisecond))
+	other := c.dial()
+	other.Send(find(1, "concurrent"))
+	const n = 11
 	closed := c.metric("corral_client_connections_closed_total", "reason", "internal_error")
 	for i := 0; i < n; i++ {
 		conn := c.dial()
@@ -163,7 +169,15 @@ func TestPanicRecordRateLimitedMetricsCountAll_RC5(t *testing.T) {
 		closedNoBytes(t, conn)
 	}
 	c.waitDelta(closed, n, "corral_client_connections_closed_total", "reason", "internal_error")
-	if got := len(c.records("request handler panic recovered")); got != 1 {
-		t.Fatalf("%d panic records for %d panics within 30 s, want 1", got, n)
+	recs := c.records("request handler panic recovered")
+	if len(recs) != 1 {
+		t.Fatalf("%d panic records for %d panics within 30 s, want 1", len(recs), n)
+	}
+	if recs[0]["error"] != "internal" {
+		t.Fatalf("record %v", recs[0])
+	}
+	m, err := other.ReadMessage(10 * time.Second)
+	if err != nil || !isOK(m) {
+		t.Fatalf("the concurrent client did not complete: %v %v", err, m)
 	}
 }

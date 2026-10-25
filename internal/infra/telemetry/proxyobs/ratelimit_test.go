@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -153,4 +154,50 @@ func TestDebugAndTransitionNotLimited(t *testing.T) {
 		t.Fatal("debug records were limited")
 	}
 	_ = fmt.Sprint
+}
+
+// AC-22 (FR-42, FR-49; Amendment 7), on a fake clock: the hook panics on 10
+// client connections within 30 s, then an 11th after the window. One record in
+// the window; the 11th gives one record with suppressed_count 9; every close is
+// counted (corral_client_connections_closed_total{reason="internal_error"}
+// rises by exactly 11, so no metric is limited); the record carries class
+// internal and no panic value.
+func TestPanicRecordRateLimitAndEveryCloseCounted_AC22(t *testing.T) {
+	r := newRig(t)
+	const marker = "SynthPanicValueMarkerZ4"
+	panicOnce := func() {
+		r.ad.Proxy().PanicRecovered(r.ctx, errors.New(marker))
+		r.ad.Proxy().ConnClosed(r.ctx, 1, proxy.CloseInternalError)
+	}
+	before := r.val("corral_client_connections_closed_total", "reason", "internal_error")
+	for i := 0; i < 10; i++ {
+		panicOnce()
+		r.clk.Advance(2 * time.Second) // 10 panics over 20 s
+	}
+	if n := len(r.records("request handler panic recovered")); n != 1 {
+		t.Fatalf("10 panics within 30 s gave %d records, want 1", n)
+	}
+	r.clk.Advance(30 * time.Second) // beyond the window
+	panicOnce()
+	recs := r.records("request handler panic recovered")
+	if len(recs) != 2 {
+		t.Fatalf("the 11th panic after the window gave %d records in total, want 2", len(recs))
+	}
+	if v, ok := suppressedOf(r, "request handler panic recovered", 1); !ok || v != 9 {
+		t.Fatalf("suppressed_count = %d (present %v), want 9", v, ok)
+	}
+	if got := r.val("corral_client_connections_closed_total", "reason", "internal_error") - before; got != 11 {
+		t.Fatalf("internal_error closes counted: %v, want exactly 11", got)
+	}
+	for _, rec := range recs {
+		a := attrs(rec)
+		if v, ok := a["error"]; !ok || v.String() != "internal" {
+			t.Fatalf("record class %v, want internal", v)
+		}
+		for k, v := range a {
+			if strings.Contains(v.String(), marker) {
+				t.Fatalf("the panic value appears in attribute %q", k)
+			}
+		}
+	}
 }
