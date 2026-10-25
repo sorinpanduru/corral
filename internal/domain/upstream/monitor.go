@@ -185,16 +185,19 @@ func (m *Monitor) dueAt(h *host, now time.Time) (time.Time, bool) {
 		return now, true
 	}
 	due := h.last.Add(m.interval(h))
-	// SDAM: checks are at least MinHeartbeat apart, counted from the end of
-	// the previous one, so a check that took long is not followed at once.
-	if f := h.done.Add(MinHeartbeat); !h.done.IsZero() && due.Before(f) {
-		due = f
-	}
 	if m.authFailing && m.cur.HasTarget && m.cur.Target == h.addr {
 		due = due.Add(h.authDelay)
 	}
 	if h.hasOverride && h.override.Before(due) {
 		due = h.override
+	}
+	// SDAM: checks are at least MinHeartbeat apart, counted from the end of
+	// the previous one. The clamp comes last: an immediate-check override
+	// requested while a check was in flight could not know when it would end.
+	if !h.done.IsZero() {
+		if f := h.done.Add(MinHeartbeat); due.Before(f) {
+			due = f
+		}
 	}
 	return due, true
 }
@@ -271,7 +274,7 @@ func (m *Monitor) scheduleImmediate() {
 		}
 		at := now
 		if h.checked {
-			if floor := h.last.Add(MinHeartbeat); floor.After(at) {
+			if floor := h.floor(); floor.After(at) {
 				at = floor
 			}
 		}
