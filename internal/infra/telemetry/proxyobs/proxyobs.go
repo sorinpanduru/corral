@@ -151,6 +151,9 @@ func New(logs *logging.Factory, mf *metrics.Factory, now func() time.Time) (*Ada
 	return a, nil
 }
 
+// SetPoolMax records the configured pool bound (corral_pool_max_connections).
+func (a *Adapters) SetPoolMax(n int) { a.m.poolMax.Set(float64(n)) }
+
 // Proxy returns the client-side observer.
 func (a *Adapters) Proxy() proxy.Observer { return &proxyObs{a} }
 
