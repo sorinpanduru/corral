@@ -1,4 +1,4 @@
-.PHONY: build test test-386 test-functional tidy
+.PHONY: build test test-386 test-twin test-functional tidy
 
 # VERSION is stamped into `corral --version` (FR-22). It must not contain
 # whitespace: the output is `corral <version>` on one line.
@@ -28,9 +28,15 @@ test:
 test-386:
 	GOARCH=386 go test -count=1 ./internal/domain/...
 
-# Binary-level tests. No Docker needed for SPEC-001 (ADR-0005).
+# Twin suites: the corral binaries against simulated upstreams (no Docker).
+# The suites build the production and the corraltest binaries themselves.
+test-twin: build
+	go test -race -count=1 -tags twin ./tests/twin/...
+
+# Binary-level tests. CORRALTEST_REQUIRE_DOCKER=1 makes a missing Docker a
+# failure instead of a skip.
 test-functional: build
-	go test -race -count=1 -tags functional ./tests/functional/...
+	CORRALTEST_REQUIRE_DOCKER=1 go test -race -count=1 -tags functional ./tests/functional/...
 
 tidy:
 	go mod tidy
