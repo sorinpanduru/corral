@@ -266,7 +266,7 @@ func TestLintCommandValuesAreAllowlisted(t *testing.T) {
 			t.Errorf("command value %q rejected:\n%s", v, problemText(ps))
 		}
 	}
-	for _, v := range []string{"", "Find", "FIND", "Hello", "getmore", "getMore", "find-one", "a b", "find\n", "insert", "ismaster", "isMaster"} {
+	for _, v := range []string{"", "Find", "FIND", "Hello", "getmore", "GetMore", "Insert", "find-one", "a b", "find\n", "ismaster", "isMaster", "collMod"} {
 		c := parse(t, metricSpec{Name: "corral_x_total", Type: "counter", Help: "h",
 			Labels: []labelSpec{{Name: "command", Values: []string{"find", v}}}})
 		if ps := metrics.Lint(c); len(ps) == 0 {

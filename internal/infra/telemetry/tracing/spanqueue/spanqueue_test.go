@@ -822,6 +822,7 @@ func TestForceFlushSnapshotOnly_FR34_FR37(t *testing.T) {
 	}
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
+	var live atomic.Int64
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -831,13 +832,17 @@ func TestForceFlushSnapshotOnly_FR34_FR37(t *testing.T) {
 				return
 			default:
 				p.OnEnd(sampled("live"))
+				live.Add(1)
 				time.Sleep(200 * time.Microsecond)
 			}
 		}
 	}()
 	defer func() { close(stop); wg.Wait() }()
 
-	time.Sleep(10 * time.Millisecond)
+	// Flush as soon as the producer is demonstrably running. A fixed sleep
+	// here made the snapshot size depend on scheduler delay: under heavy load
+	// the snapshot grew with the sleep and the flush outlived its bound.
+	eventually(t, "the producer to start", func() bool { return live.Load() >= 1 })
 	runBounded(t, 10*time.Second, "ForceFlush under continuous load", func() {
 		if err := p.ForceFlush(context.Background()); err != nil {
 			t.Errorf("ForceFlush: %v", err)

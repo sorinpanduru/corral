@@ -101,7 +101,7 @@ func TestCheckClientHeader_AC37(t *testing.T) {
 		{"OP_MSG 20 and over max-limit custom", wire.Header{Length: 20, OpCode: wire.OpMsg}, 10, "message_too_large"},
 		{"negative beats too large with tiny max", wire.Header{Length: -5, OpCode: wire.OpMsg}, 1, "malformed_message"},
 		// "GET " read as a length: 542,393,671 fails check 2 (FR-5, AC-34).
-		{"HTTP GET", wire.ParseHeader(append([]byte("GET / HTTP/1.1\r\n"))[:16]), max, "message_too_large"},
+		{"HTTP GET", wire.ParseHeader([]byte("GET / HTTP/1.1\r\n")), max, "message_too_large"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
