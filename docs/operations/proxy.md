@@ -317,19 +317,21 @@ and `$listLocalSessions` need no privilege beyond the service user's own
 sessions, and every client runs as that one user. So any client can list the
 session ids of all clients, and then end them with `killSessions` naming
 explicit ids, which corral forwards (only the empty-list form is blocked).
-Granting less to the service user does not stop this. Treat every client of
-one corral instance as able to disrupt every other client's sessions, and
-keep mutually untrusting tenants on separate corral instances and separate
-service users.
+Granting less to the service user does not stop this. The route covers every
+client of every corral instance that uses the same upstream identity, so
+separate corral instances that share an identity do not isolate anyone. The
+upstream identity is the boundary: keep mutually untrusting tenants on
+separate upstream identities (separate service users).
 
 The other routes:
 
 - reading `system.profile`, which can show other clients' operations and
   filters;
 - the `$queryStats` aggregation stage;
-- `$listSessions` and `$listLocalSessions` (with or without `allUsers: true`),
-  and the `listSessions` route to the same data (see above: no special
-  privilege is needed for the service user's own sessions);
+- `$listSessions` and `$listLocalSessions` with `allUsers: true` or another
+  user's `users` list, and the `listSessions` route to the same data. These
+  need the `listSessions` privilege, which the guidance above advises
+  against. (The own-user form is the no-privilege route described above.)
 - `$currentOp` nested inside a sub-pipeline (for example `$unionWith` or
   `$lookup`) wherever the server allows it, because corral inspects only the
   top-level stage;
@@ -408,7 +410,9 @@ message bytes, credentials, certificate data or client names.
 | `upstream` | `upstream target marked not primary` | warn |
 | `upstream` | `upstream protocol error` | warn |
 | `upstream` | `upstream barrier failed` | warn |
+| `config` | `wire listener bind failed` | error |
 | `lifecycle` | `shutdown forced by second signal` | warn |
 
-A failed bind of the wire listener is a `config` record for the setting
-`proxy.listen` (never the address), and the process exits with code 1.
+`wire listener bind failed` is the record for a failed bind of the wire
+listener: component `config`, the setting `proxy.listen` (never the address)
+and the errclass attributes. The process then exits with code 1.
