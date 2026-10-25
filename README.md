@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" alt="corral" width="320">
+</p>
+
 # corral
 
 corral is an open-source MongoDB wire-protocol proxy that gives connection
@@ -6,9 +10,10 @@ MongoDB PHP driver under PHP-FPM, where every worker holds its own persistent
 connection. corral accepts many client connections and multiplexes them over a
 small, bounded pool of upstream connections.
 
-Status: early development. The `corral` binary runs the observability
-foundation (logging, metrics, tracing, admin listener); the proxy itself is not
-yet built.
+Status: early development. The proxy core is built: corral pools upstream
+connections for replica sets and sharded clusters (through `mongos`), with
+optional TLS on both sides, SCRAM authentication to the upstream, and logging,
+metrics, tracing and an admin listener. It has not yet been used in production.
 
 License: Apache-2.0 (see `LICENSE`).
 
