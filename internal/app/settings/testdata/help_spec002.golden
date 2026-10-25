@@ -1,0 +1,187 @@
+corral: MongoDB wire-protocol connection pooling proxy
+Usage: corral [--<setting>=<value> ...]
+
+pool.checkout_timeout
+  flag:    --pool.checkout_timeout=<value>
+  env:     CORRAL_POOL_CHECKOUT_TIMEOUT
+  type:    duration
+  default: 5s
+  Maximum wait for an upstream connection.
+
+pool.max_size
+  flag:    --pool.max_size=<value>
+  env:     CORRAL_POOL_MAX_SIZE
+  type:    int
+  default: 10
+  Maximum upstream connections in the pool.
+
+pool.max_waiters
+  flag:    --pool.max_waiters=<value>
+  env:     CORRAL_POOL_MAX_WAITERS
+  type:    int
+  (optional, unset by default)
+  Maximum requests waiting for an upstream connection.
+
+pool.min_size
+  flag:    --pool.min_size=<value>
+  env:     CORRAL_POOL_MIN_SIZE
+  type:    int
+  default: 0
+  Upstream connections kept open while the upstream is available.
+
+proxy.client_idle_timeout
+  flag:    --proxy.client_idle_timeout=<value>
+  env:     CORRAL_PROXY_CLIENT_IDLE_TIMEOUT
+  type:    duration
+  default: 0s
+  Close client connections idle this long.
+
+proxy.client_io_timeout
+  flag:    --proxy.client_io_timeout=<value>
+  env:     CORRAL_PROXY_CLIENT_IO_TIMEOUT
+  type:    duration
+  default: 30s
+  Maximum time to receive a started client message, to write a reply to a client, or to complete a client TLS handshake.
+
+proxy.listen
+  flag:    --proxy.listen=<value>
+  env:     CORRAL_PROXY_LISTEN
+  type:    hostport
+  default: 127.0.0.1:27017
+  MongoDB wire listener address.
+
+proxy.max_client_connections
+  flag:    --proxy.max_client_connections=<value>
+  env:     CORRAL_PROXY_MAX_CLIENT_CONNECTIONS
+  type:    int
+  default: 10000
+  Maximum open client connections.
+
+proxy.shutdown.drain_timeout
+  flag:    --proxy.shutdown.drain_timeout=<value>
+  env:     CORRAL_PROXY_SHUTDOWN_DRAIN_TIMEOUT
+  type:    duration
+  default: 20s
+  Maximum time to drain in-flight exchanges at shutdown.
+
+proxy.shutdown.listener_close_delay
+  flag:    --proxy.shutdown.listener_close_delay=<value>
+  env:     CORRAL_PROXY_SHUTDOWN_LISTENER_CLOSE_DELAY
+  type:    duration
+  default: 0s
+  Keep serving this long after shutdown starts before closing the listener.
+
+proxy.tls.cert_path
+  flag:    --proxy.tls.cert_path=<value>
+  env:     CORRAL_PROXY_TLS_CERT_PATH
+  type:    string
+  (optional, unset by default)
+  Path to the wire listener certificate chain (PEM).
+
+proxy.tls.client_ca_path
+  flag:    --proxy.tls.client_ca_path=<value>
+  env:     CORRAL_PROXY_TLS_CLIENT_CA_PATH
+  type:    string
+  (optional, unset by default)
+  CA bundle for verifying client certificates; when set, mutual TLS is required.
+
+proxy.tls.enabled
+  flag:    --proxy.tls.enabled=<value>
+  env:     CORRAL_PROXY_TLS_ENABLED
+  type:    bool
+  default: false
+  Require TLS on the wire listener.
+
+proxy.tls.key
+  flag:    --proxy.tls.key=<value>
+  env:     CORRAL_PROXY_TLS_KEY
+  type:    text
+  (optional, unset by default)
+  (secret: set CORRAL_PROXY_TLS_KEY or CORRAL_PROXY_TLS_KEY_FILE, or pass --proxy.tls.key_file; never pass the value on the command line)
+  Wire listener TLS private key (PEM); supply via `CORRAL_PROXY_TLS_KEY_FILE` or `--proxy.tls.key_file`.
+
+upstream.auth.mechanism
+  flag:    --upstream.auth.mechanism=<value>
+  env:     CORRAL_UPSTREAM_AUTH_MECHANISM
+  type:    enum (SCRAM-SHA-256, none)
+  default: SCRAM-SHA-256
+  Upstream authentication mechanism.
+
+upstream.auth.password
+  flag:    --upstream.auth.password=<value>
+  env:     CORRAL_UPSTREAM_AUTH_PASSWORD
+  type:    string
+  (optional, unset by default)
+  (secret: set CORRAL_UPSTREAM_AUTH_PASSWORD or CORRAL_UPSTREAM_AUTH_PASSWORD_FILE, or pass --upstream.auth.password_file; never pass the value on the command line)
+  Service identity password.
+
+upstream.auth.source
+  flag:    --upstream.auth.source=<value>
+  env:     CORRAL_UPSTREAM_AUTH_SOURCE
+  type:    string
+  default: admin
+  Authentication database for the service identity.
+
+upstream.auth.username
+  flag:    --upstream.auth.username=<value>
+  env:     CORRAL_UPSTREAM_AUTH_USERNAME
+  type:    string
+  (optional, unset by default)
+  (secret: set CORRAL_UPSTREAM_AUTH_USERNAME or CORRAL_UPSTREAM_AUTH_USERNAME_FILE, or pass --upstream.auth.username_file; never pass the value on the command line)
+  Service identity username.
+
+upstream.connect_timeout
+  flag:    --upstream.connect_timeout=<value>
+  env:     CORRAL_UPSTREAM_CONNECT_TIMEOUT
+  type:    duration
+  default: 10s
+  Time limit to connect, handshake and authenticate an upstream connection, and for one monitoring check.
+
+upstream.heartbeat_interval
+  flag:    --upstream.heartbeat_interval=<value>
+  env:     CORRAL_UPSTREAM_HEARTBEAT_INTERVAL
+  type:    duration
+  default: 10s
+  Interval between upstream health and topology checks.
+
+upstream.hosts
+  flag:    --upstream.hosts=<value>
+  env:     CORRAL_UPSTREAM_HOSTS
+  type:    list of hostport
+  (required)
+  Upstream seed addresses (`host:port`); never a connection string.
+
+upstream.max_idle_time
+  flag:    --upstream.max_idle_time=<value>
+  env:     CORRAL_UPSTREAM_MAX_IDLE_TIME
+  type:    duration
+  default: 5m
+  Close idle pool connections after this long, keeping `pool.min_size`.
+
+upstream.replica_set
+  flag:    --upstream.replica_set=<value>
+  env:     CORRAL_UPSTREAM_REPLICA_SET
+  type:    string
+  (optional, unset by default)
+  Replica set name; when set, corral targets that set's current primary. When unset, the single host must be a `mongos`.
+
+upstream.tls.ca_path
+  flag:    --upstream.tls.ca_path=<value>
+  env:     CORRAL_UPSTREAM_TLS_CA_PATH
+  type:    string
+  (optional, unset by default)
+  CA bundle for verifying the upstream; unset uses system roots.
+
+upstream.tls.enabled
+  flag:    --upstream.tls.enabled=<value>
+  env:     CORRAL_UPSTREAM_TLS_ENABLED
+  type:    bool
+  default: false
+  Use verified TLS to the upstream.
+
+Control flags (no value allowed):
+  --help, -help, -h                print this help and exit
+  --version, -version              print the version and exit
+  --check-config, -check-config    validate the configuration and exit
+
+OTEL_* environment variables are honoured as described in the operator documentation.

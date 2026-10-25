@@ -267,12 +267,47 @@ var samples = map[string]sample{
 	"admin.listen":         {"0.0.0.0:9000", "[::1]:8080", ":9187"},
 	"tracing.enabled":      {"true", "TRUE", "maybe"},
 	"tracing.sample_ratio": {"0.25", "0.5", "1.5"},
+
+	// SPEC-002 (T17).
+	"proxy.listen":                        {"0.0.0.0:27018", "[::1]:27019", "127.0.0.1:0"},
+	"proxy.max_client_connections":        {"5", "6", "0"},
+	"proxy.client_idle_timeout":           {"1s", "2m", "-1s"},
+	"proxy.client_io_timeout":             {"10s", "1m", "0s"},
+	"proxy.shutdown.listener_close_delay": {"1s", "3s", "-1s"},
+	"proxy.shutdown.drain_timeout":        {"5s", "1m", "0s"},
+	"pool.max_size":                       {"20", "30", "0"},
+	"pool.min_size":                       {"2", "3", "-1"},
+	"pool.max_waiters":                    {"5", "7", "0"},
+	"pool.checkout_timeout":               {"1s", "2s", "0s"},
+	"upstream.hosts":                      {"a.test:27017", "b.test:27018", "a.test:0"},
+	"upstream.auth.source":                {"authdb", "admin2", "a$b"},
+	"upstream.connect_timeout":            {"3s", "4s", "0s"},
+	"upstream.heartbeat_interval":         {"1s", "2s", "100ms"},
+	"upstream.max_idle_time":              {"1m", "0s", "-1s"},
+	"upstream.tls.enabled":                {"true", "TRUE", "maybe"},
+}
+
+// contextualSamples are SPEC-002 settings whose valid values depend on other
+// settings or on files (cross rules, the PEM rule, the default mechanism that
+// needs credentials). The generic loop below cannot give them a valid
+// configuration in isolation; proxy_settings_test.go covers each of them with
+// its companions (AC-31), so they are excluded here by name, not silently.
+var contextualSamples = map[string]string{
+	"proxy.tls.enabled":        "needs cert_path and key (proxy-tls-material)",
+	"proxy.tls.cert_path":      "PEM rule: needs a file",
+	"proxy.tls.client_ca_path": "PEM rule and proxy-tls-mtls",
+	"upstream.tls.ca_path":     "PEM rule and upstream-tls-ca",
+	"upstream.auth.mechanism":  "default needs credentials (upstream-auth-credentials)",
+	"upstream.replica_set":     "any non-empty string is valid, so the generic invalid-value step has nothing to try; its rule is covered in proxy_settings_test.go",
 }
 
 func TestAC2_EveryNonSecretSetting(t *testing.T) {
 	r := mustRegistry(t)
 	for _, s := range r.Settings() {
 		if s.Secret {
+			continue
+		}
+		if _, ok := contextualSamples[s.Name]; ok {
 			continue
 		}
 		sm, ok := samples[s.Name]
