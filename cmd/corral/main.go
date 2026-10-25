@@ -20,7 +20,21 @@ func main() {
 	// First statement (SPEC-003 FR-18): replace the default SIGHUP action
 	// (terminate) before any argument is looked at.
 	signal.Notify(hup, syscall.SIGHUP)
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	// SIGINT and SIGTERM stay on one channel for the whole run (FR-63): the
+	// first starts the graceful shutdown, the second forces the drain to end,
+	// and any further one is drained and ignored.
+	sigs := make(chan os.Signal, 4)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(context.Background())
+	force := make(chan struct{})
+	go func() {
+		<-sigs
+		cancel()
+		<-sigs
+		close(force)
+		for range sigs {
+		}
+	}()
 	reg, hooks := testBuild()
 	code := runtime.Run(ctx, runtime.Inputs{
 		Args:     os.Args[1:],
@@ -30,8 +44,9 @@ func main() {
 		HUP:      hup,
 		Version:  version,
 		Registry: reg,
+		Force:    force,
 	}, hooks)
-	stop()
+	cancel()
 	os.Exit(code)
 }
 

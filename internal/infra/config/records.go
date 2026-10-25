@@ -62,3 +62,16 @@ func LogAdminBindFailed(l *slog.Logger, err error) {
 	}
 	l.LogAttrs(context.Background(), slog.LevelError, MsgAdminBindFailed, errorAttrs(err)...)
 }
+
+// MsgWireBindFailed is the constant message of the wire listener bind failure.
+const MsgWireBindFailed = "wire listener bind failed"
+
+// LogWireBindFailed writes the wire listener bind failure record: error level,
+// the setting name (proxy.listen) and the errclass attributes, never the
+// address or port. The caller binds component=config.
+func LogWireBindFailed(l *slog.Logger, err error) {
+	if err == nil {
+		return
+	}
+	l.LogAttrs(context.Background(), slog.LevelError, MsgWireBindFailed, errorAttrs(err)...)
+}

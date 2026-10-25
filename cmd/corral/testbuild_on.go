@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/sorinpanduru/corral/internal/app/runtime"
@@ -21,13 +22,28 @@ import (
 // variables under FR-8. Synthetic test code only.
 func testBuild() (*registry.Registry, runtime.Hooks) {
 	var hooks runtime.Hooks
-	if dir := os.Getenv("CORRALTEST_HOLD_DIR"); dir != "" {
-		switch os.Getenv("CORRALTEST_HOLD_AT") {
-		case "logger":
-			hooks.BeforeLogger = func(ctx context.Context) { hold(ctx, dir) }
-		case "checkconfig":
-			hooks.BeforeCheckConfigExit = func(ctx context.Context) { hold(ctx, dir) }
+	dir := os.Getenv("CORRALTEST_HOLD_DIR")
+	points := map[string]bool{}
+	if dir != "" {
+		for _, p := range strings.Split(os.Getenv("CORRALTEST_HOLD_AT"), ",") {
+			points[strings.TrimSpace(p)] = true
 		}
+		if points["logger"] {
+			hooks.BeforeLogger = func(ctx context.Context) { hold(ctx, dir, "held", "release") }
+		}
+		if points["checkconfig"] {
+			hooks.BeforeCheckConfigExit = func(ctx context.Context) { hold(ctx, dir, "held", "release") }
+		}
+		hooks.Hold = func(ctx context.Context, point string) {
+			if points[point] {
+				hold(ctx, dir, "held-"+point, "release-"+point)
+			}
+		}
+	}
+	hooks.PoolRoundRobin = os.Getenv("CORRALTEST_POOL_ORDER") == "roundrobin"
+	hooks.PanicCommand = os.Getenv("CORRALTEST_PANIC_COMMAND")
+	if addr := os.Getenv("CORRALTEST_PROBE_LISTEN"); addr != "" {
+		hooks.Probe = startProbe(addr, dir)
 	}
 	var extra *registry.Group
 	switch os.Getenv("CORRALTEST_REGISTRY") {
@@ -45,19 +61,19 @@ func testBuild() (*registry.Registry, runtime.Hooks) {
 	if extra == nil {
 		return nil, hooks
 	}
-	reg, err := registry.New(append([]registry.Group{settings.ObservabilityGroup()}, *extra)...) // T21: settings.Groups()
+	reg, err := registry.New(append(settings.Groups(), *extra)...)
 	if err != nil {
 		os.Exit(1)
 	}
 	return reg, hooks
 }
 
-// hold creates <dir>/held, then waits (at most 30 s) for <dir>/release.
-func hold(ctx context.Context, dir string) {
-	_ = os.WriteFile(filepath.Join(dir, "held"), nil, 0o600)
+// hold creates <dir>/<held>, then waits (at most 30 s) for <dir>/<release>.
+func hold(ctx context.Context, dir, held, release string) {
+	_ = os.WriteFile(filepath.Join(dir, held), nil, 0o600)
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) && ctx.Err() == nil {
-		if _, err := os.Stat(filepath.Join(dir, "release")); err == nil {
+		if _, err := os.Stat(filepath.Join(dir, release)); err == nil {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)

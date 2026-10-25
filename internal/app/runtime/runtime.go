@@ -17,19 +17,24 @@ import (
 	"os"
 	"runtime/debug"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/sorinpanduru/corral/internal/app/configload"
+	"github.com/sorinpanduru/corral/internal/app/proxyapp"
 	"github.com/sorinpanduru/corral/internal/app/settings"
+	"github.com/sorinpanduru/corral/internal/domain/clock"
+	"github.com/sorinpanduru/corral/internal/domain/health"
 	"github.com/sorinpanduru/corral/internal/infra/adminhttp"
 	"github.com/sorinpanduru/corral/internal/infra/config"
 	"github.com/sorinpanduru/corral/internal/infra/config/loader"
 	"github.com/sorinpanduru/corral/internal/infra/config/registry"
 	"github.com/sorinpanduru/corral/internal/infra/config/source"
 	"github.com/sorinpanduru/corral/internal/infra/config/usage"
+	"github.com/sorinpanduru/corral/internal/infra/proxyserver/exchange"
 	"github.com/sorinpanduru/corral/internal/infra/sighup"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/errclass"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logbridge"
@@ -72,9 +77,12 @@ type Inputs struct {
 	// HUP delivers SIGHUP; the entry point owns signal.Notify.
 	HUP     <-chan os.Signal
 	Version string
-	// Registry selects the settings; nil means the observability-only registry
-	// (settings.ObservabilityGroup) until the proxy settings are wired in.
+	// Registry selects the settings; nil means settings.Registry(), which
+	// includes the SPEC-002 group. The proxy runs only when the registry has it.
 	Registry *registry.Registry
+	// Force is closed by the entry point on the second termination signal
+	// (FR-63, ADR-0021); nil means no second signal.
+	Force <-chan struct{}
 	// Now is the SIGHUP limiter clock; nil means time.Now.
 	Now func() time.Time
 }
@@ -95,6 +103,16 @@ type Hooks struct {
 	// Stopping runs after the "shutting down" record and before the admin
 	// server shuts down.
 	Stopping func(ctx context.Context)
+
+	// The remaining hooks are the corraltest hooks (FR-64, ADR-0022).
+	// Hold blocks at a named hold point ("laststep", "shutdown_delay", ...).
+	Hold func(ctx context.Context, point string)
+	// PoolRoundRobin hands out idle upstream connections round-robin.
+	PoolRoundRobin bool
+	// PanicCommand makes the handler panic for that command name.
+	PanicCommand string
+	// Probe receives byte counts for the bounds checks.
+	Probe exchange.Probe
 }
 
 // Handles expose running components to Started.
@@ -125,10 +143,7 @@ func Run(ctx context.Context, in Inputs, hooks Hooks) int {
 	settingsReg := in.Registry
 	if settingsReg == nil {
 		var err error
-		// T21 switches this to the full registry (with the SPEC-002 group)
-		// together with the wire listener; until then the proxy settings are
-		// not part of the process's configuration.
-		if settingsReg, err = settings.RegistryOf(settings.ObservabilityGroup()); err != nil {
+		if settingsReg, err = settings.Registry(); err != nil {
 			logProgramming(stdout, err)
 			return exitFailure
 		}
@@ -223,10 +238,12 @@ func Run(ctx context.Context, in Inputs, hooks Hooks) int {
 	}
 
 	// Step 6: admin listener (Listen + Serve), not yet ready.
+	var readiness lateReadiness
 	admin := adminhttp.New(adminhttp.Options{
-		Addr:     obs.AdminListen,
-		Gatherer: reg,
-		ErrorLog: logbridge.NewHTTPErrorLog(factory, time.Now),
+		Addr:      obs.AdminListen,
+		Readiness: &readiness,
+		Gatherer:  reg,
+		ErrorLog:  logbridge.NewHTTPErrorLog(factory, time.Now),
 	})
 	if err := admin.Listen(); err != nil {
 		// The error is a config.Error: constant text, the net error only as
@@ -253,10 +270,18 @@ func Run(ctx context.Context, in Inputs, hooks Hooks) int {
 	if hooks.BeforeLastStep != nil {
 		hooks.BeforeLastStep(ctx)
 	}
+	if hooks.Hold != nil {
+		hooks.Hold(ctx, "laststep")
+	}
 	var tr *tracing.Tracing
+	var svc *proxyapp.Service
+	// The proxy lives on its own context: cancelling ctx starts the graceful
+	// shutdown, which must keep serving through the drain (FR-47).
+	svcCtx, svcCancel := context.WithCancel(context.Background())
+	defer svcCancel()
 	code := exitOK
 	if ctx.Err() == nil {
-		// Step 8: tracing.Start (last step).
+		// Step 8: tracing.Start.
 		tr, err = tracing.Start(ctx, tracing.Options{
 			Env:     env,
 			Config:  tcfg,
@@ -272,6 +297,35 @@ func Run(ctx context.Context, in Inputs, hooks Hooks) int {
 			shutdownAdmin(life, admin)
 			return exitFailure
 		default:
+			// Step 8a (last step): build the proxy service and bind the wire
+			// listener. A bind failure is a config error for proxy.listen.
+			if settings.HasProxyGroup(settingsReg) {
+				svc, err = proxyapp.New(settings.ProxyFrom(out.Result), proxyapp.Deps{
+					Logs: factory, Metrics: mf, Tracer: tr.TracerProvider().Tracer(tracerName),
+					TracingEnabled: tr.Enabled(), Version: in.Version, Clock: clock.System(),
+					Hooks: proxyapp.Hooks{Hold: hooks.Hold, RoundRobin: hooks.PoolRoundRobin,
+						PanicCommand: hooks.PanicCommand, Probe: hooks.Probe},
+				})
+				if err == nil {
+					readiness.Store(svc.Readiness())
+					err = svc.Bind()
+				}
+				if err != nil {
+					if errors.As(err, new(errclass.ConfigError)) {
+						config.LogWireBindFailed(cfgLog, err)
+					} else {
+						logFailure(life, err)
+					}
+					shutdownAdmin(life, admin)
+					shutdownTracing(life, tr)
+					return exitFailure
+				}
+				svc.Start(svcCtx)
+				go func() {
+					defer recoverPanic(life)
+					_ = svc.Serve(svcCtx)
+				}()
+			}
 			// Step 9: ready.
 			admin.MarkStarted()
 			life.Info(msgStartupComplete)
@@ -293,11 +347,59 @@ func Run(ctx context.Context, in Inputs, hooks Hooks) int {
 	if hooks.Stopping != nil {
 		hooks.Stopping(ctx)
 	}
+	if svc != nil {
+		stopProxy(life, svc, in.Force)
+	}
 	shutdownAdmin(life, admin)
 	if tr != nil {
 		shutdownTracing(life, tr)
 	}
 	return code
+}
+
+// tracerName is the instrumentation scope of the proxy's spans.
+const tracerName = "github.com/sorinpanduru/corral"
+
+// msgForced is the constant record for the second signal (FR-63).
+const msgForced = "shutdown forced by second signal"
+
+// stopProxy runs FR-47 and, on the second signal, ends the drain at once. The
+// record is written once; further signals change nothing.
+func stopProxy(life *slog.Logger, svc *proxyapp.Service, force <-chan struct{}) {
+	done := make(chan struct{})
+	watched := make(chan struct{})
+	go func() {
+		defer close(watched)
+		if force == nil {
+			<-done
+			return
+		}
+		select {
+		case <-force:
+			life.Warn(msgForced)
+			svc.ForceDrainEnd()
+		case <-done:
+		}
+	}()
+	_ = svc.Shutdown(context.Background())
+	close(done)
+	<-watched
+}
+
+// lateReadiness is the readiness port the admin listener holds before the
+// proxy service exists; the admin listener only consults it between startup
+// complete and shutdown, by which time the service is set.
+type lateReadiness struct {
+	r atomic.Pointer[health.Readiness]
+}
+
+func (l *lateReadiness) Store(r health.Readiness) { l.r.Store(&r) }
+
+func (l *lateReadiness) Readiness(ctx context.Context) health.Status {
+	if r := l.r.Load(); r != nil {
+		return (*r).Readiness(ctx)
+	}
+	return health.Status{Ready: true}
 }
 
 // logProgramming reports a programming error (never a configuration error)

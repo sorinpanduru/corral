@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sorinpanduru/corral/internal/domain/proxy"
@@ -61,10 +62,10 @@ type Server struct {
 	conns    map[net.Conn]struct{}
 	lnClosed bool
 
-	wg      sync.WaitGroup
-	base    context.Context
-	cancel  context.CancelFunc
-	started bool
+	wg     sync.WaitGroup
+	base   context.Context
+	cancel context.CancelFunc
+	forced atomic.Bool // ForceDrainEnd was called (it may precede Shutdown)
 }
 
 // New returns a server.
@@ -221,13 +222,19 @@ func (s *Server) handle(ctx context.Context, raw net.Conn, id int32, ap netip.Ad
 
 // ForceDrainEnd is the second signal (FR-63): it skips the rest of the
 // listener-close delay and ends the drain at once. It is idempotent.
-func (s *Server) ForceDrainEnd() { s.o.Shutdown.Force() }
+func (s *Server) ForceDrainEnd() {
+	s.forced.Store(true)
+	s.o.Shutdown.Force()
+}
 
 // Shutdown drives FR-47 steps 1 to 4 and returns when they are done.
 func (s *Server) Shutdown(ctx context.Context) error {
 	sd := s.o.Shutdown
 	// Step 1: keep serving for the listener-close delay.
 	sd.Begin()
+	if s.forced.Load() {
+		sd.Force()
+	}
 	s.hold(ctx, HoldShutdownDelay)
 	select {
 	case <-sd.DelayExpired():
