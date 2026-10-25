@@ -143,6 +143,20 @@ func Load(r *registry.Registry, in Inputs) Result {
 			winner, src = env, SourceEnv
 		}
 
+		if src != SourceUnset && !winner.failed && s.File != nil {
+			// ADR-0020: only the winning path is read, once.
+			name := s.Name
+			if src == SourceEnv {
+				name = s.Env
+			}
+			if fv, err := readFileRule(s, winner.value, in.ReadFile); err != nil {
+				fail(name, err)
+				winner.failed = true
+			} else {
+				winner.value = fv
+			}
+		}
+
 		val := Value{Source: src}
 		switch {
 		case src != SourceUnset && winner.failed:

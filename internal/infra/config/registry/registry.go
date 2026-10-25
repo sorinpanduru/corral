@@ -37,6 +37,27 @@ type Decl struct {
 	Secret      bool
 	Description string
 	Rule        func(v any) error
+	// File marks a string setting whose value is a path: the loader reads the
+	// winning path once and the effective value is a FileValue (ADR-0020).
+	File *FileRule
+}
+
+// FileRule describes the file behind a path setting. MaxBytes <= 0 means the
+// 4 MiB default. Check validates the content; its error text is never
+// reported (the loader maps any failure to a constant sentinel).
+type FileRule struct {
+	MaxBytes int64
+	Check    func(content []byte) error
+}
+
+// DefaultFileMaxBytes is the default FileRule size limit.
+const DefaultFileMaxBytes = 4 << 20
+
+// FileValue is the effective value of a File setting: the path and the bytes
+// read from it, once, during loading.
+type FileValue struct {
+	Path    string
+	Content []byte
 }
 
 // CrossRule is a rule over several settings (FR-30). Primary names the setting
@@ -253,6 +274,9 @@ func checkDecl(p problems, g Group, d Decl) {
 	specOK := d.Type.Check() == nil
 	if !specOK {
 		p.add("invalid type", d.Name)
+	}
+	if d.File != nil && (d.Secret || d.Type.Kind != types.KindString) {
+		p.add("file rule only on non-secret string settings", d.Name)
 	}
 	switch d.Presence {
 	case PresenceDefault:
