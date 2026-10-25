@@ -1,8 +1,8 @@
 # SPEC-002: Proxy core (wire listener, handshake, multiplexing pool, upstream)
 
-Status: approved (Owner, 2026-10-24; revision 5); Amendment 1 approved (Owner, 2026-10-24); Amendment 2 approved (Owner, 2026-10-24); Amendment 3 approved (Owner, 2026-10-25)
+Status: approved (Owner, 2026-10-24; revision 5); Amendment 1 approved (Owner, 2026-10-24); Amendment 2 approved (Owner, 2026-10-24); Amendment 3 approved (Owner, 2026-10-25); Amendment 4 approved (Owner, 2026-10-25)
 Owner: Sorin Panduru
-Last updated: 2026-10-25 (Amendment 3)
+Last updated: 2026-10-25 (Amendment 4)
 
 ## Goal
 
@@ -146,6 +146,15 @@ the connection string pointing at corral.
   - Failure to bind exits with code 1 (SPEC-003 FR-24). The error record
     carries `component=config` and `setting=proxy.listen`, and does not
     contain the address.
+    - *(Amendment 4)* The record has level error and the fixed message
+      `wire listener bind failed`. It carries `error` and
+      `corral.error.detail` per SPEC-001 FR-29 (class `config`, with the
+      detail of the bind error, for example `EADDRINUSE`). It carries no
+      address, host or port.
+    - It mirrors SPEC-003 Amendment 3's `admin listener bind failed`. Because
+      it is not an `invalid configuration` record, the message
+      `invalid configuration` alone still identifies load-time config errors
+      (exit 2), separately from bind failures (exit 1).
   - Binding the wire listener is the last startup step for SPEC-001 FR-18.
     Startup does not wait for the upstream to be reachable (FR-46).
 - **FR-2:** At most `proxy.max_client_connections` client connections are open
@@ -1136,6 +1145,18 @@ the connection string pointing at corral.
     - grant no `queryStatsRead` / `queryStatsReadTransformed`;
   - the residual cross-client exposure routes listed in Data and compliance,
     and that the least-privilege guidance above closes most of them;
+  - *(Amendment 4; Owner decision 2026-10-25)* that the guidance does
+    **not** close one route:
+    - any client can list every client's session IDs with
+      `$listSessions` / `$listLocalSessions` for the own user, which needs
+      no special privilege and, under the shared identity, covers all
+      clients;
+    - it can then end those sessions with `killSessions` and explicit IDs
+      (or act on them with `endSessions`, `abortTransaction` or
+      `commitTransaction`);
+    - corral does not block this. Applications that share an upstream
+      identity through corral can therefore end each other's sessions,
+      and only separate upstream identities isolate them;
   - *(Amendment 1)* the reply chunk size (FR-58); that handshake, auth and
     blocked command names are matched case-sensitively (FR-13); and the
     FR-60 refusal of duplicated inspected fields and of a `pipeline` sent as
@@ -1647,6 +1668,7 @@ declares its enumeration. Records carrying `error` also carry
 
 | Component | Level | `msg` (constant) | Attributes beyond time/level/msg/component | Notes |
 |---|---|---|---|---|
+| `config` | error | `wire listener bind failed` | `setting` (`proxy.listen`), `error` (`config`), `corral.error.detail` (for example `EADDRINUSE`); no address, host or port | FR-1 (Amendment 4); once, then exit 1; not an `invalid configuration` record |
 | `proxy` | info | `wire listener bound` | none (no address) | startup |
 | `proxy` | debug | `client connection opened` | `corral.connection.id`, `client.address`, `client.port` | |
 | `proxy` | debug | `client connection closed` | `reason` (client close reasons), `corral.connection.id` | |
@@ -1714,13 +1736,15 @@ Amendment 1 of this spec needs no further SPEC-001 change. It adds no
 metric, label, error detail, readiness reason or log key. Its one new
 record uses the existing `lifecycle` component. Amendments 2 and 3 of this
 spec need no SPEC-001 change either; neither adds a new signal.
+Amendment 4 needs none either: its record uses the existing `config`
+component and the existing keys `setting`, `error` and `corral.error.detail`.
 
 ## Behavior on failure
 
 | Situation | Client sees | corral does |
 |---|---|---|
 | Invalid or missing setting, secret on the command line, cross-setting rule broken, unreadable PEM | n/a | exit 2 with SPEC-003 records, before binding anything (FR-55) |
-| Wire listener cannot bind | n/a | exit 1, `setting=proxy.listen` (FR-1) |
+| Wire listener cannot bind | n/a | one record: level error, `component=config`, message `wire listener bind failed`, `setting=proxy.listen`, class `config` with the bind error's detail, no address; exit 1 (FR-1, Amendment 4) |
 | Malformed frame, bad length, OP_COMPRESSED, legacy opcode, bad flags or checksum, invalid body, deciding field beyond the buffer | connection closed, no reply | counts; rate-limited warn (FR-5 to FR-7, FR-38) |
 | Duplicated inspected field (including the command name), or a kind-1 section named like an inspected field other than the command name (Amendments 1 and 2) | connection closed, no reply | nothing forwarded when detected before a lease; otherwise the upstream connection is discarded and never receives the complete message; `malformed_message` (FR-38, FR-60) |
 | Malformed OP_QUERY (Amendment 1) | connection closed, no reply | `malformed_message` (FR-8) |
@@ -1760,7 +1784,10 @@ drivers, which the error codes and labels enable.
     `killAllSessionsByPattern` (FR-33), and by refusing the FR-60 bypass
     forms (Amendment 1). The residual routes are listed in Data and
     compliance; least privilege for the service user (FR-51) is the
-    mitigation.
+    mitigation. *(Amendment 4)* One exception: listing sessions for the own
+    user and then ending them with `killSessions` and explicit IDs is not
+    prevented by least privilege. By Owner decision it is documented only
+    (FR-51).
   - **No client authentication on the wire listener:** protection comes from
     the loopback default (FR-1), network placement and optional mutual TLS
     (FR-44). Client TLS is not mandatory.
@@ -1821,28 +1848,48 @@ drivers, which the error codes and labels enable.
   identity would kill every client's sessions.
 
   **Residual exposure routes** (flagged for review by security@emag.ro).
-  corral does not block these. Each is mitigated by the FR-51
-  least-privilege guidance for the service user, and most work only if the
-  service user has privileges FR-51 advises against:
+  corral does not block these. The routes in this first list work only if
+  the service user has privileges that FR-51 advises against, so the FR-51
+  least-privilege guidance mitigates them:
   - reading `system.profile`, which can show other clients' operations and
     their filters;
   - the `$queryStats` aggregation stage;
-  - `$listSessions` / `$listLocalSessions` (with or without
-    `allUsers: true`), and the `listSessions` route to the same data. Under
-    the shared identity these list every client's sessions;
+  - *(corrected by Amendment 4)* `$listSessions` / `$listLocalSessions`
+    with `allUsers: true` or with a `users` list naming other users. These
+    need the `listSessions` cluster action. The same stages for the caller's
+    own user are **not** in this list; see the session-enumeration route
+    below;
   - `$currentOp` nested inside a sub-pipeline (for example `$unionWith` or
     `$lookup`), wherever the server allows it, which FR-33 does not inspect;
   - an `aggregate` with `$currentOp` wrapped in `explain`;
   - `connectionStatus`, which reveals the service identity's name.
 
-  *(Amendment 1, G-14; updated by Amendment 3)* Further routes that need no
-  extra privilege, because all clients share one identity. These are also
-  least-privilege mitigated as far as roles allow:
+  *(Amendment 4; Owner decision 2026-10-25, "document only")*
+  **Session enumeration and termination, not prevented by least privilege:**
+  - `$listSessions` and `$listLocalSessions` for the caller's own user need
+    no special privilege. That is their form with no arguments, an empty
+    `users` list, or a `users` list naming only the caller.
+  - Under the shared upstream identity, the "own user" is the service user.
+    Any client can therefore list the session IDs of every client of every
+    corral instance that uses that identity.
+  - With those IDs, the client can end other clients' sessions through
+    `killSessions` with explicit IDs, which FR-33 forwards. It can also act
+    on them with `endSessions`, or with `abortTransaction` or
+    `commitTransaction` carrying another client's `lsid`.
+  - Least privilege does not prevent this. No role can grant the service
+    user the application access it needs while denying these
+    own-user operations.
+  - By Owner decision, corral does not block it. The FR-51 operator
+    documentation must state it (Amendment 4).
+
+  *(Amendment 1, G-14; updated by Amendments 3 and 4)* Further routes that
+  need no extra privilege, because all clients share one identity:
   - `killSessions` with explicit `lsid`s naming another client's sessions,
     and `endSessions`, `abortTransaction` or `commitTransaction` sent with
-    another client's `lsid`. Session IDs are random 128-bit UUIDs, so this
-    needs a leaked ID, not a guess. Unlike the empty-list form, which FR-33
-    blocks, these are forwarded;
+    another client's `lsid`. Session IDs are random 128-bit UUIDs and cannot
+    be guessed, but *(Amendment 4)* they can be listed through the
+    own-user session stages above. These requests are forwarded, unlike the
+    empty-list form, which FR-33 blocks;
   - session-less cursors, which any client knowing the 64-bit cursor ID can
     `getMore` or `killCursors`. Official drivers always use (implicit)
     sessions, which bind cursors to an `lsid`;
@@ -1854,10 +1901,12 @@ drivers, which the error codes and labels enable.
     It is not a bypass, because the server takes the command from the body's
     first key.
 
-  The mitigation for the remaining routes is the FR-51 least-privilege
-  guidance for the service user, and keeping session and cursor IDs out of
-  logs available to other tenants. SPEC-001 already allows them only in
-  logs and spans, never in metrics.
+  For the remaining routes, the mitigations are the FR-51 least-privilege
+  guidance for the service user, as far as roles allow, and keeping session
+  and cursor IDs out of logs available to other tenants. SPEC-001 already
+  allows them only in logs and spans, never in metrics. *(Amendment 4)*
+  These mitigations do not prevent the session enumeration and termination
+  route above. That route is accepted and documented, not mitigated.
 - **PII:** corral does not need personal data to do its job and emits none.
   Personal data may pass through it in transit only, as classified above.
   - Minimization: only the FR-9 fields are read, and `saslSupportedMechs`
@@ -1889,8 +1938,15 @@ hook" means a `corraltest`-build hook (FR-64).
   - with defaults, corral listens on `127.0.0.1:27017` only;
   - `--proxy.listen=:27017` and `--proxy.listen=127.0.0.1:0` each exit 2 with
     `setting=proxy.listen`;
-  - an address already in use exits 1 with `setting=proxy.listen` and
-    without the address value;
+  - an address already in use exits 1. *(Amendment 4)* stdout holds exactly
+    one record about it:
+    - level error, `component=config` and the message
+      `wire listener bind failed`;
+    - `setting=proxy.listen`, `error=config` and
+      `corral.error.detail=EADDRINUSE`;
+    - no address, host or port in any attribute, checked with the marker
+      harness using the port number as a marker;
+    - no record with the message `invalid configuration` is emitted;
   - `/readyz` stays `starting` until the wire listener is bound (test hook);
   - the startup-complete record follows the `wire listener bound` record.
 - **AC-2** (FR-2, FR-3, FR-48):
@@ -2631,14 +2687,31 @@ Added by Amendment 3:
   - The parser exposes only whether the argument is empty or not an array,
     never the session IDs (AC-7).
 
+Added by Amendment 4:
+
+- **AC-59** (FR-1, FR-49): Unit (startup path, with an injected listener
+  that fails) and functional (AC-1).
+  - When binding the wire listener fails with "address already in use", and
+    separately with "permission denied", exactly one record is emitted with:
+    - level error, `component=config`, message `wire listener bind failed`;
+    - `setting=proxy.listen`, `error=config`, and a `corral.error.detail`
+      from the SPEC-001 FR-29 enum (`EADDRINUSE` for the first case,
+      `other` for the second).
+  - The process exits 1 and emits no `invalid configuration` record.
+  - The record contains no host, address or port (marker check, as in
+    AC-1).
+
 ## Open questions
 
 Must be empty before approval.
 
-None for Amendment 3. The member-retention rule and the `killSessions`
-block are Owner decisions of 2026-10-25. The remaining changes are
-clarifications of existing text, for Owner approval with the text
-(Decisions log).
+None for Amendment 4.
+- The bind-failure record names a record the implementation already emits
+  and that FR-1 already required, so it involves no product decision.
+- The correction to the session-enumeration exposure follows the Owner
+  decision of 2026-10-25 ("document only").
+
+The Owner approves the text.
 
 ## Decisions log
 
@@ -2684,3 +2757,5 @@ part of Q1 (standalone) and Q5 (cross-client commands), and refined Q11/Q9
 | 2026-10-24 | Amendment 2 (incl. challenge-review fixes M1, S1–S4) approved by the Owner and promoted; R-1 to R-6 resolutions confirmed. | Owner approval, 2026-10-24. |
 | 2026-10-25 | **Amendment 3.** <br>**Owner decision, member retention:** non-matching servers are no longer dropped permanently. Only a member reporting a *different* `setName` (foreign) is ignored. It is re-checked every `upstream.heartbeat_interval` and re-admitted when it reports the matching `setName` again. A member reporting no `setName` (ghost or startup state during a rolling restart, recognised by `isreplicaset`) or failing its check (unreachable) stays in the known set and is re-checked on the normal schedule. FR-18's replica-set incompatibility from seed results is kept consistent: it applies only while no matching member has been found since startup; ghost and unreachable seeds never cause it; after a matching member has been found, losing all of them is transient unavailability. This replaces the revision 4/5 text "not monitored further" and "non-matching seeds stop being checked" (Terms, FR-9, FR-18, FR-37, NFR, FR-51, AC-18, AC-56). <br>**Owner decision, `killSessions`:** `killSessions` with an empty array, or an argument that is not a non-empty array, is blocked like `killAllSessions`: code 13 `Unauthorized`, the fixed message, detail `command_blocked`. Under the shared identity it would kill every client's sessions. `killSessions` with explicit session IDs is still forwarded and is listed as residual exposure. FR-9 reads only whether the argument is empty or not an array. FR-38's deciding-field rule covers the argument (FR-9, FR-33, FR-38, FR-51, FR-61, Synthesized error replies, Behavior on failure, Data and compliance, AC-58). The residual-exposure list now states that every remaining route is mitigated by least privilege, and names `$listSessions` / `$listLocalSessions` / `listSessions`, explicit-`lsid` `killSessions`, and `explain`-wrapped or `$unionWith` / `$lookup`-nested `$currentOp`. <br>**Spec-writer clarifications of existing text (wave 2 code review), for Owner approval with the text:** <br>(a) the FR-35 single retry applies only to check failures of class `network` or `timeout` (including TLS); other unsuccessful outcomes are applied at once; <br>(b) `writeConcernError.code` marks a host only in an `ok: 1` reply, and in an `ok: 0` reply only the top-level `code` counts; <br>(c) when a server becomes the target, corral runs an immediate check of it (still at least 500 ms after the previous one) that authenticates on its monitoring connection (FR-22, FR-37). <br>AC-57 covers these. No SPEC-001 change is needed. AC-56 to AC-58 added; AC-18 adjusted. <br>**Challenge-review fixes (APPROVE with should-fixes):** <br>- S1: a ghost is defined exactly as `isreplicaset: true` without `setName`; a standalone-looking or `mongos` member after a match is "other non-matching", kept and re-checked but never the target and with no discovery; AC-56 gains the standalone-after-match case. <br>- S2: the "compatible → incompatible" example is now a single-`mongos` host re-pointed at a replica set. <br>- Nit: a foreign server is kept while it is a seed or still listed by a matching member. | Owner decisions of 2026-10-25 (member retention; `killSessions` block) and Orchestrator request from the wave 2 code review. Promotion awaits Owner approval of the text. |
 | 2026-10-25 | Amendment 3 (incl. challenge-review fixes S1, S2) approved by the Owner and promoted; clarifications confirmed. | Owner approval, 2026-10-25. |
+| 2026-10-25 | **Amendment 4.** A gap found in code review: FR-1 required a record when the wire listener cannot bind, but did not name it. The record is now declared as the implementation emits it: level error, `component=config`, the fixed message `wire listener bind failed`, `setting=proxy.listen`, `error` (class `config`) and `corral.error.detail` from the bind error (for example `EADDRINUSE`), and no address, host or port; exit 1. It mirrors SPEC-003 Amendment 3's `admin listener bind failed`, so that `invalid configuration` alone still identifies load-time config errors (exit 2). FR-1, the log events table (new `config` row), Behavior on failure, AC-1 (adjusted) and new AC-59 are updated. No SPEC-001 change is needed: the record uses an existing component and existing keys. <br>**Owner decision 2026-10-25 ("document only"), session-enumeration exposure:** <br>- The Amendment 3 residual-exposure text was wrong to say least privilege mitigates `$listSessions` / `$listLocalSessions`. For the caller's own user these stages need no special privilege. <br>- Under the shared upstream identity, any client can therefore list every client's session IDs, then end those sessions through `killSessions` with explicit IDs, which FR-33 forwards. `endSessions` and `abortTransaction` / `commitTransaction` with another client's `lsid` work the same way. <br>- Least privilege does not prevent this. corral does not block it, by Owner decision. FR-51 operator documentation must state it. <br>- Changes: Data and compliance (the first residual list now has only the `allUsers` / other-users forms; a new session enumeration and termination route; the explicit-`lsid` bullet no longer says a leaked ID is needed; the closing mitigation paragraph), NFR Security "Cross-client effects", and a new FR-51 bullet. FR-33 and blocking behaviour are unchanged, and no AC changes, because the change is documentation only. | Gap found in code review, relayed by the Orchestrator, 2026-10-25; Owner decision "document only" on the session-enumeration exposure, relayed by the Orchestrator, 2026-10-25. Promotion awaits Owner approval of the text. |
+| 2026-10-25 | Amendment 4 approved by the Owner and promoted (bind-failure record; session enumeration/termination residual exposure documented by Owner decision, flagged for security@emag.ro). | Owner approval, 2026-10-25. |
