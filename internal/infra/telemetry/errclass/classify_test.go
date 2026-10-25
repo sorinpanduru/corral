@@ -434,3 +434,44 @@ func TestClassify_RealConnDeadline(t *testing.T) {
 		t.Fatalf("Classify = (%s, %s)", c, d)
 	}
 }
+
+// FR-45 (TLS handshake errors): an error wrapped by errclass.TLSHandshake is
+// network/tls_handshake even when the underlying cause is a reset or an EOF (a
+// peer that drops or garbles the ClientHello), while a deadline stays
+// timeout/deadline_exceeded.
+func TestClassify_TLSHandshakeWrapper_FR45(t *testing.T) {
+	cases := []struct {
+		name   string
+		err    error
+		class  errclass.Class
+		detail errclass.Detail
+	}{
+		{"ECONNRESET", &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}, errclass.ClassNetwork, errclass.DetailTLSHandshake},
+		{"EPIPE", &net.OpError{Op: "write", Net: "tcp", Err: os.NewSyscallError("write", syscall.EPIPE)}, errclass.ClassNetwork, errclass.DetailTLSHandshake},
+		{"EOF", io.EOF, errclass.ClassNetwork, errclass.DetailTLSHandshake},
+		{"unexpected EOF", io.ErrUnexpectedEOF, errclass.ClassNetwork, errclass.DetailTLSHandshake},
+		{"an alert", tls.AlertError(40), errclass.ClassNetwork, errclass.DetailTLSHandshake},
+		{"a certificate error", x509.UnknownAuthorityError{}, errclass.ClassNetwork, errclass.DetailTLSHandshake},
+		{"context deadline", context.DeadlineExceeded, errclass.ClassTimeout, errclass.DetailDeadlineExceeded},
+		{"os deadline", os.ErrDeadlineExceeded, errclass.ClassTimeout, errclass.DetailDeadlineExceeded},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			wrapped := errclass.TLSHandshake(tc.err)
+			if wrapped == nil {
+				t.Fatal("TLSHandshake returned nil for a non-nil error")
+			}
+			class, detail := errclass.Classify(wrapped)
+			if class != tc.class || detail != tc.detail {
+				t.Fatalf("Classify = %s/%s, want %s/%s", class, detail, tc.class, tc.detail)
+			}
+			// The cause is still reachable.
+			if !errors.Is(wrapped, tc.err) && tc.name != "a certificate error" {
+				t.Fatalf("the wrapper hides its cause")
+			}
+		})
+	}
+	if errclass.TLSHandshake(nil) != nil {
+		t.Fatal("TLSHandshake(nil) is not nil")
+	}
+}

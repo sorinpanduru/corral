@@ -179,3 +179,47 @@ func (c *corral) waitMetricAtLeastTwin(want float64, name string, kv ...string) 
 	c.t.Helper()
 	eventually(c.t, name, func() bool { return c.metric(name, kv...) >= want })
 }
+
+// FR-45: corral with upstream TLS against a PLAINTEXT upstream. When the
+// upstream drops the connection at once, the failure is a TLS handshake
+// failure (network/tls_handshake), not a bare reset or EOF. When it instead
+// reads the ClientHello as a frame header and waits for the rest, the handshake
+// hits upstream.connect_timeout and stays timeout/deadline_exceeded.
+func TestUpstreamTLSAgainstPlaintextUpstream_FR45(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		setup  func(*mongosim.Server)
+		class  string
+		detail string
+		metric string
+	}{
+		{"dropped connection", func(s *mongosim.Server) { s.RefuseNew(true) }, "network", "tls_handshake", "network"},
+		{"garbled ClientHello waited on", func(*mongosim.Server) {}, "timeout", "deadline_exceeded", "timeout"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tw := mongosTwin(t) // plaintext
+			tc.setup(tw)
+			ca := mongosim.NewAuthority(t).CAFile()
+			c := start(t, tlsOptsFor(tw, ca, map[string]string{"upstream.connect_timeout": "1s"}))
+			c.waitReadyz(503, "upstream_unavailable")
+			c.waitMetricAtLeastTwin(1, "corral_upstream_connect_errors_total", "kind", "monitor", "error_class", tc.metric)
+			rec := c.waitRecords("upstream connection failed", 1)[0]
+			if rec["error"] != tc.class || rec["corral.error.detail"] != tc.detail {
+				t.Fatalf("record %v: want error=%s, corral.error.detail=%s", rec, tc.class, tc.detail)
+			}
+			if code, body := c.readyz(); code != 503 || body != "upstream_unavailable" {
+				t.Fatalf("readiness %d %q", code, body)
+			}
+			conn := c.dial()
+			if m := rt(t, conn, find(1, "plain-upstream")); code(m) != 6 {
+				t.Fatalf("request: %v", doc(m))
+			}
+			if n := len(tw.Received()); n != 0 {
+				t.Fatalf("the plaintext upstream received %d messages", n)
+			}
+			if tw.ConnAttemptsBy("corral") != 0 {
+				t.Fatal("a pool connection was opened")
+			}
+		})
+	}
+}
