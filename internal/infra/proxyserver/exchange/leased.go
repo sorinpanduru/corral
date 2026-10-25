@@ -88,8 +88,13 @@ func (x *msg) leased(ctx context.Context, ex spans.Exchange, lease Lease) (proxy
 	nc := up.NetConn()
 	rt := ex.RoundTrip(ctx, serverAddr(up.Host()), up.ID())
 
-	hdr, _ := wire.RewriteRequestHeader(x.prefix[:20], up.Correlator().Next())
 	flags := x.req.Flags
+	reqID := up.Correlator().Next()
+	if flags&wire.FlagMoreToCome != 0 {
+		// No reply will ever match this ID: do not leave it outstanding.
+		up.Correlator().Forget(reqID)
+	}
+	hdr, _ := wire.RewriteRequestHeader(x.prefix[:20], reqID)
 	forwardEnd := int64(x.h.Length)
 	if flags&wire.FlagChecksumPresent != 0 {
 		forwardEnd -= 4 // the checksum is stripped, never forwarded

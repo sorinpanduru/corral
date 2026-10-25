@@ -77,6 +77,10 @@ func (c *Correlator) Match(responseTo int32) error {
 	return nil
 }
 
+// Forget drops an ID recorded by Next without a reply to match, for requests
+// that never get one (moreToCome). It does nothing for an unknown ID.
+func (c *Correlator) Forget(id int32) { delete(c.out, id) }
+
 // Outstanding returns the number of outstanding requests.
 func (c *Correlator) Outstanding() int { return len(c.out) }
 
