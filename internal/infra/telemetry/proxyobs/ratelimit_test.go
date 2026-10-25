@@ -1,6 +1,7 @@
 package proxyobs_test
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -40,6 +41,9 @@ func limitedEvents() []limited {
 		}},
 		{"upstream target marked not primary", func(r *rig) { r.ad.Upstream().TargetMarkedNotPrimary(r.ctx, "h:1", 10107, "NotWritablePrimary") }},
 		{"upstream protocol error", func(r *rig) { r.ad.Pool().ConnUnsolicited(r.ctx, "h:1") }},
+		// RC5: the panic record is rate-limited too, so a client that can
+		// trigger panics cannot flood the log.
+		{"request handler panic recovered", func(r *rig) { r.ad.Proxy().PanicRecovered(r.ctx, errors.New("synthetic panic")) }},
 	}
 }
 

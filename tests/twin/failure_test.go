@@ -148,3 +148,22 @@ func TestOpenConnectionsSurviveUpstreamOutage_AC23(t *testing.T) {
 		}
 	}
 }
+
+// RC5 (FR-42, FR-49): the "request handler panic recovered" record is
+// rate-limited (one per 30 s), while every panic is still counted: each closes
+// its connection with reason internal_error.
+func TestPanicRecordRateLimitedMetricsCountAll_RC5(t *testing.T) {
+	c, _ := startMongos(t, opts{panicCmd: "boomRC5"})
+	c.waitReady()
+	const n = 6
+	closed := c.metric("corral_client_connections_closed_total", "reason", "internal_error")
+	for i := 0; i < n; i++ {
+		conn := c.dial()
+		conn.Send(cmd(int32(i+1), "boomRC5", 1, "$db", "d"))
+		closedNoBytes(t, conn)
+	}
+	c.waitDelta(closed, n, "corral_client_connections_closed_total", "reason", "internal_error")
+	if got := len(c.records("request handler panic recovered")); got != 1 {
+		t.Fatalf("%d panic records for %d panics within 30 s, want 1", got, n)
+	}
+}
