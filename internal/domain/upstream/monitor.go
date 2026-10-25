@@ -19,6 +19,7 @@ type host struct {
 	checking bool
 	retrying bool
 	checked  bool // has been checked at least once
+	reported bool // a check has finished at least once (success or failure)
 	last     time.Time
 
 	override    time.Time // immediate-check time (FR-37); zero when none
@@ -304,7 +305,9 @@ func (m *Monitor) apply(h *host, req CheckRequest, rep Report, seq uint64) {
 			return
 		}
 		h.retrying, h.checking, h.up = false, false, false
+		h.reported = true
 	} else {
+		h.reported = true
 		h.retrying, h.checking, h.up = false, false, true
 		h.hasReport, h.rep = true, rep
 		if h.markedNP && seq > h.markSeq {
@@ -454,7 +457,17 @@ func (m *Monitor) evaluate() evalResult {
 			r.target, r.hasTarget, r.params = chosen.addr, true, chosen.rep.Params
 		}
 	}
-	if !r.incompat && !m.matchEver {
+	// Seed results decide incompatibility only once every seed has reported
+	// once, so the arrival order of the first checks cannot flap the state: a
+	// foreign seed that answers before the matching members is not yet
+	// incompatibility.
+	seedsReported := true
+	for _, sd := range m.cfg.Seeds {
+		if h := m.byAdr[sd]; h == nil || !h.reported {
+			seedsReported = false
+		}
+	}
+	if !r.incompat && !m.matchEver && seedsReported {
 		// Only a foreign, standalone or mongos seed counts, and only until a
 		// matching member has been found since startup. Ghost and unreachable
 		// seeds never do (Amendment 3).
