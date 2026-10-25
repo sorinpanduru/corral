@@ -305,8 +305,8 @@ func (x *msg) reply(lease Lease, up Upstream, rt spans.Step, ex spans.Exchange) 
 		if n > total {
 			n = total
 		}
-		if rem := total - n; rem > 0 && rem < 4 {
-			n = total - 4
+		if rem := total - n; strip > 0 && rem > 0 && rem < int64(strip)+1 {
+			n = total - int64(strip) - 1 // the last chunk keeps a body byte with the checksum
 		}
 		if _, err := io.ReadFull(nc, rb[:n]); err != nil {
 			return x.upstreamFail(lease, rt, ex, errorf("read from the upstream failed", err))
