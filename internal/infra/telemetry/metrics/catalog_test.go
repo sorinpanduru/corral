@@ -10,18 +10,24 @@ import (
 
 const droppedHelp = "Spans dropped because the trace export queue was full."
 
-// FR-31, FR-37: the embedded catalog has exactly the spans-dropped counter.
-func TestEmbeddedCatalogContainsOnlySpansDropped(t *testing.T) {
+// FR-31, FR-37: the embedded catalog holds the spans-dropped counter unchanged
+// (SPEC-002 adds 23 more metrics; see catalog_spec002_test.go).
+func TestEmbeddedCatalogContainsSpansDropped(t *testing.T) {
 	c, err := metrics.LoadCatalog()
 	if err != nil {
 		t.Fatalf("LoadCatalog: %v", err)
 	}
-	if len(c.Metrics) != 1 {
-		t.Fatalf("embedded catalog has %d entries, want exactly 1", len(c.Metrics))
+	if len(c.Metrics) != 24 {
+		t.Fatalf("embedded catalog has %d entries, want 24 (1 + 23 from SPEC-002)", len(c.Metrics))
 	}
-	m := c.Metrics[0]
-	if m.Name != "corral_tracing_spans_dropped_total" {
-		t.Errorf("name = %q", m.Name)
+	var m *metrics.MetricDef
+	for i := range c.Metrics {
+		if c.Metrics[i].Name == "corral_tracing_spans_dropped_total" {
+			m = &c.Metrics[i]
+		}
+	}
+	if m == nil {
+		t.Fatal("spans-dropped counter missing")
 	}
 	if metrics.NameTracingSpansDropped != "corral_tracing_spans_dropped_total" {
 		t.Errorf("NameTracingSpansDropped = %q", metrics.NameTracingSpansDropped)

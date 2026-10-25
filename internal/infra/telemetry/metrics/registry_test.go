@@ -175,7 +175,10 @@ func TestPromlintCorralFamilies(t *testing.T) {
 	if err := metrics.RegisterAll(f2); err != nil {
 		t.Fatal(err)
 	}
-	lintFamilies(t, corralFamilies(t, reg2), 1)
+	// Label-less metrics (and histograms) appear without observations: the
+	// spans-dropped counter plus 10 label-less SPEC-002 metrics. Labelled
+	// families are linted in catalog_spec002_test.go.
+	lintFamilies(t, corralFamilies(t, reg2), 11)
 }
 
 func lintFamilies(t *testing.T, fams []*dto.MetricFamily, want int) {
