@@ -1,6 +1,7 @@
 package upstream_test
 
 import (
+	"context"
 	"os"
 	"sync/atomic"
 	"testing"
@@ -111,5 +112,65 @@ func TestFailedAuthCheckKeepsTargetUnusableUntilSuccess_FR22(t *testing.T) {
 	h.rec.mu.Unlock()
 	if len(ko) != 0 {
 		t.Fatalf("AuthFailed observer calls for a transient stall: %v", ko)
+	}
+}
+
+// FR-37 (SDAM): an immediate check requested while a slow check (longer than
+// 500 ms) is in flight does not start at once when that check ends: the next
+// check starts exactly 500 ms after the slow one ENDS.
+func TestImmediateCheckDuringSlowCheckWaitsFromItsEnd_FR37(t *testing.T) {
+	h := newHarness(t, rsCfg(A), healthyRS, false)
+	var armed atomic.Bool
+	release := make(chan struct{})
+	h.chk.mu.Lock()
+	h.chk.hook = func(req upstream.CheckRequest) {
+		if req.Host == A && armed.Load() && !req.Fresh {
+			armed.Store(false)
+			<-release
+		}
+	}
+	h.chk.mu.Unlock()
+	h.start()
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	h.waitState("target", func(s upstream.State) bool { return s.HasTarget })
+	h.quiet()
+	n0 := len(h.chk.of(A))
+
+	// The next heartbeat check of A starts and stays in flight (slow).
+	armed.Store(true)
+	for i := 0; i < 80 && len(h.chk.of(A)) == n0; i++ {
+		h.clk.WaitForTimers(1, time.Second)
+		h.clk.Advance(500 * time.Millisecond)
+		time.Sleep(2 * time.Millisecond)
+	}
+	h.waitCount(A, n0+1)
+	started := h.chk.of(A)[n0].At
+	h.clk.Advance(800 * time.Millisecond) // the check is slow: longer than 500 ms
+	// An immediate check is requested while it is in flight.
+	h.m.PoolConnectFailed(context.Background(), A, netErr())
+	time.Sleep(30 * time.Millisecond)
+	if n := len(h.chk.of(A)); n != n0+1 {
+		t.Fatalf("a second check of A started while the slow one was in flight (%d checks)", n)
+	}
+	// The slow check ends now.
+	ended := h.clk.Now()
+	close(release)
+	time.Sleep(30 * time.Millisecond)
+	h.clk.Advance(499 * time.Millisecond)
+	time.Sleep(30 * time.Millisecond)
+	if n := len(h.chk.of(A)); n != n0+1 {
+		t.Fatalf("the next check started %v after the slow one ended, want exactly 500 ms (not at once)", h.clk.Now().Sub(ended))
+	}
+	h.clk.Advance(time.Millisecond)
+	h.waitCount(A, n0+2)
+	next := h.chk.of(A)[n0+1].At
+	if got := next.Sub(ended); got != 500*time.Millisecond {
+		t.Fatalf("the next check started %v after the slow one ended (it started %v before), want exactly 500 ms", got, started)
 	}
 }
