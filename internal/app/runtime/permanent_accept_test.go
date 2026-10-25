@@ -1,7 +1,10 @@
 package runtime_test
 
 import (
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"regexp"
 	"strings"
 	"sync"
@@ -68,10 +71,22 @@ func portOf(addr string) string { return addr[strings.LastIndex(addr, ":")+1:] }
 func TestPermanentAcceptErrorShutsDownWithoutDelay_AC60(t *testing.T) {
 	twin := mongosim.Start(t, mongosim.Options{Hello: mongosim.HelloSpec{Role: mongosim.Mongos}})
 	hold := twin.AddRule(mongosim.Match{Marker: "held"}, mongosim.Hold())
+	// A plain HTTP sink for OTLP/HTTP exports. The in-process gRPC collector is
+	// not used: its server races with Run's gRPC log bridge under -race.
+	var exports atomic.Int32
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if n, _ := io.Copy(io.Discard, r.Body); n > 0 {
+			exports.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(sink.Close)
 	fl := newFault()
 	proxyAddr, adminAddr := reserveAddr(t), reserveAddr(t)
 	p := startProxy(t, proxyOpts{upstream: twin.Addr(), proxy: proxyAddr, admin: adminAddr, hooks: wrapWith(fl),
-		extra: []string{"--proxy.shutdown.listener_close_delay=60s"}})
+		extra: []string{"--proxy.shutdown.listener_close_delay=60s", "--tracing.enabled=true"},
+		env:   []string{"OTEL_EXPORTER_OTLP_ENDPOINT=" + sink.URL, "OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf"}})
 	p.waitStarted()
 	eventually(t, "ready", func() bool { r, err := get(adminAddr, "/readyz"); return err == nil && r.status == 200 })
 
@@ -143,9 +158,20 @@ func TestPermanentAcceptErrorShutsDownWithoutDelay_AC60(t *testing.T) {
 	if regexp.MustCompile(`\b` + portOf(proxyAddr) + `\b`).Match(p.out.bytes()) {
 		t.Fatal("the port number appears in the output")
 	}
-	// The tracing flush (SPEC-001 FR-34) is not asserted here: an in-process
-	// fake OTLP collector races with Run's gRPC log bridge under -race, so the
-	// flush after a failure shutdown is covered by the normal shutdown tests.
+	// Pool and monitoring connections are closed (FR-47 step 5)...
+	eventually(t, "every upstream connection closed", func() bool {
+		for _, ci := range twin.Conns() {
+			if ci.Open {
+				return false
+			}
+		}
+		return len(twin.Conns()) > 0
+	})
+	// ...and the tracing flush ran (SPEC-001 FR-34): the exchange's spans were
+	// exported before the process exited.
+	if exports.Load() == 0 {
+		t.Fatal("no span export reached the OTLP sink: the tracing flush did not run")
+	}
 }
 
 // A second signal during that shutdown ends the drain at once but the exit

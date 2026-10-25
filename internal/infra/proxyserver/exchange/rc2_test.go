@@ -2,6 +2,7 @@ package exchange_test
 
 import (
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,7 +23,7 @@ func TestSlowDrippingReaderBoundedByOneTimeout_RC2(t *testing.T) {
 	const timeout = time.Second
 	r := newRig(t, opts{ioTimeout: timeout, poolMax: 1})
 	c := r.dial()
-	begin := time.Now()
+	var firstByte atomic.Int64 // unix nanos of the first reply byte the client read
 	c.Send(rawwire.OpMsg(rawwire.OpMsgOpts{RequestID: 1, Body: find("c", bson.E{Key: "corraltestReplyBytes", Value: 40 << 20})}))
 	stop := make(chan struct{})
 	defer close(stop)
@@ -36,7 +37,11 @@ func TestSlowDrippingReaderBoundedByOneTimeout_RC2(t *testing.T) {
 			case <-time.After(50 * time.Millisecond):
 			}
 			_ = nc.SetReadDeadline(time.Now().Add(time.Second))
-			if _, err := nc.Read(buf); err != nil {
+			n, err := nc.Read(buf)
+			if n > 0 {
+				firstByte.CompareAndSwap(0, time.Now().UnixNano())
+			}
+			if err != nil {
 				if ne, ok := err.(net.Error); ok && ne.Timeout() {
 					continue
 				}
@@ -47,8 +52,15 @@ func TestSlowDrippingReaderBoundedByOneTimeout_RC2(t *testing.T) {
 	if reason := r.waitServed(); reason != proxy.CloseIOTimeout {
 		t.Fatalf("close reason %q, want io_timeout", reason)
 	}
-	if d := time.Since(begin); d > 3*timeout {
-		t.Fatalf("closed after %v: the timeout (%v) is applied per chunk, not to the reply", d, timeout)
+	// The bound runs from the first reply byte: the time spent waiting for the
+	// upstream before it is not charged to the client (FR-57), so it must not
+	// count here either. A per-chunk deadline would take about 125 s.
+	fb := firstByte.Load()
+	if fb == 0 {
+		t.Fatal("the client never received a reply byte")
+	}
+	if d := time.Since(time.Unix(0, fb)); d > 3*timeout {
+		t.Fatalf("closed %v after the first reply byte: the timeout (%v) is applied per chunk, not to the reply", d, timeout)
 	}
 	if n := r.obs.nTimeouts(); n != 1 {
 		t.Fatalf("ClientIOTimeout calls = %d, want 1", n)

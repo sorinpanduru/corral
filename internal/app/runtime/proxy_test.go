@@ -53,6 +53,12 @@ func startProxy(t *testing.T, o proxyOpts) *proxyRun {
 			t.Setenv(k, "")
 		}
 	}
+	// The OTel SDK reads OTEL_* from the process environment.
+	for _, kv := range o.env {
+		if k, v, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "OTEL_") {
+			t.Setenv(k, v)
+		}
+	}
 	up := o.upstream
 	if up == "" {
 		up = reserveAddr(t)
