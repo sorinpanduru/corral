@@ -337,8 +337,9 @@ The other routes:
 - `connectionStatus`, which reveals the service identity's name;
 - `killSessions` with explicit `lsid` values naming another client's
   sessions, and `endSessions`, `abortTransaction` or `commitTransaction` sent
-  with another client's session id. Session ids are random 128-bit UUIDs, so
-  this needs a leaked id, not a guess;
+  with another client's session id. The ids are random 128-bit UUIDs, but a
+  client can list every client's ids without special privilege (see "Session
+  enumeration and kill" above), so do not rely on them being secret;
 - session-less cursors, which any client that knows the 64-bit cursor id can
   `getMore` or `killCursors`. Official drivers always use sessions, which bind
   a cursor to its `lsid`.
