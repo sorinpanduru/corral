@@ -119,8 +119,12 @@ func TestShutdownPhases_AC26(t *testing.T) {
 		t.Fatal("delay did not expire")
 	}
 	s.ListenerClosed()
+	if s.Phase() != proxy.PhaseServing {
+		t.Fatalf("phase after the listener closed (step 2): %v, want Serving until step 3", s.Phase())
+	}
+	s.Step3()
 	if s.Phase() != proxy.PhaseLate {
-		t.Fatalf("phase after the listener closed: %v, want Late", s.Phase())
+		t.Fatalf("phase after step 3: %v, want Late", s.Phase())
 	}
 }
 

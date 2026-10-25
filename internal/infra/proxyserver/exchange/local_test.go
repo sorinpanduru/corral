@@ -11,7 +11,14 @@ import (
 	"github.com/sorinpanduru/corral/internal/testkit/rawwire"
 )
 
-func code(m *rawwire.Message) int64 { return m.Docs[0].Lookup("code").AsInt64() }
+// code is the reply's error code, or 0 when it has none.
+func code(m *rawwire.Message) int64 {
+	v, err := m.Docs[0].LookupErr("code")
+	if err != nil {
+		return 0
+	}
+	return v.AsInt64()
+}
 
 // FR-13, FR-14: a handshake is answered locally over OP_MSG and OP_QUERY and
 // never reaches the upstream; connectionId is the client connection's ID.
@@ -214,6 +221,7 @@ func TestShutdownLateMessage_FR47(t *testing.T) {
 	idle := r.dial()
 	r.sd.Begin()
 	r.sd.ListenerClosed()
+	r.sd.Step3()
 	// A message first read after step 3.
 	m := roundTrip(t, busy, findM(2, "late"))
 	if code(m) != 91 || m.Docs[0].Lookup("codeName").StringValue() != "ShutdownInProgress" {

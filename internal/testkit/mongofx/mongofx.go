@@ -228,12 +228,46 @@ func initReplSet(tb testing.TB, o Opts, name string, addrs []string) {
 		members = append(members, bson.D{{Key: "_id", Value: i}, {Key: "host", Value: a}})
 	}
 	cmd(tb, direct, "admin", bson.D{{Key: "replSetInitiate", Value: bson.D{{Key: "_id", Value: name}, {Key: "members", Value: members}}}})
-	waitFor(tb, "a primary", 90*time.Second, func() error {
+	// Wait for a primary. An election that does not finish promptly (a loaded
+	// machine, a slow member) is nudged with replSetStepUp on the first member,
+	// at most once every 15 s; the wait is long enough for a slow start.
+	start := time.Now()
+	var nudged time.Time
+	waitFor(tb, "a primary", 150*time.Second, func() error {
 		r, err := try(direct, "admin", bson.D{{Key: "hello", Value: 1}})
 		if err == nil && r["isWritablePrimary"] != true {
 			err = errors.New("not yet primary")
+			if time.Since(start) > 15*time.Second && time.Since(nudged) > 15*time.Second {
+				nudged = time.Now()
+				_, _ = tryT(direct, "admin", bson.D{{Key: "replSetStepUp", Value: 1}, {Key: "skipDryRun", Value: true}}, 20*time.Second)
+			}
 		}
 		return err
+	})
+	// And for every member to settle as PRIMARY or SECONDARY, so that a test
+	// starts from a stable set.
+	waitFor(tb, "every member to be primary or secondary", 120*time.Second, func() error {
+		var st struct {
+			Members []struct {
+				Name     string `bson:"name"`
+				State    int32  `bson:"state"`
+				StateStr string `bson:"stateStr"`
+			} `bson:"members"`
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := direct.Database("admin").RunCommand(ctx, bson.D{{Key: "replSetGetStatus", Value: 1}}).Decode(&st); err != nil {
+			return err
+		}
+		if len(st.Members) != len(addrs) {
+			return errors.New("members missing from replSetGetStatus")
+		}
+		for _, m := range st.Members {
+			if m.State != 1 && m.State != 2 {
+				return fmt.Errorf("member %s in state %s", m.Name, m.StateStr)
+			}
+		}
+		return nil
 	})
 }
 
