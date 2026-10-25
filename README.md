@@ -27,18 +27,41 @@ Requires Go (see `go.mod`).
 
 ## Running
 
+corral needs an upstream: a replica set (set `upstream.replica_set`) or a
+single `mongos`. A standalone `mongod` is not supported. With the default
+SCRAM authentication, give the service credentials as files, never on the
+command line:
+
 ```
 make build
-./bin/corral -log.level=info -admin.listen=127.0.0.1:9187
+./bin/corral --upstream.hosts=db1.example:27017,db2.example:27017,db3.example:27017 \
+             --upstream.replica_set=rs0 \
+             --upstream.auth.username_file=/run/secrets/<name> \
+             --upstream.auth.password_file=/run/secrets/<name>
 ```
 
-`SIGINT` or `SIGTERM` triggers a graceful shutdown. See the operations guide
-below for settings and exit codes.
+For a single `mongos`, give exactly one address in `upstream.hosts` and leave
+`upstream.replica_set` unset. Use `--upstream.auth.mechanism=none` for an
+upstream without authentication.
 
-The admin listener has no authentication or TLS; read Security and operational warnings before binding a non-loopback address.
+Applications then connect to `proxy.listen` (default `127.0.0.1:27017`) with a
+plain connection string such as `mongodb://corral-host:27017/`. The admin
+listener (`admin.listen`, default `127.0.0.1:9187`) serves `/readyz`, which
+answers 200 once an upstream target is reachable, and `/metrics`.
+
+`SIGINT` or `SIGTERM` triggers a graceful shutdown; a second signal forces it.
+
+The admin listener has no authentication or TLS; read "Security and
+operational warnings" in the observability guide before binding a
+non-loopback address.
 
 ## Documentation
 
-- [Observability and operations](docs/operations/observability.md): settings,
-  admin endpoints, logging, tracing and security notes.
+- [Proxy operations](docs/operations/proxy.md): what corral supports,
+  connecting clients, the upstream, pooling, TLS, shutdown, the shared
+  upstream identity and its security implications.
+- [Configuration](docs/operations/configuration.md): configuration sources and
+  precedence, secrets as files, and the reference for every setting.
+- [Observability](docs/operations/observability.md): logging, metrics,
+  tracing, the admin endpoints and security notes.
 - Architecture decisions: `docs/adr/`.
