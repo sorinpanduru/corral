@@ -191,6 +191,17 @@ func classifyMsg(h Header, prefix []byte, fits bool) (Request, error) {
 		return Request{}, ErrMalformed()
 	}
 	r := Request{Kind: KindOpMsg, RequestID: h.RequestID, Flags: binary.LittleEndian.Uint32(prefix[16:]), FitsPrefix: fits}
+	// FR-5 order: structural checks on the prefix come before the size rule
+	// for local messages.
+	v := NewMsgValidator(h, false)
+	if err := v.Write(prefix[16:]); err != nil {
+		return Request{}, err
+	}
+	if fits {
+		if err := v.Close(); err != nil {
+			return Request{}, err
+		}
+	}
 	pos := 20
 	for {
 		if pos >= len(prefix) {
@@ -226,6 +237,9 @@ func classifyMsg(h Header, prefix []byte, fits bool) (Request, error) {
 	r.Command = first.Key()
 	cmd := r.Command
 	whole := st == bson.PartialOK // the first value is complete
+	if !whole && (slices.Contains(collectionCommands, cmd) || cmd == "getMore") {
+		return Request{}, ErrMalformed() // a deciding value outside the prefix (FR-38)
+	}
 
 	var p capPlan
 	p.add("db", bson.CaptureValue, "$db")
@@ -262,7 +276,11 @@ func classifyMsg(h Header, prefix []byte, fits bool) (Request, error) {
 	r.StartTransaction = p.flag(w, "startTxn")
 
 	if cmd == "killSessions" {
-		r.KillSessionsEmpty = killSessionsEmpty(first, whole)
+		empty, ok := killSessionsEmpty(first, whole)
+		if !ok {
+			return Request{}, ErrMalformed() // the argument starts outside the prefix
+		}
+		r.KillSessionsEmpty = empty
 	}
 	if whole && slices.Contains(collectionCommands, cmd) {
 		if s, ok := first.StringValue(); ok {
@@ -276,6 +294,10 @@ func classifyMsg(h Header, prefix []byte, fits bool) (Request, error) {
 		}
 		if s := p.str(w, "collection"); s != "" {
 			r.Collection, r.HasCollection = s, true
+		} else if i, ok := p.idx["collection"]; ok && w.Matched(i) {
+			if _, found := w.Captured(i); !found && !w.Complete() {
+				return Request{}, ErrMalformed() // the collection value is outside the prefix
+			}
 		}
 	case cmd == "aggregate":
 		if v, ok := p.get(w, "stage"); ok {
@@ -398,32 +420,22 @@ func splitDoc(b []byte, fits bool) (doc, rest []byte, err error) {
 	return b[:l], b[l:], nil
 }
 
-// killSessionsEmpty reports whether the first value of killSessions names no
-// session: an empty, absent or non-array list, or one with no document that
-// has a binary id. When the value is only partly
-// inside the prefix it is non-empty if its declared length says so.
-func killSessionsEmpty(first bson.Element, whole bool) bool {
+// killSessionsEmpty reports whether the argument of killSessions is an empty
+// array or not an array (Amendment 3: such a call would kill every session).
+// Any non-empty array is forwarded. The argument must start inside the prefix
+// (its type is known, and for an array its 4-byte length): otherwise the
+// caller refuses the message as malformed (FR-38).
+func killSessionsEmpty(first bson.Element, whole bool) (empty, ok bool) {
 	if first.Type() != bson.TypeArray {
-		return true
+		return true, true
 	}
-	if !whole {
-		return false // a value too large for the prefix cannot be empty
+	v := first.ValueBytes()
+	if len(v) < 4 {
+		return false, false
 	}
-	arr, _ := first.Array()
-	empty := true
-	// Explicit lsids: at least one element is a document with a binary id.
-	_ = bson.ForEach(arr, func(it bson.Element) bool {
-		d, ok := it.Document()
-		if !ok {
-			return true
-		}
-		if e, found, err := bson.Lookup(d, "id"); err == nil && found {
-			if _, _, isBin := e.Binary(); isBin {
-				empty = false
-				return false
-			}
-		}
-		return true
-	})
-	return empty
+	if whole {
+		arr, _ := first.Array()
+		return len(arr) <= 5, true
+	}
+	return int32(binary.LittleEndian.Uint32(v)) <= 5, true
 }

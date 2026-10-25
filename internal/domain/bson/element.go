@@ -21,6 +21,10 @@ type Element struct {
 // Key returns the element key.
 func (e Element) Key() string { return string(e.key) }
 
+// ValueBytes returns the value bytes seen so far (a view): the whole value
+// for a complete element, a prefix for a PartialKeyOnly element.
+func (e Element) ValueBytes() []byte { return e.val }
+
 // Type returns the element type.
 func (e Element) Type() Type { return e.typ }
 

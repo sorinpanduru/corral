@@ -151,6 +151,7 @@ type Walker struct {
 	found       []bool
 	vals        []Value
 	counts      []int
+	matched     uint64                // captures whose key was seen at its terminal position
 	topFirst    [MaxCaptureBytes]byte // first top-level key, bounded
 	topFirstLen int
 	topFirstSet bool
@@ -223,6 +224,10 @@ func resetInts(c []int, n int) []int {
 	clear(c)
 	return c
 }
+
+// Matched reports whether capture i's key has been seen, even if its value
+// is not complete yet (the value may extend beyond the bytes fed so far).
+func (w *Walker) Matched(i int) bool { return i >= 0 && i < 64 && w.matched&(1<<uint(i)) != 0 }
 
 // FirstKey returns the first top-level key once it has been read (truncated to
 // MaxCaptureBytes). ok is false before that, and for an empty document.
@@ -592,6 +597,7 @@ func (w *Walker) onKey() error {
 			continue
 		}
 		// Terminal match (first occurrence at this level).
+		w.matched |= bit
 		if d == 0 && len(path) == 1 {
 			w.counts[i]++
 		}
