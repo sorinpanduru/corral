@@ -45,7 +45,7 @@ func (c *conn) infoLocked() ConnInfo {
 		Index: c.idx, Remote: c.nc.RemoteAddr().String(), AppName: c.appName,
 		DriverName: c.driverName, DriverVersion: c.driverVersion,
 		Authenticated: c.authenticated, AuthMechanism: c.authMech, AuthUser: c.authUser,
-		Open: c.open, InFlight: c.inflight, SignatureForged: c.sigForged,
+		Open: c.open, InFlight: c.inflight || (c.open && (c.partial.Load() > 0 || len(c.in) > 0)), SignatureForged: c.sigForged,
 		PartialBytes: int(c.partial.Load()), BytesReceived: c.recvTotal.Load(), Blackholed: c.blackholed, Opened: c.opened, Closed: c.closed, Messages: c.nmsgs,
 	}
 }
@@ -83,13 +83,15 @@ func (c *conn) readLoop() {
 	defer close(c.in)
 	for {
 		raw, err := readFrame(&progressReader{r: c.nc, c: c})
-		c.partial.Store(0)
 		if err != nil {
+			// Keep PartialBytes: tests assert on bytes received before a
+			// close in the middle of a frame. No message is recorded.
 			c.close(false)
 			return
 		}
 		select {
 		case c.in <- raw:
+			c.partial.Store(0)
 		case <-c.done:
 			return
 		}

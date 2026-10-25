@@ -45,11 +45,13 @@ users and passwords only. Run: `go test -race ./twins/mongosim`.
 - `SendRaw(connIndex, b)`: unsolicited bytes on a connection (AC-46).
   `CloseConn(connIndex, reset)`: close one connection (FIN or RST).
 - Idle detection: `ConnInfo.InFlight` is true from receipt of a request until
-  it is fully handled (held, delayed, being answered); `IdleConns(appName)`
+  it is fully handled (held, delayed, being answered), and also while a partial
+  frame or a queued request exists; `IdleConns(appName)`
   lists open, non-in-flight connections with that handshake appName (use
   `"corral"` for idle pool connections).
 - Partial messages: `ConnInfo.PartialBytes` (bytes of the incomplete frame
-  received so far, 0 when none) and `ConnInfo.BytesReceived` (all bytes).
+  received so far, 0 when none; kept after a close in the middle of a frame, and
+  no message is recorded for it) and `ConnInfo.BytesReceived` (all bytes).
 - Refusal with attribution: `RefuseApp(appName, bool)` reads that appName's
   hello, records it (so `ConnAttemptsBy(appName)` counts it), then resets the
   connection without a reply, while other appNames (the monitor) are answered

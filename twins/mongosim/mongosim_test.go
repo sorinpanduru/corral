@@ -1021,3 +1021,29 @@ func TestPartialBytesAndPingErrors(t *testing.T) {
 		h.Remove()
 	}
 }
+
+func TestPartialBytesKeptAfterCloseMidFrame(t *testing.T) {
+	s := mongosim.Start(t, mongosim.Options{})
+	c := dial(t, s.Addr())
+	c.cmd(helloCmd("corral"))
+	d, _ := bson.Marshal(bson.D{{Key: "ping", Value: 1}, {Key: "$db", Value: "admin"}})
+	p := append(append(binary.LittleEndian.AppendUint32(nil, 0), 0), d...)
+	full := frame(mongosim.OpMsg, 5, 0, p)
+	c.nc.Write(full[:30])
+	if !poll(func() bool { return s.Conns()[0].PartialBytes == 30 }) {
+		t.Fatal("partial not seen")
+	}
+	if len(s.IdleConns("corral")) != 0 {
+		t.Fatal("a connection with a partial message is not idle")
+	}
+	c.nc.Close()
+	if !poll(func() bool { return !s.Conns()[0].Open }) {
+		t.Fatal("not closed")
+	}
+	if ci := s.Conns()[0]; ci.PartialBytes != 30 {
+		t.Fatalf("partial bytes lost: %d", ci.PartialBytes)
+	}
+	if n := len(s.Received()); n != 1 { // only the hello
+		t.Fatalf("incomplete frame recorded as a message: %d", n)
+	}
+}
