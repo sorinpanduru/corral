@@ -186,7 +186,7 @@ func TestShutdownSequence_AC26(t *testing.T) {
 		return false
 	})
 	order := h.order()
-	want := []string{proxyserver.HoldShutdownDelay, proxyserver.HoldListenerClosed, proxyserver.HoldStep3, proxyserver.HoldDrainExpired}
+	want := []string{proxyserver.HoldShutdownDelay, proxyserver.HoldListenerClosed, proxyserver.HoldStep3, proxyserver.HoldDrain, proxyserver.HoldDrainExpired}
 	if len(order) < len(want) {
 		t.Fatalf("hold points reached: %v", order)
 	}

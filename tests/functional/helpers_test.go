@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/sorinpanduru/corral/internal/testkit/corralargs"
+	"github.com/sorinpanduru/corral/twins/mongosim"
 )
 
 const (
@@ -246,7 +246,10 @@ func withMinimalProxyArgs(t *testing.T, args []string) []string {
 			return args // the test supplies its own proxy arguments
 		}
 	}
-	closed := corralargs.FreePort(t)
+	// ADR-0021: a reachable upstream, so readiness is 200 as the SPEC-001 and
+	// SPEC-003 tests expect. The twin runs in the test process and serves the
+	// separate binary on loopback; it needs no Docker.
+	twin := mongosim.Start(t, mongosim.Options{Hello: mongosim.HelloSpec{Role: mongosim.Mongos}})
 	out := append([]string(nil), args...)
-	return append(out, corralargs.Minimal(t, "127.0.0.1:"+strconv.Itoa(closed))...)
+	return append(out, corralargs.Minimal(t, twin.Addr())...)
 }

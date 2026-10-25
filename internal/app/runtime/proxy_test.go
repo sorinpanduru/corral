@@ -41,6 +41,8 @@ type proxyOpts struct {
 	extra    []string
 	hooks    func(*corralrt.Hooks)
 	env      []string
+	proxy    string // pre-reserved addresses, for hooks that need them
+	admin    string
 }
 
 func startProxy(t *testing.T, o proxyOpts) *proxyRun {
@@ -56,7 +58,14 @@ func startProxy(t *testing.T, o proxyOpts) *proxyRun {
 	}
 	args := corralargs.Minimal(t, up)
 	proxyAddr := strings.TrimPrefix(args[2], "--proxy.listen=")
-	admin := reserveAddr(t)
+	if o.proxy != "" {
+		proxyAddr = o.proxy
+		args[2] = "--proxy.listen=" + o.proxy
+	}
+	admin := o.admin
+	if admin == "" {
+		admin = reserveAddr(t)
+	}
 	args = append(args, "--admin.listen="+admin, "--upstream.heartbeat_interval=500ms")
 	args = append(args, o.extra...)
 	reg, err := settings.Registry()
@@ -169,8 +178,8 @@ func TestReadyzStartingAndNoWireListenerBeforeLastStep_AC1(t *testing.T) {
 		body   string
 		bound  bool
 	}
-	var proxyAddr, adminAddr string
-	p := startProxy(t, proxyOpts{hooks: func(h *corralrt.Hooks) {
+	proxyAddr, adminAddr := reserveAddr(t), reserveAddr(t) // known before the hook can run
+	p := startProxy(t, proxyOpts{proxy: proxyAddr, admin: adminAddr, hooks: func(h *corralrt.Hooks) {
 		h.BeforeLastStep = func(context.Context) {
 			r, _ := get(adminAddr, "/readyz")
 			c, err := net.DialTimeout("tcp", proxyAddr, 200*time.Millisecond)
@@ -182,8 +191,6 @@ func TestReadyzStartingAndNoWireListenerBeforeLastStep_AC1(t *testing.T) {
 			held.mu.Unlock()
 		}
 	}})
-	_ = p
-	proxyAddr, adminAddr = p.proxy, p.admin
 	p.waitStarted()
 	held.mu.Lock()
 	defer held.mu.Unlock()
@@ -267,15 +274,15 @@ func TestShutdownHoldPointsAndOrder_AC26(t *testing.T) {
 	var points []string
 	release := make(chan struct{})
 	var adminDuringDrain, wireClosed bool
-	var p *proxyRun
-	p = startProxy(t, proxyOpts{hooks: func(h *corralrt.Hooks) {
+	proxyAddr, adminAddr := reserveAddr(t), reserveAddr(t)
+	p := startProxy(t, proxyOpts{proxy: proxyAddr, admin: adminAddr, hooks: func(h *corralrt.Hooks) {
 		h.Hold = func(ctx context.Context, point string) {
 			mu.Lock()
 			points = append(points, point)
 			mu.Unlock()
 			if point == "shutdown_drain" {
-				r, err := get(p.admin, "/readyz")
-				c, derr := net.DialTimeout("tcp", p.proxy, 200*time.Millisecond)
+				r, err := get(adminAddr, "/readyz")
+				c, derr := net.DialTimeout("tcp", proxyAddr, 200*time.Millisecond)
 				if derr == nil {
 					c.Close()
 				}

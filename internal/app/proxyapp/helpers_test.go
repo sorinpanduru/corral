@@ -62,7 +62,13 @@ func load(t *testing.T, upstreamAddrs []string, extra []string, env []string) (s
 		}
 		hosts += a
 	}
-	args := []string{"--upstream.hosts=" + hosts, "--proxy.listen=" + proxyAddr, "--upstream.heartbeat_interval=500ms", "--pool.checkout_timeout=2s"}
+	args := []string{"--upstream.hosts=" + hosts, "--proxy.listen=" + proxyAddr}
+	if !hasArg(extra, "--upstream.heartbeat_interval") {
+		args = append(args, "--upstream.heartbeat_interval=500ms")
+	}
+	if !hasArg(extra, "--pool.checkout_timeout") {
+		args = append(args, "--pool.checkout_timeout=2s")
+	}
 	if !hasArg(extra, "--upstream.auth.mechanism") {
 		args = append(args, "--upstream.auth.mechanism=none")
 	}
@@ -170,7 +176,14 @@ func send(t *testing.T, c *rawwire.Conn, raw []byte) *rawwire.Message {
 	return m
 }
 
-func code(m *rawwire.Message) int64 { return m.Docs[0].Lookup("code").AsInt64() }
+// code is the reply's error code, or 0 when it has none (a success reply).
+func code(m *rawwire.Message) int64 {
+	v, err := m.Docs[0].LookupErr("code")
+	if err != nil {
+		return 0
+	}
+	return v.AsInt64()
+}
 
 // ---- metrics and records ----
 
