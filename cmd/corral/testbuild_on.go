@@ -45,7 +45,7 @@ func testBuild() (*registry.Registry, runtime.Hooks) {
 	if extra == nil {
 		return nil, hooks
 	}
-	reg, err := registry.New(append(settings.Groups(), *extra)...)
+	reg, err := registry.New(append([]registry.Group{settings.ObservabilityGroup()}, *extra)...) // T21: settings.Groups()
 	if err != nil {
 		os.Exit(1)
 	}

@@ -16,7 +16,7 @@ var errRatioRange = errors.New("settings: ratio out of range")
 
 // Groups lists every spec's group. A new spec adds exactly one group here.
 func Groups() []registry.Group {
-	return []registry.Group{observabilityGroup()}
+	return []registry.Group{ObservabilityGroup(), ProxyGroup()}
 }
 
 // Registry builds the registry of every group.

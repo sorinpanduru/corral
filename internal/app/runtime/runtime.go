@@ -124,7 +124,10 @@ func Run(ctx context.Context, in Inputs, hooks Hooks) int {
 	settingsReg := in.Registry
 	if settingsReg == nil {
 		var err error
-		if settingsReg, err = settings.Registry(); err != nil {
+		// T21 switches this to the full registry (with the SPEC-002 group)
+		// together with the wire listener; until then the proxy settings are
+		// not part of the process's configuration.
+		if settingsReg, err = settings.RegistryOf(settings.ObservabilityGroup()); err != nil {
 			logProgramming(stdout, err)
 			return exitFailure
 		}

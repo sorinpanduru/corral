@@ -21,7 +21,9 @@ const (
 	defaultSampleRatio = "1.0"
 )
 
-func observabilityGroup() registry.Group {
+// ObservabilityGroup is the SPEC-001 group (exported for in-process tests that
+// build a registry without the proxy group, ADR-0021).
+func ObservabilityGroup() registry.Group {
 	enum := func(vs ...string) types.Spec { return types.Spec{Kind: types.KindEnum, EnumValues: vs} }
 	def := func(name string, t types.Spec, d, desc string) registry.Decl {
 		return registry.Decl{Name: name, Type: t, Presence: registry.PresenceDefault, Default: d, Description: desc}
