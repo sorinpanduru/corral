@@ -26,7 +26,7 @@ var (
 	ErrServerSignature = errors.New("scram: server signature mismatch")
 	// ErrProtocol means a malformed or unexpected message, or a server error.
 	ErrProtocol = errors.New("scram: protocol error")
-	// ErrSASLprep means the username or password cannot be prepared.
+	// ErrSASLprep means the password cannot be prepared (the username is not prepped).
 	ErrSASLprep = errors.New("scram: credential rejected by SASLprep")
 	// ErrIterations means the server asked for fewer than 4096 or more than 1,000,000 iterations.
 	ErrIterations = errors.New("scram: iteration count outside the accepted range")

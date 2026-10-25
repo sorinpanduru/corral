@@ -221,7 +221,6 @@ func cleanEnv() []string {
 	return out
 }
 
-// SPEC-003 hold points keep the SPEC-003 file names held / release.
 // The SPEC-003 hold points keep the plain held/release file names (ADR-0014).
 // cmd/corral has no exported constant for them yet, so the names are listed
 // here; keep in step with cmd/corral/testbuild_on.go.

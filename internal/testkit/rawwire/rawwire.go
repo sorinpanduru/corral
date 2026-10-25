@@ -426,9 +426,15 @@ func NestedBody(n int, mixed bool) []byte {
 	out := make([]byte, 0, n*8+len(leaf))
 	for k := 1; k < n; k++ {
 		size := len(leaf) + 8*(n-k)
+		// The wrapper element is an array when mixed and k is even. Its key is
+		// an index ("0") when it sits inside an array level (the previous
+		// wrapper was an array), otherwise a field name.
 		typ, key := byte(0x03), byte('d')
 		if mixed && k%2 == 0 {
-			typ, key = 0x04, '0'
+			typ = 0x04
+		}
+		if mixed && k >= 2 && (k-1)%2 == 0 {
+			key = '0'
 		}
 		out = put32(out, uint32(size))
 		out = append(out, typ, key, 0)
