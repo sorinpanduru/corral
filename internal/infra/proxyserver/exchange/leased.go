@@ -296,7 +296,7 @@ func (x *msg) reply(lease Lease, up Upstream, rt spans.Step, ex spans.Exchange) 
 	// chunk is held until the whole reply has validated, so a reply with a bad
 	// tail never reaches the client complete (FR-58). The chunk sizes keep at
 	// least four bytes in the last chunk so a stripped checksum never straddles.
-	out := &replyOut{s: s, head: rew[:]}
+	out := &replyOut{s: s, head: rew[:], budget: proxy.NewIOBudget(d.IOTimeout, d.Clock)}
 	rb := make([]byte, ReplyChunk)
 	total := int64(h.Length) - 20
 	var last []byte
@@ -358,23 +358,27 @@ func (x *msg) replyWriteFail(lease Lease, rt spans.Step, ex spans.Exchange, err 
 }
 
 // replyOut writes a reply to the client. The 20-byte header goes out with the
-// first write; every write has its own deadline, so time spent waiting for the
-// upstream never counts against the client write.
+// first write. The whole reply shares one write budget (FR-57): only time spent
+// inside a client write is charged, so waiting for the upstream is free but a
+// slow-reading client cannot hold the lease for longer than the I/O timeout in
+// total.
 type replyOut struct {
-	s    *session
-	head []byte // pending header, nil once written
+	s      *session
+	head   []byte // pending header, nil once written
+	budget *proxy.IOBudget
 }
 
 func (o *replyOut) write(b []byte) error {
-	_ = o.s.cc.Conn.SetWriteDeadline(o.s.e.d.Clock.Now().Add(o.s.e.d.IOTimeout))
+	if o.head == nil && len(b) == 0 {
+		return nil
+	}
+	_ = o.s.cc.Conn.SetWriteDeadline(o.budget.BeginRead())
+	defer o.budget.EndRead()
 	if o.head != nil {
 		bufs := net.Buffers{o.head, b}
 		o.head = nil
 		_, err := bufs.WriteTo(o.s.cc.Conn)
 		return err
-	}
-	if len(b) == 0 {
-		return nil
 	}
 	_, err := o.s.cc.Conn.Write(b)
 	return err
