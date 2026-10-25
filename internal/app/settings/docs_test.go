@@ -28,30 +28,79 @@ func readDoc(t *testing.T, name string) string {
 	return string(b)
 }
 
-// AC-16: every registered setting's name, environment variable (and, for a
-// secret, its file references) appears in the document.
+// entries splits configuration.md into per-setting entries: a heading
+// "#### `<name>`" and the text up to the next heading.
+func entries(doc string) map[string]string {
+	out := map[string]string{}
+	heading := regexp.MustCompile("(?m)^#{2,6} +`([^`]+)`[ \t]*$")
+	idx := heading.FindAllStringSubmatchIndex(doc, -1)
+	for i, m := range idx {
+		end := len(doc)
+		if i+1 < len(idx) {
+			end = idx[i+1][0]
+		}
+		// an entry also ends at the next heading of any kind
+		rest := doc[m[1]:end]
+		if j := regexp.MustCompile("(?m)^#{1,6} ").FindStringIndex(rest); j != nil {
+			rest = rest[:j[0]]
+		}
+		out[doc[m[2]:m[3]]] = rest
+	}
+	return out
+}
+
+// AC-16 (strengthened): every registered setting, in every group (SPEC-001,
+// SPEC-002, SPEC-003), has its own entry in configuration.md that shows:
+//   - for an ordinary setting, its flag form --<name>= and its environment
+//     variable;
+//   - for a secret, that a literal flag is not accepted, its file-reference
+//     flag --<name>_file= and its CORRAL_..._FILE environment variable.
+//
+// A mention in a table alone does not satisfy it.
 func TestAC16_EverySettingIsDocumented(t *testing.T) {
 	doc := readDoc(t, "configuration.md")
 	r := mustRegistry(t)
 	if len(r.Settings()) == 0 {
 		t.Fatal("empty registry")
 	}
+	ents := entries(doc)
 	for _, s := range r.Settings() {
-		names := []string{s.Name, s.Env}
-		if s.Secret {
-			names = append(names, s.FileEnv, s.FileFlag)
+		body, ok := ents[s.Name]
+		if !ok {
+			t.Errorf("configuration.md has no entry (a heading with the setting name) for %s", s.Name)
+			continue
 		}
-		for _, n := range names {
-			if !strings.Contains(doc, n) {
-				t.Errorf("configuration.md does not mention %s (setting %s)", n, s.Name)
+		if !strings.Contains(body, s.Env) {
+			t.Errorf("the entry for %s does not show its environment variable %s", s.Name, s.Env)
+		}
+		if !s.Secret {
+			if want := "--" + s.Name + "="; !strings.Contains(body, want) {
+				t.Errorf("the entry for %s does not show its flag form %s", s.Name, want)
 			}
+			continue
+		}
+		if !strings.Contains(strings.ToLower(body), "not accepted") {
+			t.Errorf("the entry for secret %s does not say that a literal flag is not accepted", s.Name)
+		}
+		if want := "--" + s.Name + "_file="; !strings.Contains(body, want) {
+			t.Errorf("the entry for secret %s does not show %s", s.Name, want)
+		}
+		if !strings.Contains(body, s.FileEnv) {
+			t.Errorf("the entry for secret %s does not show %s", s.Name, s.FileEnv)
+		}
+		if !strings.Contains(s.FileEnv, "_FILE") || !strings.Contains(s.FileFlag, "_file") {
+			t.Errorf("unexpected file reference names for %s: %s, %s", s.Name, s.FileEnv, s.FileFlag)
 		}
 	}
-	// Non-vacuity: the five SPEC-001 settings are among those checked.
+	// Non-vacuity: the five SPEC-001 settings are among those checked, and
+	// there are entries for settings of the SPEC-002 groups too.
 	for _, n := range spec001Names {
 		if _, ok := r.Lookup(n); !ok {
 			t.Errorf("%s is not registered", n)
 		}
+	}
+	if _, ok := r.Lookup("proxy.listen"); !ok || len(r.Settings()) < 30 {
+		t.Errorf("the registry does not hold the SPEC-002 settings (%d settings)", len(r.Settings()))
 	}
 }
 
