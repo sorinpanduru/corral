@@ -68,8 +68,10 @@ rather than in the command document.
 ## No client authentication
 
 The wire listener does not authenticate clients. `saslStart`,
-`saslContinue` and `authenticate` are answered with an error (code 18 or 115),
-and applications must not send credentials. Protect the listener by
+`saslContinue` and `authenticate` are answered with code 18
+(`AuthenticationFailed`), and `getnonce` and `logout` with code 115
+(`CommandNotSupported`). Nothing is forwarded, and applications must not send
+credentials. Protect the listener by
 network placement (a private network, a firewall, a security group) or with
 mutual TLS: set `proxy.tls.enabled=true`, `proxy.tls.cert_path`, `proxy.tls.key` (by
 file) and `proxy.tls.client_ca_path`, and only clients with a certificate that
@@ -204,12 +206,16 @@ version it has seen to ignore a stale primary.
   seed is dropped.
 - **A member with a different replica set name** is ignored, but kept and
   re-checked, and re-admitted when it reports the configured name again. Once
-  a matching member has been seen, a mismatch never makes corral report the
-  upstream as incompatible. Readiness reports `upstream_incompatible` only
-  when no member ever matched.
-- A not-primary or shutdown code (10107, 13435, 13436, 11602, 11600, 189, 91)
-  in a forwarded reply, or in a `writeConcernError`, marks the host as not
-  primary until the next check confirms otherwise. Idle connections to that
+  a matching member has been seen, a set-name or topology mismatch never makes
+  corral report the upstream as incompatible, and losing all matching members
+  is transient unavailability. An incompatible wire version can still be
+  reported at any time, because it describes the target itself.
+- In replica-set mode, a not-primary or shutdown code (10107, 13435, 13436,
+  11602, 11600, 189, 91) as the top-level `code` of an `ok: 0` reply, or as
+  `writeConcernError.code` of an `ok: 1` reply, marks the host as not primary
+  until the next check confirms otherwise. Codes inside `writeErrors` never
+  mark it. With a single `mongos`, only a top-level 91 or 11600 in an `ok: 0`
+  reply marks the target. Idle connections to that
   host close with reason `not_primary`. The error reply itself goes to the
   client unchanged, and the driver's own retry logic applies.
 
@@ -233,7 +239,7 @@ reach a usable upstream, and 503 with one of these reasons otherwise:
 | `starting` | Startup has not completed. |
 | `upstream_unavailable` | No usable upstream target is known: no member is reachable, or there is no primary. |
 | `upstream_auth_failed` | The upstream rejected corral's credentials. Requests fail fast with code 6. |
-| `upstream_incompatible` | The upstream is a standalone, the wrong topology, the wrong replica set, or outside the supported wire version range. Requests fail fast with code 6. |
+| `upstream_incompatible` | The upstream is outside the supported wire version range (at any time), or is a standalone, the wrong topology or the wrong replica set while no matching member has been found since startup. Requests fail fast with code 6. |
 | `shutting_down` | Graceful shutdown has begun. |
 
 Startup does not wait for the upstream: corral binds the port as its last
@@ -241,10 +247,14 @@ startup step, and answers handshakes with code 6 until an upstream is
 available. `corral_upstream_available` is 1 exactly when `/readyz` is 200 for
 upstream reasons.
 
-After an authentication failure corral keeps checking, with an
-authentication backoff that grows from the heartbeat interval up to a cap
-(with jitter), and clears the state when a check or a pool connection
-authenticates again.
+An authentication failure is a code 18 or 334 reply to an authentication
+command, or a SCRAM server signature that fails verification; anything else
+(network errors, timeouts, other error replies) is transient. While the state
+is failing corral opens no pool connections. Each check of the target, every
+`upstream.heartbeat_interval` plus the reconnect backoff after consecutive
+failures (100 ms growing to 5 s, plus or minus 20% jitter), opens a fresh
+monitoring connection and authenticates on it. The first success clears the
+state.
 
 ## Shutdown
 
@@ -265,7 +275,7 @@ On the first SIGTERM or SIGINT, corral:
 `/readyz` answers 503 `shutting_down` for the whole sequence. A second
 SIGTERM or SIGINT during shutdown ends the drain at once: if it arrives during
 `proxy.shutdown.listener_close_delay` it cuts that delay short too, the
-listener closes, all client connections are closed, steps 5 follow, and the
+listener closes, all client connections are closed, step 5 follows, and the
 process exits 0. corral logs `shutdown forced by second signal` once; further
 signals are ignored.
 
@@ -331,7 +341,7 @@ Served by `/metrics`; label values come from fixed sets.
 | `corral_protocol_errors_total` | counter | Protocol violations, by `side` (client or upstream) and `error_detail`. |
 | `corral_requests_total` | counter | Requests, by command and outcome. |
 | `corral_request_duration_seconds` | histogram | Request duration, by command. |
-| `corral_request_errors_total` | counter | Failed requests, by command and error class. |
+| `corral_request_errors_total` | counter | Failed requests, by `error_class`. |
 | `corral_requests_dropped_total` | counter | moreToCome requests that got no reply because corral refused them. |
 | `corral_pool_connections` | gauge | Pool connections, by state. |
 | `corral_pool_max_connections` | gauge | The configured `pool.max_size`. |
@@ -372,7 +382,7 @@ message bytes, credentials, certificate data or client names.
 | `upstream` | `upstream authentication failed` | warn |
 | `upstream` | `upstream unavailable` | warn |
 | `upstream` | `upstream available` | info |
-| `upstream` | `upstream incompatible` | warn |
+| `upstream` | `upstream incompatible` | error |
 | `upstream` | `upstream primary changed` | info |
 | `upstream` | `upstream target marked not primary` | warn |
 | `upstream` | `upstream protocol error` | warn |
