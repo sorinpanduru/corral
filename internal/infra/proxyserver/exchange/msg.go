@@ -314,7 +314,7 @@ func partialCommand(b []byte) string {
 			// The size is attacker-controlled: bound it in int64 so the skip
 			// cannot wrap on a 32-bit platform.
 			size := int64(int32(binary.LittleEndian.Uint32(b[pos+1:])))
-			if size < 4 || size > int64(len(b))-int64(pos)-1 {
+			if size < 5 || size > int64(len(b))-int64(pos)-1 { // 4-byte length plus the identifier's NUL at least
 				return ""
 			}
 			pos += 1 + int(size)
