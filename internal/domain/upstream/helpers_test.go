@@ -305,3 +305,32 @@ func (r *recorder) snapshotMarked() []markedCall {
 	defer r.mu.Unlock()
 	return append([]markedCall(nil), r.marked...)
 }
+
+// stepUntil advances the fake clock in small steps until host has been checked
+// at least n times, so a test does not depend on the exact spacing (a failing
+// authentication state delays checks by the reconnect backoff).
+func (h *harness) stepUntil(host string, n int) {
+	h.t.Helper()
+	for i := 0; i < 400 && len(h.chk.of(host)) < n; i++ {
+		h.clk.WaitForTimers(1, time.Second)
+		h.clk.Advance(250 * time.Millisecond)
+		time.Sleep(2 * time.Millisecond)
+	}
+	h.waitCount(host, n)
+}
+
+// stepUntilState steps the clock until cond holds.
+func (h *harness) stepUntilState(what string, cond func(upstream.State) bool) upstream.State {
+	h.t.Helper()
+	var s upstream.State
+	for i := 0; i < 400; i++ {
+		if s = h.m.State(); cond(s) {
+			return s
+		}
+		h.clk.WaitForTimers(1, time.Second)
+		h.clk.Advance(250 * time.Millisecond)
+		time.Sleep(2 * time.Millisecond)
+	}
+	h.t.Fatalf("timed out stepping the clock until %s", what)
+	return s
+}

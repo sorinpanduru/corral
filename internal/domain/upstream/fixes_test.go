@@ -117,8 +117,7 @@ func TestRetryOnlyForTransportErrors_FR35(t *testing.T) {
 			}
 			h.chk.mu.Unlock()
 			h.chk.failWith(A, e)
-			h.advance(10 * time.Second)
-			h.waitCount(A, n0+2)
+			h.stepUntil(A, n0+2)
 			if !h.chk.of(A)[n0+1].Req.Fresh {
 				t.Fatal("the second check is not a fresh retry")
 			}
@@ -140,8 +139,7 @@ func TestRetryOnlyForTransportErrors_FR35(t *testing.T) {
 			h.quiet()
 			n0 := len(h.chk.of(A))
 			h.chk.failWith(A, e)
-			h.advance(10 * time.Second)
-			h.waitCount(A, n0+1)
+			h.stepUntil(A, n0+1)
 			h.waitState("target unknown", func(s upstream.State) bool { return !s.HasTarget })
 			h.quiet()
 			if got := len(h.chk.of(A)); got != n0+1 {

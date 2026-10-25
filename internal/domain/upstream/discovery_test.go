@@ -93,8 +93,7 @@ func TestDiscoveryFromSecondary_AC18(t *testing.T) {
 	h.waitState("primary found via the primary field", func(s upstream.State) bool { return s.HasTarget && s.Target == D })
 	// The arbiter is not monitored further.
 	h.quiet()
-	h.advance(10 * time.Second)
-	h.waitCount(B, 2)
+	h.stepUntil(B, 2)
 	h.quiet()
 	if n := len(h.chk.of(X)); n != 1 {
 		t.Fatalf("arbiter checked %d times, want 1", n)
@@ -115,8 +114,7 @@ func TestNonMatchingServerIgnoredButRechecked_FR37(t *testing.T) {
 	h.quiet()
 	nD := len(h.chk.of(D))
 	for i := 0; i < 3; i++ {
-		h.advance(10 * time.Second)
-		h.waitCount(D, nD+i+1)
+		h.stepUntil(D, nD+i+1)
 	}
 	if s := h.m.State(); s.Target != A || s.Incompatible {
 		t.Fatalf("a member of another set affected the state: %+v", s)
@@ -144,8 +142,7 @@ func TestUnreadyAndFailingMembersStayKnown_FR37(t *testing.T) {
 	h.quiet()
 	nB, nC := len(h.chk.of(B)), len(h.chk.of(C))
 	for i := 0; i < 3; i++ {
-		h.advance(10 * time.Second)
-		h.waitCount(B, nB+i+1)
+		h.stepUntil(B, nB+i+1)
 		h.waitCount(C, nC+i+1)
 	}
 	if s := h.m.State(); s.Incompatible || s.Target != A {
@@ -154,8 +151,7 @@ func TestUnreadyAndFailingMembersStayKnown_FR37(t *testing.T) {
 	// Both come up as members of the set and are then followed like any member.
 	h.chk.set(secondary(B, "rs0", A, A, B, C))
 	h.chk.set(secondary(C, "rs0", A, A, B, C))
-	h.advance(10 * time.Second)
-	h.waitCount(B, nB+4)
+	h.stepUntil(B, nB+4)
 	h.waitCount(C, nC+4)
 	// A steps down, B becomes primary with a larger pair: B is the target.
 	h.chk.set(secondary(A, "rs0", B, A, B, C))
@@ -288,8 +284,7 @@ func TestTwoFailuresMarkUnknown_AC32(t *testing.T) {
 	h.quiet()
 	n0 := len(h.chk.of(A))
 	h.chk.down(A)
-	h.advance(10 * time.Second)
-	h.waitCount(A, n0+2)
+	h.stepUntil(A, n0+2)
 	s := h.waitState("target unknown", func(s upstream.State) bool { return !s.HasTarget })
 	if !s.Reached {
 		t.Fatal("Reached must stay true after losing the target")

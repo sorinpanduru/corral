@@ -173,8 +173,7 @@ func TestAuthRecoveryChecks_AC25(t *testing.T) {
 	h.quiet()
 	n := len(h.chk.of(A))
 	for i := 0; i < 3; i++ {
-		h.advance(10 * time.Second)
-		h.waitCount(A, n+i+1)
+		h.stepUntil(A, n+i+1)
 	}
 	h.quiet()
 	cs := h.chk.of(A)
@@ -192,16 +191,14 @@ func TestAuthRecoveryChecks_AC25(t *testing.T) {
 	// Recovery: the next target check succeeds in authenticating.
 	good := primary(A, "rs0", A, B)
 	h.chk.set(good)
-	h.advance(10 * time.Second)
-	h.waitState("cleared", func(s upstream.State) bool { return !s.AuthFailing })
+	h.stepUntilState("cleared", func(s upstream.State) bool { return !s.AuthFailing })
 	if st := h.readiness(); !st.Ready {
 		t.Fatalf("readiness: %+v", st)
 	}
 	// After recovery, checks go back to reusing connections.
 	h.quiet()
 	n = len(h.chk.of(A))
-	h.advance(10 * time.Second)
-	h.waitCount(A, n+1)
+	h.stepUntil(A, n+1)
 	if c := h.chk.of(A)[n]; c.Req.Fresh {
 		t.Fatal("checks still ask for fresh connections after recovery")
 	}
