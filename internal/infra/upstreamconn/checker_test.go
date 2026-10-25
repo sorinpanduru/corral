@@ -151,9 +151,11 @@ func TestCheckerAuthFailureIsSeparate_AC41(t *testing.T) {
 			if r.AuthErr == nil || !upstream.IsAuthFailed(r.AuthErr) {
 				t.Fatalf("AuthErr = %v, want AuthFailed", r.AuthErr)
 			}
+			// Only the monitor reports authentication events; the checker
+			// reports the outcome through the Report fields.
 			rec.mu.Lock()
-			if len(rec.authKO) != 1 || rec.authKO[0] != "monitor" {
-				t.Errorf("AuthFailed observer calls: %v", rec.authKO)
+			if len(rec.authKO) != 0 {
+				t.Errorf("the checker reported AuthFailed events: %v", rec.authKO)
 			}
 			rec.mu.Unlock()
 		})
@@ -185,8 +187,8 @@ func TestCheckerAuthSucceededEvent_AC25(t *testing.T) {
 	}
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	if len(rec.authOK) != 1 || rec.authOK[0] != "monitor" {
-		t.Fatalf("AuthSucceeded calls: %v", rec.authOK)
+	if len(rec.authOK) != 0 {
+		t.Fatalf("the checker reported AuthSucceeded events (only the monitor does): %v", rec.authOK)
 	}
 }
 

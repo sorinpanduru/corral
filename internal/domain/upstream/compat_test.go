@@ -238,7 +238,11 @@ func TestIncompatibleThenCompatible_AC10(t *testing.T) {
 		t.Fatalf("readiness: %+v", st)
 	}
 	// And back again: a second transition, a second record.
-	h.chk.set(mongos(A))
+	// Amendment 3: the match is sticky, so the second transition is a wire
+	// version change (still allowed after a match).
+	r := primary(A, "rs0", A)
+	r.Params = params(0, 17)
+	h.chk.set(r)
 	h.advance(10 * 1e9)
 	h.waitState("incompatible again", func(s upstream.State) bool { return s.Incompatible })
 	eventually(t, "two incompatible records", func() bool {
@@ -249,7 +253,7 @@ func TestIncompatibleThenCompatible_AC10(t *testing.T) {
 	h.rec.mu.Lock()
 	second := h.rec.incompat[1]
 	h.rec.mu.Unlock()
-	if second != "topology_mismatch@"+A {
+	if second != "wire_version@"+A {
 		t.Fatalf("second record %q", second)
 	}
 }

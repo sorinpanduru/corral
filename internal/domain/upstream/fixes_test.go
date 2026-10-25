@@ -43,14 +43,19 @@ func TestChangeOrderOnIncompatibility_M1(t *testing.T) {
 			t.Fatalf("change %d (%v) precedes BecameIncompatible: %+v", i, cs[i].Kind, cs)
 		}
 	}
-	// The same transition through a standalone report on the single seed.
-	h2 := newHarness(t, rsCfg(A), func(c *fakeChecker) { c.set(primary(A, "rs0", A)) }, false).start()
+	// The same transition in single-mongos mode: the host is re-pointed at a
+	// replica-set member (Amendment 3: a match is sticky in replica-set mode,
+	// so the name-mismatch route is no longer available after a match).
+	h2 := newHarness(t, mongosCfg(A), func(c *fakeChecker) { c.set(mongos(A)) }, false).start()
 	h2.waitState("target", func(s upstream.State) bool { return s.HasTarget })
-	h2.chk.set(primary(A, "different-set", A))
+	h2.chk.set(primary(A, "rs0", A))
 	h2.advance(10 * time.Second)
-	waitIncompat(h2, "replica_set_name_mismatch", "")
+	waitIncompat(h2, "topology_mismatch", A)
 	cs = h2.changeKinds()
-	inc = indexOfChange(cs, upstream.BecameIncompatible, "")
+	inc = indexOfChange(cs, upstream.BecameIncompatible, A)
+	if inc < 0 {
+		t.Fatalf("no BecameIncompatible for the old target: %+v", cs)
+	}
 	for i := 0; i < inc; i++ {
 		if cs[i].Kind == upstream.HostNotPrimary {
 			t.Fatalf("HostNotPrimary precedes BecameIncompatible: %+v", cs)
@@ -220,7 +225,10 @@ func TestFailingStateChecksUseBackoff_FR56(t *testing.T) {
 	}
 	cs := h.chk.of(A)
 	gap := func(i int) time.Duration { return cs[i].At.Sub(cs[i-1].At) }
-	for i := 1; i < len(cs); i++ {
+	// The first gap is AC-57's immediate authenticating check of a new target
+	// (at least 500 ms after the previous one); only steady-state checks while
+	// auth is failing are spaced by the heartbeat and the backoff.
+	for i := 2; i < len(cs); i++ {
 		if gap(i) < cfg.HeartbeatInterval {
 			t.Fatalf("gap %d = %v is below the heartbeat interval", i, gap(i))
 		}

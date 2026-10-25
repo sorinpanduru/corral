@@ -63,9 +63,11 @@ func TestRemovedMembersLeaveKnownSet_AC56(t *testing.T) {
 	h.waitState("target", func(s upstream.State) bool { return s.Target == A })
 	h.waitCount(C, 1)
 	h.quiet()
-	// A's list drops C (and the others agree).
+	// A's list drops C (and the others agree), and C no longer reports the
+	// matching setName (Amendment 3: a matching member is never removed).
 	h.chk.set(primaryAt(A, "rs0", 1, 2, A, B))
 	h.chk.set(secondary(B, "rs0", A, A, B))
+	h.chk.set(secondary(C, "other-set", C, C))
 	eventually(t, "C removed and its connection closed", func() bool {
 		h.clk.WaitForTimers(1, time.Second)
 		h.clk.Advance(500 * time.Millisecond)

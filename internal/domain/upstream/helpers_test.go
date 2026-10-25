@@ -13,7 +13,10 @@ package upstream_test
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"net"
+	"os"
 	"sync"
 	"syscall"
 	"testing"
@@ -147,9 +150,18 @@ func (f *fakeChecker) Check(ctx context.Context, req upstream.CheckRequest) upst
 		if err == nil {
 			err = netErr()
 		}
-		return upstream.Report{Host: req.Host, Err: err}
+		return upstream.Report{Host: req.Host, Err: err, Transient: transientFailure(err)}
 	}
 	return r
+}
+
+// transientFailure mimics the real checker's classification (FR-35): network,
+// TLS and timeout errors are transient, anything else is not.
+func transientFailure(err error) bool {
+	var ne net.Error
+	var ae tls.AlertError
+	return errors.As(err, &ne) || errors.As(err, &ae) ||
+		errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func (f *fakeChecker) all() []call {
@@ -274,6 +286,25 @@ type recorder struct {
 	marked   []markedCall
 	ctxs     []context.Context
 	availCnt int
+	authOK   []string // kinds of AuthSucceeded calls
+	authKO   []string // kinds of AuthFailed calls
+	authErrs []error
+	authHost []string
+}
+
+func (r *recorder) AuthSucceeded(_ context.Context, kind, host string) {
+	r.mu.Lock()
+	r.authOK = append(r.authOK, kind)
+	r.authHost = append(r.authHost, host)
+	r.mu.Unlock()
+}
+
+func (r *recorder) AuthFailed(_ context.Context, kind, host string, err error) {
+	r.mu.Lock()
+	r.authKO = append(r.authKO, kind)
+	r.authErrs = append(r.authErrs, err)
+	r.authHost = append(r.authHost, host)
+	r.mu.Unlock()
 }
 
 type markedCall struct {
