@@ -222,13 +222,22 @@ func TestShutdownLateMessage_FR47(t *testing.T) {
 	r.sd.Begin()
 	r.sd.ListenerClosed()
 	r.sd.Step3()
-	// A message first read after step 3.
-	m := roundTrip(t, busy, findM(2, "late"))
-	if code(m) != 91 || m.Docs[0].Lookup("codeName").StringValue() != "ShutdownInProgress" {
-		t.Fatalf("late message: %v", m.Docs[0])
+	// A message first read after step 3 gets 91 and the connection then closes.
+	// A connection that is idle when step 3 starts is closed at once instead
+	// (FR-47 step 3), so racing the close is also correct: either the 91 reply
+	// and a close, or a close with no bytes. The deterministic version of this
+	// (the hook holding step 3) is TestShutdownStep3Behaviour_FR47.
+	if err := busy.Send(findM(2, "late")); err != nil {
+		t.Log("send:", err)
 	}
-	if _, err := busy.ReadMessage(5 * time.Second); err == nil {
-		t.Fatal("the connection stayed open after the 91 reply")
+	m, err := busy.ReadMessage(5 * time.Second)
+	if err == nil {
+		if code(m) != 91 || m.Docs[0].Lookup("codeName").StringValue() != "ShutdownInProgress" {
+			t.Fatalf("late message: %v", m.Docs[0])
+		}
+		if _, err := busy.ReadMessage(5 * time.Second); err == nil {
+			t.Fatal("the connection stayed open after the 91 reply")
+		}
 	}
 	_ = idle
 }
