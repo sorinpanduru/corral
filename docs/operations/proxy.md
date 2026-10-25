@@ -411,7 +411,16 @@ message bytes, credentials, certificate data or client names.
 | `upstream` | `upstream protocol error` | warn |
 | `upstream` | `upstream barrier failed` | warn |
 | `config` | `wire listener bind failed` | error |
+| `lifecycle` | `wire listener serve failed` | error |
 | `lifecycle` | `shutdown forced by second signal` | warn |
+
+Transient accept errors on the wire listener (out of descriptors, an aborted
+connection, a timeout) are retried after 5 ms, doubling to 1 s, with no record
+and no metric. A permanent accept error logs `wire listener serve failed`
+once, shuts down without the listener-close delay (`/readyz` answers
+`shutting_down`, exchanges in progress finish within the drain timeout) and
+exits with code 1. A SIGTERM or SIGINT during that shutdown ends the drain at
+once, and the exit code is still 1.
 
 `wire listener bind failed` is the record for a failed bind of the wire
 listener: component `config`, the setting `proxy.listen` (never the address)
