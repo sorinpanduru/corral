@@ -1,6 +1,7 @@
 package mongosim
 
 import (
+	"crypto/tls"
 	"net"
 	"strings"
 	"sync"
@@ -53,7 +54,11 @@ func (c *conn) infoLocked() ConnInfo {
 // close closes the connection; reset sends a TCP RST instead of a FIN.
 func (c *conn) close(reset bool) {
 	c.once.Do(func() {
-		if tc, ok := c.nc.(*net.TCPConn); ok && reset {
+		var base net.Conn = c.nc
+		if tl, ok := base.(*tls.Conn); ok {
+			base = tl.NetConn()
+		}
+		if tc, ok := base.(*net.TCPConn); ok && reset {
 			_ = tc.SetLinger(0)
 		}
 		_ = c.nc.Close()
@@ -81,6 +86,18 @@ func (p *progressReader) Read(b []byte) (int, error) {
 
 func (c *conn) readLoop() {
 	defer close(c.in)
+	if tl, ok := c.nc.(*tls.Conn); ok {
+		_ = tl.SetDeadline(time.Now().Add(5 * time.Second))
+		err := tl.Handshake()
+		_ = tl.SetDeadline(time.Time{})
+		if err != nil {
+			c.s.mu.Lock()
+			c.s.tlsFailures++
+			c.s.mu.Unlock()
+			c.close(false)
+			return
+		}
+	}
 	for {
 		raw, err := readFrame(&progressReader{r: c.nc, c: c})
 		if err != nil {

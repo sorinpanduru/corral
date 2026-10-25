@@ -10,6 +10,7 @@
 package mongosim
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
 	"strings"
@@ -31,6 +32,12 @@ type Options struct {
 	// RequireAuth makes commands other than the handshake family, ping and
 	// endSessions fail with code 13 on unauthenticated connections.
 	RequireAuth bool
+	// TLS selects the upstream TLS mode; the zero value (TLSOff) serves
+	// plaintext exactly as before. See tls.go.
+	TLS TLSMode
+	// Authority signs the server certificate in the TLS modes; when nil a new
+	// one is generated. Pass one Authority to several servers to share a CA.
+	Authority *Authority
 }
 
 // Message is one request the server received.
@@ -109,6 +116,9 @@ type Server struct {
 	nonceSeq         int64
 	reqSeq           int32
 	wg               sync.WaitGroup
+	tlsCfg           *tls.Config
+	auth             *Authority
+	tlsFailures      int
 }
 
 // Start launches a server on 127.0.0.1:0 (or opts.Addr) and stops it through
@@ -125,6 +135,13 @@ func Start(tb testing.TB, opts Options) *Server {
 		attemptsBy: map[string]int{},
 		authSticky: Succeed,
 		processID:  bson.ObjectID{0x6d, 0x6f, 0x6e, 0x67, 0x6f, 0x73, 0x69, 0x6d, 0, 0, 0, 1},
+	}
+	if opts.TLS != TLSOff {
+		s.auth = opts.Authority
+		if s.auth == nil {
+			s.auth = NewAuthority(tb)
+		}
+		s.tlsCfg = s.auth.serverConfig(tb, opts.TLS)
 	}
 	addr := opts.Addr
 	if addr == "" {
@@ -225,6 +242,9 @@ func (s *Server) acceptLoop(ln net.Listener) {
 			return
 		}
 		s.attempts++
+		if s.tlsCfg != nil {
+			nc = tls.Server(nc, s.tlsCfg)
+		}
 		c := &conn{
 			s:      s,
 			idx:    len(s.conns),

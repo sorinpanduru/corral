@@ -1,0 +1,179 @@
+package mongosim
+
+// Optional upstream TLS for the simulated server. All key material is
+// generated in memory at test time with synthetic names and is never written
+// anywhere except a per-test temporary directory (CAFile). Nothing is
+// committed. No real credentials or production data are involved.
+
+import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"net"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+// TLSMode selects what the server presents on its listener.
+type TLSMode int
+
+const (
+	// TLSOff serves plaintext (the default, unchanged behaviour).
+	TLSOff TLSMode = iota
+	// TLSValid presents a certificate signed by the Authority, valid now,
+	// with SANs for 127.0.0.1, ::1 and "localhost". TLS 1.2 and 1.3.
+	TLSValid
+	// TLSExpired presents a certificate signed by the Authority whose
+	// validity ended 24 hours ago. Otherwise as TLSValid.
+	TLSExpired
+	// TLSHostnameMismatch presents a currently valid certificate signed by
+	// the Authority whose only SAN is "mismatch.corral-test.invalid", so
+	// dialling 127.0.0.1 or localhost fails host-name verification.
+	TLSHostnameMismatch
+	// TLSLegacyVersion presents a valid certificate but negotiates only
+	// TLS 1.0 and 1.1 (MaxVersion TLS 1.1). A client demanding TLS 1.2 or
+	// later fails the handshake with a protocol-version alert.
+	TLSLegacyVersion
+)
+
+// Authority is a throwaway test CA with a synthetic name.
+type Authority struct {
+	cert *x509.Certificate
+	key  *ecdsa.PrivateKey
+	pem  []byte
+	dir  string
+	file string
+	tb   testing.TB
+}
+
+// NewAuthority generates a fresh CA ("corral-test-ca").
+func NewAuthority(tb testing.TB) *Authority {
+	tb.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		tb.Fatalf("mongosim: ca key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          serial(tb),
+		Subject:               pkix.Name{CommonName: "corral-test-ca", Organization: []string{"corral-test"}},
+		NotBefore:             time.Now().Add(-72 * time.Hour),
+		NotAfter:              time.Now().Add(72 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		tb.Fatalf("mongosim: ca cert: %v", err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		tb.Fatalf("mongosim: ca parse: %v", err)
+	}
+	return &Authority{
+		cert: cert, key: key, tb: tb,
+		pem: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+	}
+}
+
+func serial(tb testing.TB) *big.Int {
+	n, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 62))
+	if err != nil {
+		tb.Fatalf("mongosim: serial: %v", err)
+	}
+	return n
+}
+
+// CAPEM is the CA certificate in PEM (public; the CA key is never exposed).
+func (a *Authority) CAPEM() []byte { return append([]byte(nil), a.pem...) }
+
+// CAFile writes the CA certificate to a file in a per-test temporary
+// directory (removed by the test framework) and returns its path, suitable
+// for upstream.tls.ca_path (CORRAL_UPSTREAM_TLS_CA_PATH). Repeated calls
+// return the same file.
+func (a *Authority) CAFile() string {
+	a.tb.Helper()
+	if a.file == "" {
+		a.dir = a.tb.TempDir()
+		a.file = filepath.Join(a.dir, "corral-test-ca.pem")
+		if err := os.WriteFile(a.file, a.pem, 0o600); err != nil {
+			a.tb.Fatalf("mongosim: write ca: %v", err)
+		}
+	}
+	return a.file
+}
+
+func (a *Authority) serverConfig(tb testing.TB, mode TLSMode) *tls.Config {
+	tb.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		tb.Fatalf("mongosim: server key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: serial(tb),
+		Subject:      pkix.Name{CommonName: "corral-test-mongosim"},
+		NotBefore:    time.Now().Add(-48 * time.Hour),
+		NotAfter:     time.Now().Add(48 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+	}
+	switch mode {
+	case TLSExpired:
+		tmpl.NotBefore = time.Now().Add(-72 * time.Hour)
+		tmpl.NotAfter = time.Now().Add(-24 * time.Hour)
+	case TLSHostnameMismatch:
+		tmpl.DNSNames = []string{"mismatch.corral-test.invalid"}
+		tmpl.IPAddresses = nil
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, a.cert, &key.PublicKey, a.key)
+	if err != nil {
+		tb.Fatalf("mongosim: server cert: %v", err)
+	}
+	cfg := &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
+		MinVersion:   tls.VersionTLS12,
+	}
+	if mode == TLSLegacyVersion {
+		// Go still honours an explicit MinVersion below 1.2 on the server.
+		cfg.MinVersion = tls.VersionTLS10
+		cfg.MaxVersion = tls.VersionTLS11
+	}
+	return cfg
+}
+
+// Authority returns the CA that signs this server's certificate, or nil when
+// TLS is off.
+func (s *Server) Authority() *Authority { return s.auth }
+
+// CAPEM is shorthand for Authority().CAPEM(); nil when TLS is off.
+func (s *Server) CAPEM() []byte {
+	if s.auth == nil {
+		return nil
+	}
+	return s.auth.CAPEM()
+}
+
+// CAFile is shorthand for Authority().CAFile(); "" when TLS is off.
+func (s *Server) CAFile() string {
+	if s.auth == nil {
+		return ""
+	}
+	return s.auth.CAFile()
+}
+
+// TLSHandshakeFailures counts server-side handshakes that did not complete
+// (client rejected the certificate or version, plaintext client, stall > 5s).
+func (s *Server) TLSHandshakeFailures() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tlsFailures
+}

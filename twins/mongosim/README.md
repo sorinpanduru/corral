@@ -67,6 +67,27 @@ users and passwords only. Run: `go test -race ./twins/mongosim`.
 - `Stop` is safe against a racing Accept (a late connection is closed, never
   registered); `Cluster` mutators publish atomically under a cluster lock.
 
+## Upstream TLS (optional; proposed change, needs Owner approval)
+
+Source contract: SPEC-002 FR-45, AC-24. Off by default; with `Options.TLS`
+unset behaviour is unchanged.
+
+- `Options{TLS: m, Authority: a}`; modes `TLSOff` (zero), `TLSValid`,
+  `TLSExpired` (CA-signed, expired 24 h ago), `TLSHostnameMismatch` (valid,
+  only SAN `mismatch.corral-test.invalid`), `TLSLegacyVersion` (valid cert,
+  TLS 1.0 to 1.1 only). `TLSValid` has SANs 127.0.0.1, ::1, localhost.
+- `NewAuthority(tb)` makes a synthetic CA ("corral-test-ca"); omit `Authority`
+  to get a fresh one per server. `Server.Authority()`, `Server.CAPEM()`,
+  `Server.CAFile()` (PEM in the test's TempDir, for `upstream.tls.ca_path`).
+  A second `NewAuthority` gives a "wrong CA" for the client to trust.
+- `Server.TLSHandshakeFailures()` counts failed server-side handshakes.
+- Keys and certificates are generated in memory at test time (ECDSA P-256);
+  only the public CA certificate is ever written, to a TempDir.
+- Differences: the handshake runs in the connection's read goroutine, with a
+  5 s limit; failed handshakes are not recorded in `Conns()` messages. Refuse
+  and Blackhole skip the handshake. Legacy mode relies on Go's server honouring
+  an explicit `MinVersion` below 1.2 (verified in the self-test).
+
 ## Known differences from a real mongod
 
 - Commands other than the ones above are echoed, never executed; there is no
