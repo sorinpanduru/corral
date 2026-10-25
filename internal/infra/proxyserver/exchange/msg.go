@@ -182,7 +182,7 @@ func (x *msg) local(dec proxy.Decision, closeAfter bool) (proxy.CloseReason, boo
 		_, ex := d.Spans.Start(s.ctx, s.rootInfo(&x.req))
 		ex.End(refusal, nil)
 	}
-	x.complete(outcome, refusal, dec.NoReply && dec.Kind == proxy.Refuse)
+	x.complete(outcome, refusal, dec.NoReply && dec.Kind != proxy.Handshake)
 	if closeAfter {
 		return proxy.CloseShutdown, false
 	}
@@ -265,10 +265,23 @@ func (x *msg) checkoutFailed(co spans.Step, ex spans.Exchange, err error) (proxy
 // discarded and the client closed (FR-40).
 func (x *msg) upstreamFail(lease Lease, rt spans.Step, ex spans.Exchange, err error) (proxy.CloseReason, bool) {
 	lease.Discard(pool.CloseError)
+	if isProtocolErr(err) {
+		x.s.e.d.Obs.UpstreamProtocolError(x.s.ctx, lease.Upstream().Host(), err)
+	}
 	rt.End(err, nil)
 	ex.End(err, nil)
 	x.complete(proxy.OutcomeProxyError, err, false)
 	return proxy.CloseUpstreamFailure, false
+}
+
+// isProtocolErr reports whether err is an upstream protocol violation (not a
+// transport failure and not an ok:0 reply).
+func isProtocolErr(err error) bool {
+	switch _, d := errclass.Classify(err); string(d) {
+	case "unexpected_response", "message_too_large", "malformed_message", "checksum_mismatch":
+		return true
+	}
+	return false
 }
 
 func classOf(err error) string { c, _ := errclass.Classify(err); return string(c) }

@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/sorinpanduru/corral/internal/domain/clock"
@@ -95,7 +96,13 @@ type ClientConn struct {
 }
 
 // Engine serves client connections.
-type Engine struct{ d Deps }
+type Engine struct {
+	d Deps
+
+	mu      sync.Mutex
+	idle    map[*session]struct{} // sessions waiting for a first byte
+	closing bool                  // CloseIdle was called
+}
 
 // New returns an engine.
 func New(d Deps) *Engine {
@@ -105,7 +112,7 @@ func New(d Deps) *Engine {
 	if d.Clock == nil {
 		d.Clock = clock.System()
 	}
-	return &Engine{d: d}
+	return &Engine{d: d, idle: map[*session]struct{}{}}
 }
 
 // session is the state of one client connection.
@@ -119,6 +126,46 @@ type session struct {
 	meta   proxy.Metadata
 	buf    []byte
 	lease  Lease // the current lease, for the panic path
+	kicked bool  // CloseIdle interrupted the idle wait (guarded by e.mu)
+}
+
+// CloseIdle is FR-47 step 3 for connections between exchanges: it interrupts
+// every first-byte wait, and any later idle wait ends at once. An exchange in
+// progress is not affected; it finishes and the connection then closes.
+func (e *Engine) CloseIdle() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.closing = true
+	for s := range e.idle {
+		s.kicked = true
+		_ = s.cc.Conn.SetReadDeadline(time.Unix(1, 0))
+	}
+}
+
+// beginIdle registers s as idle and sets the idle deadline; false means the
+// engine is already closing idle connections.
+func (s *session) beginIdle() bool {
+	e := s.e
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closing {
+		return false
+	}
+	if e.d.IdleTimeout > 0 {
+		_ = s.cc.Conn.SetReadDeadline(e.d.Clock.Now().Add(e.d.IdleTimeout))
+	} else {
+		_ = s.cc.Conn.SetReadDeadline(time.Time{})
+	}
+	e.idle[s] = struct{}{}
+	return true
+}
+
+// endIdle unregisters s and reports whether CloseIdle interrupted the wait.
+func (s *session) endIdle() bool {
+	s.e.mu.Lock()
+	defer s.e.mu.Unlock()
+	delete(s.e.idle, s)
+	return s.kicked
 }
 
 // Serve runs the message loop until the connection ends and returns why.
@@ -138,6 +185,9 @@ func (e *Engine) Serve(ctx context.Context, cc *ClientConn) (reason proxy.CloseR
 	defer stop()
 	for {
 		r, more := s.exchange()
+		if more && e.d.Shutdown != nil && e.d.Shutdown.Phase() == proxy.PhaseLate {
+			return proxy.CloseShutdown // FR-47: finish the exchange, then close
+		}
 		if !more {
 			if ctx.Err() != nil && r == proxy.CloseClientClosed {
 				return proxy.CloseShutdown
@@ -165,15 +215,15 @@ func (s *session) readBudget(dst []byte) error {
 func (s *session) exchange() (proxy.CloseReason, bool) {
 	d := &s.e.d
 	// Between exchanges: read the first byte under the idle deadline.
-	if d.IdleTimeout > 0 {
-		_ = s.cc.Conn.SetReadDeadline(d.Clock.Now().Add(d.IdleTimeout))
-	} else {
-		_ = s.cc.Conn.SetReadDeadline(time.Time{})
+	if !s.beginIdle() {
+		return proxy.CloseShutdown, false
 	}
 	var first [1]byte
-	if _, err := io.ReadFull(s.cc.Conn, first[:]); err != nil {
+	_, err := io.ReadFull(s.cc.Conn, first[:])
+	kicked := s.endIdle()
+	if err != nil {
 		switch {
-		case s.ctx.Err() != nil:
+		case s.ctx.Err() != nil || kicked:
 			return proxy.CloseShutdown, false
 		case isTimeout(err):
 			return proxy.CloseIdleTimeout, false

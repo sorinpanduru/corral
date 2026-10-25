@@ -2,6 +2,7 @@ package exchange
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -159,8 +160,8 @@ func (x *msg) leased(ctx context.Context, ex spans.Exchange, lease Lease) (proxy
 	if flags&wire.FlagMoreToCome != 0 {
 		rt.End(nil, nil)
 		ex.End(nil, nil)
-		x.complete(proxy.OutcomeOK, nil, false)
 		x.barrier(lease, up)
+		x.complete(proxy.OutcomeOK, nil, false)
 		return "", true
 	}
 	return x.reply(lease, up, rt, ex)
@@ -189,15 +190,25 @@ func (x *msg) barrier(lease Lease, up Upstream) {
 
 	id := up.Correlator().Next()
 	_ = nc.SetReadDeadline(time.Time{})
+	fail := func(err error) {
+		lease.Discard(pool.CloseError)
+		d.Obs.UpstreamBarrierFailed(x.s.ctx, up.Host(), err)
+		if isProtocolErr(err) {
+			d.Obs.UpstreamProtocolError(x.s.ctx, up.Host(), err)
+		}
+	}
 	if _, err := nc.Write(wire.BuildMsg(id, 0, 0, wire.PingBody())); err != nil {
 		end()
-		lease.Discard(pool.CloseError)
+		fail(errorf("barrier write to the upstream failed", err))
 		return
 	}
 	h, scanner, err := readOwnReply(nc, up)
 	end()
 	if err != nil || aborted.Load() {
-		lease.Discard(pool.CloseError)
+		if err == nil {
+			err = errors.New("barrier interrupted by a lease abort")
+		}
+		fail(err)
 		return
 	}
 	_ = h
@@ -208,7 +219,7 @@ func (x *msg) barrier(lease Lease, up Upstream) {
 			HasTop: true, OKZero: f.IsError(), Top: f.Code, TopName: f.CodeName})
 	}
 	if marked || f.IsError() {
-		lease.Discard(pool.CloseError)
+		fail(errors.New("barrier ping reply was an error"))
 		return
 	}
 	_ = nc.SetReadDeadline(time.Time{})
@@ -278,13 +289,21 @@ func (x *msg) reply(lease Lease, up Upstream, rt spans.Step, ex spans.Exchange) 
 		strip = 4
 	}
 
-	out := &replyOut{s: s, buf: append(make([]byte, 0, 2*ReplyChunk+len(rew)), rew[:]...)}
+	// Each validated chunk goes straight to the client from rb. Only the last
+	// chunk is held until the whole reply has validated, so a reply with a bad
+	// tail never reaches the client complete (FR-58). The chunk sizes keep at
+	// least four bytes in the last chunk so a stripped checksum never straddles.
+	out := &replyOut{s: s, head: rew[:]}
 	rb := make([]byte, ReplyChunk)
 	total := int64(h.Length) - 20
+	var last []byte
 	for total > 0 {
 		n := int64(len(rb))
 		if n > total {
 			n = total
+		}
+		if rem := total - n; rem > 0 && rem < 4 {
+			n = total - 4
 		}
 		if _, err := io.ReadFull(nc, rb[:n]); err != nil {
 			return x.upstreamFail(lease, rt, ex, errorf("read from the upstream failed", err))
@@ -293,17 +312,24 @@ func (x *msg) reply(lease Lease, up Upstream, rt spans.Step, ex spans.Exchange) 
 			return x.upstreamFail(lease, rt, ex, err)
 		}
 		total -= n
-		if err := out.add(rb[:n]); err != nil {
-			return x.replyWriteFail(lease, rt, ex, err)
-		}
 		if d.Probe != nil {
-			d.Probe.ReplyHeld(s.cc.ID, len(out.buf))
+			d.Probe.ReplyHeld(s.cc.ID, int(n))
+		}
+		if total == 0 {
+			last = rb[:n]
+			break
+		}
+		if err := out.write(rb[:n]); err != nil {
+			return x.replyWriteFail(lease, rt, ex, err)
 		}
 	}
 	if err := scanner.Close(); err != nil {
 		return x.upstreamFail(lease, rt, ex, err)
 	}
-	if err := out.finish(strip); err != nil {
+	if len(last) < strip {
+		return x.upstreamFail(lease, rt, ex, wire.ErrMalformed())
+	}
+	if err := out.write(last[:len(last)-strip]); err != nil {
 		return x.replyWriteFail(lease, rt, ex, err)
 	}
 	f := scanner.Fields()
@@ -328,35 +354,25 @@ func (x *msg) replyWriteFail(lease Lease, rt spans.Step, ex spans.Exchange, err 
 	return x.clientIOFail(err)
 }
 
-// replyOut writes a reply to the client holding back the last ReplyChunk
-// bytes until the whole reply has validated, within one write deadline.
+// replyOut writes a reply to the client. The 20-byte header goes out with the
+// first write; every write has its own deadline, so time spent waiting for the
+// upstream never counts against the client write.
 type replyOut struct {
-	s       *session
-	buf     []byte
-	started bool
+	s    *session
+	head []byte // pending header, nil once written
 }
 
 func (o *replyOut) write(b []byte) error {
-	if !o.started {
-		o.started = true
-		_ = o.s.cc.Conn.SetWriteDeadline(o.s.e.d.Clock.Now().Add(o.s.e.d.IOTimeout))
+	_ = o.s.cc.Conn.SetWriteDeadline(o.s.e.d.Clock.Now().Add(o.s.e.d.IOTimeout))
+	if o.head != nil {
+		bufs := net.Buffers{o.head, b}
+		o.head = nil
+		_, err := bufs.WriteTo(o.s.cc.Conn)
+		return err
+	}
+	if len(b) == 0 {
+		return nil
 	}
 	_, err := o.s.cc.Conn.Write(b)
 	return err
-}
-
-func (o *replyOut) add(chunk []byte) error {
-	o.buf = append(o.buf, chunk...)
-	if n := len(o.buf) - ReplyChunk; n > 0 {
-		if err := o.write(o.buf[:n]); err != nil {
-			return err
-		}
-		o.buf = append(o.buf[:0], o.buf[n:]...)
-	}
-	return nil
-}
-
-// finish writes what is held, without the stripped checksum bytes.
-func (o *replyOut) finish(strip int) error {
-	return o.write(o.buf[:len(o.buf)-strip])
 }

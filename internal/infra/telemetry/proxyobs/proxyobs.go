@@ -56,6 +56,7 @@ const (
 	msgPrimaryChanged  = "upstream primary changed"
 	msgMarkedNP        = "upstream target marked not primary"
 	msgUpProtocolError = "upstream protocol error"
+	msgUpBarrierFailed = "upstream barrier failed"
 )
 
 const limitWindow = 30 * time.Second
@@ -111,7 +112,7 @@ func New(logs *logging.Factory, mf *metrics.Factory, now func() time.Time) (*Ada
 		return nil, err
 	}
 	for _, msg := range []string{msgConnRejected, msgAuthRejected, msgBlocked, msgProtocolError, msgIOTimeout, msgTLSFailed,
-		msgCheckoutTimeout, msgQueueFull, msgUpConnFailed, msgUpAuthFailed, msgMarkedNP, msgUpProtocolError} {
+		msgCheckoutTimeout, msgQueueFull, msgUpConnFailed, msgUpAuthFailed, msgMarkedNP, msgUpProtocolError, msgUpBarrierFailed} {
 		a.limiters[msg] = ratelimit.New(limitWindow, now)
 	}
 	var errs []error
@@ -281,6 +282,23 @@ func (o *proxyObs) ClientProtocolError(ctx context.Context, id int32, err error)
 	}
 	if attrs, ok := o.a.allow(msgProtocolError, append(errclass.LogAttrs(err), connAttr(id))); ok {
 		o.a.proxyLog.LogAttrs(ctx, slog.LevelWarn, msgProtocolError, attrs...)
+	}
+}
+
+func (o *proxyObs) UpstreamBarrierFailed(ctx context.Context, host string, err error) {
+	if attrs, ok := o.a.allow(msgUpBarrierFailed, append(errclass.LogAttrs(err), hostAttrs(host)...)); ok {
+		o.a.upLog.LogAttrs(ctx, slog.LevelWarn, msgUpBarrierFailed, attrs...)
+	}
+}
+
+func (o *proxyObs) UpstreamProtocolError(ctx context.Context, host string, err error) {
+	_, d := errclass.Classify(err)
+	if !in(protoDetails, string(d)) {
+		return
+	}
+	inc(o.a.m.protoErrs, "upstream", string(d))
+	if attrs, ok := o.a.allow(msgUpProtocolError, append(errclass.LogAttrs(err), hostAttrs(host)...)); ok {
+		o.a.upLog.LogAttrs(ctx, slog.LevelWarn, msgUpProtocolError, attrs...)
 	}
 }
 

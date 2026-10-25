@@ -68,20 +68,28 @@ type Observer interface {
 	RequestReceived(ctx context.Context, command string)
 	RequestCompleted(ctx context.Context, res RequestResult)
 	PanicRecovered(ctx context.Context, err error)
+	// UpstreamBarrierFailed reports a failed moreToCome barrier ping (FR-29).
+	UpstreamBarrierFailed(ctx context.Context, host string, err error)
+	// UpstreamProtocolError reports an upstream reply that broke the protocol
+	// (unexpected_response, message_too_large, malformed_message,
+	// checksum_mismatch) on a forwarded or barrier reply.
+	UpstreamProtocolError(ctx context.Context, host string, err error)
 }
 
 // Noop is an Observer that does nothing; embed it to override single methods.
 type Noop struct{}
 
-func (Noop) ConnOpened(context.Context, ConnInfo)               {}
-func (Noop) ConnClosed(context.Context, int32, CloseReason)     {}
-func (Noop) ConnRejected(context.Context, RejectReason)         {}
-func (Noop) TLSFailed(context.Context, error)                   {}
-func (Noop) HandshakeAnswered(context.Context, HandshakeInfo)   {}
-func (Noop) ClientAuthRejected(context.Context, int32, Refusal) {}
-func (Noop) CommandBlocked(context.Context, int32, string)      {}
-func (Noop) ClientProtocolError(context.Context, int32, error)  {}
-func (Noop) ClientIOTimeout(context.Context, int32)             {}
-func (Noop) RequestReceived(context.Context, string)            {}
-func (Noop) RequestCompleted(context.Context, RequestResult)    {}
-func (Noop) PanicRecovered(context.Context, error)              {}
+func (Noop) ConnOpened(context.Context, ConnInfo)                 {}
+func (Noop) ConnClosed(context.Context, int32, CloseReason)       {}
+func (Noop) ConnRejected(context.Context, RejectReason)           {}
+func (Noop) TLSFailed(context.Context, error)                     {}
+func (Noop) HandshakeAnswered(context.Context, HandshakeInfo)     {}
+func (Noop) ClientAuthRejected(context.Context, int32, Refusal)   {}
+func (Noop) CommandBlocked(context.Context, int32, string)        {}
+func (Noop) ClientProtocolError(context.Context, int32, error)    {}
+func (Noop) ClientIOTimeout(context.Context, int32)               {}
+func (Noop) RequestReceived(context.Context, string)              {}
+func (Noop) RequestCompleted(context.Context, RequestResult)      {}
+func (Noop) PanicRecovered(context.Context, error)                {}
+func (Noop) UpstreamBarrierFailed(context.Context, string, error) {}
+func (Noop) UpstreamProtocolError(context.Context, string, error) {}

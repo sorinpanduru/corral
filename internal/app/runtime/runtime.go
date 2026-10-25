@@ -72,7 +72,8 @@ type Inputs struct {
 	// HUP delivers SIGHUP; the entry point owns signal.Notify.
 	HUP     <-chan os.Signal
 	Version string
-	// Registry selects the settings; nil means settings.Registry().
+	// Registry selects the settings; nil means the observability-only registry
+	// (settings.ObservabilityGroup) until the proxy settings are wired in.
 	Registry *registry.Registry
 	// Now is the SIGHUP limiter clock; nil means time.Now.
 	Now func() time.Time
