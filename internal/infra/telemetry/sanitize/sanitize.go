@@ -52,3 +52,18 @@ func clean(s string, limit int) string {
 	}
 	return b.String()
 }
+
+// CollectionForTelemetry returns a collection name for logs and spans: each
+// invalid UTF-8 byte is replaced by U+FFFD, and the name is not truncated
+// (SPEC-001 FR-40). Collection names never become metric labels.
+func CollectionForTelemetry(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 2*utf8.UTFMax)
+	for _, r := range s { // RuneError once per invalid byte
+		b.WriteRune(r)
+	}
+	return b.String()
+}

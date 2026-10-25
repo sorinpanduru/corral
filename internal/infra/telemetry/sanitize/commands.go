@@ -8,7 +8,14 @@ const OtherCommand = "other"
 
 // commandAllowlist is the central command-name allowlist owned by SPEC-001.
 // It is the single place to extend when a later spec amends SPEC-001 (D2).
-var commandAllowlist = []string{"find", "hello"}
+var commandAllowlist = []string{
+	"find", "hello",
+	"getMore", "killCursors", "insert", "update", "delete", "findAndModify",
+	"aggregate", "count", "distinct", "bulkWrite", "createIndexes",
+	"dropIndexes", "listIndexes", "listCollections", "listDatabases", "create",
+	"drop", "ping", "buildInfo", "endSessions", "commitTransaction",
+	"abortTransaction", "saslStart", "saslContinue", "authenticate",
+}
 
 // commandAliases maps legacy spellings to their allowlisted name. Matching is
 // case-sensitive: only the listed spellings alias.

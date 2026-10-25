@@ -53,7 +53,10 @@ var nonBaseUnits = []string{
 
 // allowedLabelNames is the closed allowlist of label names (FR-11): every
 // other name is rejected, which subsumes the FR-11 deny patterns.
-var allowedLabelNames = []string{"command", LabelErrorClass, LabelErrorDetail}
+var allowedLabelNames = []string{
+	"command", LabelErrorClass, LabelErrorDetail,
+	"outcome", "reason", "side", "state", "opcode", "kind",
+}
 
 // AllowedLabelNames returns a copy of the label name allowlist.
 func AllowedLabelNames() []string { return slices.Clone(allowedLabelNames) }
@@ -221,6 +224,10 @@ func lintLabel(metric string, l LabelDef, duplicate bool) []Problem {
 		default:
 			if !valueRE.MatchString(v) {
 				add("value %q must be non-empty and match ^[a-z0-9_]+$", v)
+			} else if errclassHas(v) || detailHas(v) {
+				// Amendment 3 (FR-11): outcome, reason, state, side, opcode
+				// and kind hold non-error categories, never FR-29 values.
+				add("value %q equals an FR-29 class or detail; use error_class or error_detail", v)
 			}
 		}
 	}
