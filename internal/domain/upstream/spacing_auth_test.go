@@ -81,8 +81,10 @@ func TestFailedAuthCheckKeepsTargetUnusableUntilSuccess_FR22(t *testing.T) {
 		h.clk.WaitForTimers(1, time.Second)
 		h.clk.Advance(500 * time.Millisecond)
 		time.Sleep(3 * time.Millisecond)
-		if h.m.State().HasTarget {
+		if st := h.m.State(); st.HasTarget {
 			t.Fatal("the target became usable while authenticating checks keep failing")
+		} else if st.AuthFailing {
+			t.Fatal("a transient authentication stall set the authentication-failing state")
 		}
 	}
 	cs := h.chk.of(A)
@@ -99,5 +101,15 @@ func TestFailedAuthCheckKeepsTargetUnusableUntilSuccess_FR22(t *testing.T) {
 	h.stepUntilState("the target usable again", func(s upstream.State) bool { return s.HasTarget && s.Target == A })
 	if st := h.readiness(); !st.Ready {
 		t.Fatalf("readiness %+v after recovery", st)
+	}
+	// A transient stall is no authentication failure: no state, no event.
+	if h.m.State().AuthFailing {
+		t.Fatal("AuthFailing after a transient stall")
+	}
+	h.rec.mu.Lock()
+	ko := append([]string(nil), h.rec.authKO...)
+	h.rec.mu.Unlock()
+	if len(ko) != 0 {
+		t.Fatalf("AuthFailed observer calls for a transient stall: %v", ko)
 	}
 }

@@ -104,6 +104,7 @@ func TestAuthStallKeepsTargetUnusable_FR22(t *testing.T) {
 	// SCRAM now stalls longer than the connect timeout; dropping the monitoring
 	// connection makes the next check authenticate again.
 	tw.SetAuthOutcome(mongosim.AuthDelay(10 * time.Second))
+	authFails := c.metric("corral_upstream_auth_failures_total")
 	begin := time.Now()
 	tw.CloseConns()
 	c.waitReadyz(503, "upstream_unavailable")
@@ -118,7 +119,18 @@ func TestAuthStallKeepsTargetUnusable_FR22(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	// A transient stall is not an authentication failure: nothing is counted
+	// or logged as one.
+	if got := c.metric("corral_upstream_auth_failures_total"); got != authFails {
+		t.Fatalf("corral_upstream_auth_failures_total changed from %v to %v during a transient stall", authFails, got)
+	}
+	if n := len(c.records("upstream authentication failed")); n != 0 {
+		t.Fatalf("%d `upstream authentication failed` records for a transient stall", n)
+	}
 	// Authentication works again: recovery to 200.
 	tw.SetAuthOutcome(mongosim.Succeed)
 	c.waitReady()
+	if got := c.metric("corral_upstream_auth_failures_total"); got != authFails {
+		t.Fatalf("auth_failures_total %v -> %v after recovery", authFails, got)
+	}
 }
