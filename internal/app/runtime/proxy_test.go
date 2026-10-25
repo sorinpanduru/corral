@@ -414,6 +414,12 @@ func TestSecondSignalForcesDrainEnd_AC47(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("%d forced-shutdown records, want exactly 1", n)
 	}
+	// AC-60: a listener closed by shutdown / a second signal is not an error.
+	for _, r := range p.out.records(t) {
+		if str(r, "msg") == "wire listener serve failed" {
+			t.Fatalf("a serve-failed record after a normal shutdown: %v", r)
+		}
+	}
 	rule.Release()
 }
 
