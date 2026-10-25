@@ -26,6 +26,7 @@ import (
 	"time"
 
 	corralrt "github.com/sorinpanduru/corral/internal/app/runtime"
+	"github.com/sorinpanduru/corral/internal/app/settings"
 	"github.com/sorinpanduru/corral/internal/infra/config/registry"
 	"github.com/sorinpanduru/corral/internal/infra/config/source"
 	"github.com/sorinpanduru/corral/internal/infra/osfile"
@@ -268,9 +269,18 @@ func run(tb testing.TB, o runOpts) *harness {
 			}
 		},
 	}
+	// ADR-0021: in-process tests of SPEC-001 and SPEC-003 behaviour use the
+	// observability group alone, so they need no SPEC-002 arguments.
+	reg := o.registry
+	if reg == nil {
+		var err error
+		if reg, err = settings.RegistryOf(settings.ObservabilityGroup()); err != nil {
+			tb.Fatalf("registry: %v", err)
+		}
+	}
 	in := corralrt.Inputs{
 		Args: o.args, Env: envEntries(o.env), ReadFile: o.readFile, Stdout: h.out,
-		HUP: o.hup, Version: o.version, Registry: o.registry, Now: o.now,
+		HUP: o.hup, Version: o.version, Registry: reg, Now: o.now,
 	}
 	go func() { h.done <- corralrt.Run(ctx, in, hooks) }()
 	tb.Cleanup(func() {

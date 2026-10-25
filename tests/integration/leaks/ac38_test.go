@@ -33,6 +33,8 @@ import (
 	"google.golang.org/grpc/codes"
 
 	corralrt "github.com/sorinpanduru/corral/internal/app/runtime"
+	"github.com/sorinpanduru/corral/internal/app/settings"
+	"github.com/sorinpanduru/corral/internal/infra/config/registry"
 	"github.com/sorinpanduru/corral/internal/infra/osfile"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logbridge"
 	"github.com/sorinpanduru/corral/internal/infra/telemetry/logging"
@@ -383,7 +385,7 @@ func runSetup(t *testing.T, s setup) {
 	// validation is the same one (SPEC-003 FR-19, FR-25).
 	in := corralrt.Inputs{
 		Args: args, Env: os.Environ(), ReadFile: osfile.Read, Stdout: out,
-		HUP: make(chan os.Signal), Version: "test",
+		HUP: make(chan os.Signal), Version: "test", Registry: obsRegistry(),
 	}
 	go func() { done <- corralrt.Run(ctx, in, hooks) }()
 
@@ -559,4 +561,14 @@ func TestAC38_TracesSpecificVariables(t *testing.T) {
 	eachProto(t, func(t *testing.T, p string) {
 		runSetup(t, setup{name: "f", proto: p, coll: collReject, header: true, userinfo: true, traces: true})
 	})
+}
+
+// obsRegistry is the observability group alone (ADR-0021): this test is about
+// SPEC-001 behaviour and needs no SPEC-002 arguments.
+func obsRegistry() *registry.Registry {
+	r, err := settings.RegistryOf(settings.ObservabilityGroup())
+	if err != nil {
+		panic(err)
+	}
+	return r
 }

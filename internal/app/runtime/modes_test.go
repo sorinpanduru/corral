@@ -51,10 +51,7 @@ func runSync(t *testing.T, o runOpts) (int, *syncBuf) {
 
 func usageText(t *testing.T) string {
 	t.Helper()
-	r, err := settings.Registry()
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := obsOnlyRegistry(t) // the registry the harness runs with (ADR-0021)
 	var b bytes.Buffer
 	if err := usage.Write(&b, r); err != nil {
 		t.Fatal(err)
@@ -330,7 +327,7 @@ func TestProgrammingErrorsExitOne(t *testing.T) {
 		}
 	}
 	var buf syncBuf
-	code = corralrt.Run(context.Background(), corralrt.Inputs{Args: []string{"--tracing.enabled=true"}, Stdout: &buf, Version: "test"}, corralrt.Hooks{})
+	code = corralrt.Run(context.Background(), corralrt.Inputs{Args: []string{"--tracing.enabled=true"}, Stdout: &buf, Version: "test", Registry: obsOnlyRegistry(t)}, corralrt.Hooks{})
 	if code != 1 {
 		t.Errorf("nil file reader: exit %d, want 1", code)
 	}
@@ -339,4 +336,14 @@ func TestProgrammingErrorsExitOne(t *testing.T) {
 			t.Error("a nil reader was reported as a configuration error")
 		}
 	}
+}
+
+// obsOnlyRegistry is the observability group alone (ADR-0021).
+func obsOnlyRegistry(tb testing.TB) *registry.Registry {
+	tb.Helper()
+	r, err := settings.RegistryOf(settings.ObservabilityGroup())
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return r
 }

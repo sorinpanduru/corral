@@ -71,7 +71,7 @@ func reg(tb testing.TB) *registry.Registry {
 			},
 		}},
 	}
-	r, err := registry.New(append(settings.Groups(), tg)...)
+	r, err := registry.New(settings.ObservabilityGroup(), tg) // ADR-0021: no SPEC-002 group here
 	if err != nil {
 		tb.Fatalf("registry: %v", err)
 	}

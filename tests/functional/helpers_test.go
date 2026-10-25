@@ -11,11 +11,14 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/sorinpanduru/corral/internal/testkit/corralargs"
 )
 
 const (
@@ -73,6 +76,7 @@ func startProc(t *testing.T, env []string, args ...string) *proc {
 // startProcBin starts the given binary (the default one, or testBinPath).
 func startProcBin(t *testing.T, bin string, env []string, args ...string) *proc {
 	t.Helper()
+	args = withMinimalProxyArgs(t, args)
 	p := &proc{t: t, done: make(chan struct{})}
 	p.cmd = exec.Command(bin, args...)
 	p.cmd.Env = env
@@ -225,4 +229,24 @@ func lifecycleMsgs(recs []map[string]any) []string {
 		}
 	}
 	return out
+}
+
+// withMinimalProxyArgs appends the minimal SPEC-002 arguments (ADR-0021):
+// upstream.hosts is required and the default mechanism needs credentials, so
+// every binary-level test of an earlier spec starts corral with a closed
+// upstream port, no authentication and a free loopback proxy port. Help and
+// version runs do not load the configuration and are left alone.
+func withMinimalProxyArgs(t *testing.T, args []string) []string {
+	t.Helper()
+	for _, a := range args {
+		if a == "--help" || a == "-help" || a == "-h" || a == "--version" || a == "-version" {
+			return args
+		}
+		if strings.HasPrefix(a, "--upstream.hosts") || strings.HasPrefix(a, "-upstream.hosts") {
+			return args // the test supplies its own proxy arguments
+		}
+	}
+	closed := corralargs.FreePort(t)
+	out := append([]string(nil), args...)
+	return append(out, corralargs.Minimal(t, "127.0.0.1:"+strconv.Itoa(closed))...)
 }
