@@ -115,6 +115,9 @@ type Hooks struct {
 	PanicCommand string
 	// Probe receives byte counts for the bounds checks.
 	Probe exchange.Probe
+	// WrapWireListener wraps the bound wire listener (a test seam for
+	// injecting accept errors, FR-66).
+	WrapWireListener func(net.Listener) net.Listener
 }
 
 // Handles expose running components to Started.
@@ -283,6 +286,7 @@ func Run(ctx context.Context, in Inputs, hooks Hooks) int {
 	defer svcCancel()
 	code := exitOK
 	wireErr := make(chan error, 1)
+	noDelay := false // FR-66: shutdown after a permanent accept error
 	if ctx.Err() == nil {
 		// Step 8: tracing.Start.
 		tr, err = tracing.Start(ctx, tracing.Options{
@@ -307,7 +311,7 @@ func Run(ctx context.Context, in Inputs, hooks Hooks) int {
 					Logs: factory, Metrics: mf, Tracer: tr.TracerProvider().Tracer(tracerName),
 					TracingEnabled: tr.Enabled(), Version: in.Version, Clock: clock.System(),
 					Hooks: proxyapp.Hooks{Hold: hooks.Hold, RoundRobin: hooks.PoolRoundRobin,
-						PanicCommand: hooks.PanicCommand, Probe: hooks.Probe},
+						PanicCommand: hooks.PanicCommand, Probe: hooks.Probe, WrapListener: hooks.WrapWireListener},
 				})
 				if err == nil {
 					readiness.Store(svc.Readiness())
@@ -348,6 +352,7 @@ func Run(ctx context.Context, in Inputs, hooks Hooks) int {
 			case err := <-wireErr:
 				life.LogAttrs(context.Background(), slog.LevelError, msgWireServeFailed, errclass.LogAttrs(err)...)
 				code = exitFailure
+				noDelay = true
 			}
 		}
 	}
@@ -361,7 +366,11 @@ func Run(ctx context.Context, in Inputs, hooks Hooks) int {
 	stopForce := watchForce(life, svc, in.Force)
 	defer stopForce()
 	if svc != nil {
-		_ = svc.Shutdown(context.Background())
+		if noDelay {
+			_ = svc.ShutdownNow(context.Background())
+		} else {
+			_ = svc.Shutdown(context.Background())
+		}
 	}
 	shutdownAdmin(life, admin)
 	if tr != nil {

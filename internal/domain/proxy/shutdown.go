@@ -86,6 +86,18 @@ func (s *Shutdown) Step3() {
 	s.mu.Unlock()
 }
 
+// BeginNow starts the shutdown without step 1: the listener-close delay is
+// not applied (FR-66, a permanent accept error).
+func (s *Shutdown) BeginNow() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.begun {
+		return
+	}
+	s.begun = true
+	s.closeDelay()
+}
+
 // ListenerClosed records FR-47 step 2: the drain timer starts. The phase stays
 // Serving until Step3, so a message read between the two is served normally.
 func (s *Shutdown) ListenerClosed() {

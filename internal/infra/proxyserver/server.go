@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sorinpanduru/corral/internal/domain/clock"
 	"github.com/sorinpanduru/corral/internal/domain/proxy"
 	"github.com/sorinpanduru/corral/internal/infra/config"
 	"github.com/sorinpanduru/corral/internal/infra/proxyserver/exchange"
@@ -53,6 +54,11 @@ type Options struct {
 	IDs       *proxy.ConnIDs
 	// Hold is the corraltest hook; nil in production.
 	Hold func(ctx context.Context, point string)
+	// Clock times the accept retry delay; nil means the system clock.
+	Clock clock.Clock
+	// WrapListener, when set, wraps the bound listener (a test seam for
+	// injecting accept errors).
+	WrapListener func(net.Listener) net.Listener
 }
 
 // Server is the wire listener.
@@ -76,6 +82,9 @@ func New(o Options) *Server {
 	if o.Obs == nil {
 		o.Obs = proxy.Noop{}
 	}
+	if o.Clock == nil {
+		o.Clock = clock.System()
+	}
 	s := &Server{o: o, conns: map[net.Conn]struct{}{}}
 	s.base, s.cancel = context.WithCancel(context.Background())
 	return s
@@ -87,6 +96,9 @@ func (s *Server) Bind() error {
 	ln, err := net.Listen("tcp", s.o.Addr)
 	if err != nil {
 		return config.NewError(SettingListen, err)
+	}
+	if s.o.WrapListener != nil {
+		ln = s.o.WrapListener(ln)
 	}
 	s.ln = ln
 	return nil
@@ -133,9 +145,13 @@ func (s *Server) Serve(ctx context.Context) error {
 				} else if delay *= 2; delay > acceptBackoffMax {
 					delay = acceptBackoffMax
 				}
+				// No jitter, no record, no metric (FR-66).
+				wake := make(chan struct{})
+				t := s.o.Clock.AfterFunc(delay, func() { close(wake) })
 				select {
-				case <-time.After(delay):
+				case <-wake:
 				case <-ctx.Done():
+					t.Stop()
 					return nil
 				}
 				continue
@@ -266,17 +282,29 @@ func (s *Server) ForceDrainEnd() {
 }
 
 // Shutdown drives FR-47 steps 1 to 4 and returns when they are done.
-func (s *Server) Shutdown(ctx context.Context) error {
+func (s *Server) Shutdown(ctx context.Context) error { return s.shutdown(ctx, false) }
+
+// ShutdownNow is Shutdown without step 1: the listener-close delay is not
+// applied (FR-66, after a permanent accept error).
+func (s *Server) ShutdownNow(ctx context.Context) error { return s.shutdown(ctx, true) }
+
+func (s *Server) shutdown(ctx context.Context, noDelay bool) error {
 	sd := s.o.Shutdown
-	// Step 1: keep serving for the listener-close delay.
-	sd.Begin()
+	if noDelay {
+		sd.BeginNow()
+	} else {
+		// Step 1: keep serving for the listener-close delay.
+		sd.Begin()
+	}
 	if s.forced.Load() {
 		sd.Force()
 	}
-	s.hold(ctx, HoldShutdownDelay)
-	select {
-	case <-sd.DelayExpired():
-	case <-ctx.Done():
+	if !noDelay {
+		s.hold(ctx, HoldShutdownDelay)
+		select {
+		case <-sd.DelayExpired():
+		case <-ctx.Done():
+		}
 	}
 	// Step 2: close the listener.
 	s.closeListener()

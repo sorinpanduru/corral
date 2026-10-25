@@ -46,6 +46,9 @@ type Hooks struct {
 	RoundRobin   bool
 	PanicCommand string
 	Probe        exchange.Probe
+	// WrapListener wraps the bound wire listener (a test seam for injecting
+	// accept errors, FR-66).
+	WrapListener func(net.Listener) net.Listener
 }
 
 // Deps are the service's dependencies.
@@ -131,7 +134,8 @@ func New(cfg settings.Proxy, d Deps) (*Service, error) {
 		ReplyCodes: s.mon.ReplyCodes, Probe: d.Hooks.Probe, PanicCommand: d.Hooks.PanicCommand,
 	})
 	s.srv = proxyserver.New(proxyserver.Options{Addr: cfg.Listen, MaxConns: cfg.MaxClientConnections, TLS: serverTLS,
-		IOTimeout: cfg.ClientIOTimeout, Engine: eng, Obs: ad.Proxy(), Shutdown: s.sd, IDs: proxy.NewConnIDs(), Hold: d.Hooks.Hold})
+		IOTimeout: cfg.ClientIOTimeout, Engine: eng, Obs: ad.Proxy(), Shutdown: s.sd, IDs: proxy.NewConnIDs(), Hold: d.Hooks.Hold,
+		Clock: d.Clock, WrapListener: d.Hooks.WrapListener})
 	return s, nil
 }
 
@@ -179,8 +183,19 @@ func (s *Service) ForceDrainEnd() { s.srv.ForceDrainEnd() }
 
 // Shutdown runs FR-47: steps 1 to 4 in the server, then step 5, closing the
 // pool and the monitoring connections.
-func (s *Service) Shutdown(ctx context.Context) error {
-	err := s.srv.Shutdown(ctx)
+func (s *Service) Shutdown(ctx context.Context) error { return s.shutdown(ctx, false) }
+
+// ShutdownNow is Shutdown without the listener-close delay (FR-66: the
+// listener can no longer accept).
+func (s *Service) ShutdownNow(ctx context.Context) error { return s.shutdown(ctx, true) }
+
+func (s *Service) shutdown(ctx context.Context, noDelay bool) error {
+	var err error
+	if noDelay {
+		err = s.srv.ShutdownNow(ctx)
+	} else {
+		err = s.srv.Shutdown(ctx)
+	}
 	if h := s.d.Hooks.Hold; h != nil {
 		h(ctx, HoldPoolClose)
 	}
