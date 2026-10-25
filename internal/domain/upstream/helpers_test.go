@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/sorinpanduru/corral/internal/domain/health"
+	"github.com/sorinpanduru/corral/internal/domain/pool"
 	"github.com/sorinpanduru/corral/internal/domain/upstream"
 	"github.com/sorinpanduru/corral/internal/testkit/fakeclock"
 )
@@ -79,11 +80,31 @@ type call struct {
 type fakeChecker struct {
 	clk *fakeclock.Clock
 
-	mu    sync.Mutex
-	table map[string]upstream.Report
-	fail  map[string]error
-	hook  func(upstream.CheckRequest)
-	calls []call
+	mu     sync.Mutex
+	table  map[string]upstream.Report
+	fail   map[string]error
+	hook   func(upstream.CheckRequest)
+	calls  []call
+	closed []closeCall
+}
+
+type closeCall struct {
+	Host   string
+	Reason string
+}
+
+// CloseHost records a request to close the monitoring connection of a host
+// (the monitor calls it when a host leaves the known set).
+func (f *fakeChecker) CloseHost(host string, reason pool.CloseReason) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed = append(f.closed, closeCall{host, string(reason)})
+}
+
+func (f *fakeChecker) closeCalls() []closeCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]closeCall(nil), f.closed...)
 }
 
 func newChecker(clk *fakeclock.Clock) *fakeChecker {

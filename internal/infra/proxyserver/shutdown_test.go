@@ -280,3 +280,34 @@ func TestServeReturnsOnContextCancel_FR43(t *testing.T) {
 	}
 	_ = proxy.CloseShutdown
 }
+
+// M2 (review): at step 3 an idle connection closes at once (it does not wait
+// for the drain), and a connection whose exchange finishes after step 3 is
+// closed after its reply; an exchange in progress is not cut.
+func TestShutdownStep3Behaviour_FR47(t *testing.T) {
+	r := newRig(t, opts{drain: time.Hour})
+	idle := r.dial()
+	roundTrip(t, idle, hello(1))
+	busy := r.dial()
+	r.twin.AddRule(mongosim.Match{Marker: "finishes"}, mongosim.Delay(700*time.Millisecond))
+	busy.Send(findSlow(1, "finishes"))
+	time.Sleep(100 * time.Millisecond)
+	begin := time.Now()
+	done := shutdownAsync(r, context.Background())
+	if err := idle.ExpectClosedNoBytes(3 * time.Second); err != nil {
+		t.Fatalf("idle connection not closed at step 3: %v", err)
+	}
+	if d := time.Since(begin); d > 2*time.Second {
+		t.Fatalf("the idle connection closed after %v: it must not wait for the drain", d)
+	}
+	m, err := busy.ReadMessage(10 * time.Second)
+	if err != nil || m.Header.ResponseTo != 1 {
+		t.Fatalf("the exchange in progress was cut: %v", err)
+	}
+	if _, err := busy.ReadMessage(5 * time.Second); err == nil {
+		t.Fatal("the connection stayed open after its exchange finished during shutdown")
+	}
+	if err := waitErr(t, done, "Shutdown"); err != nil {
+		t.Fatal(err)
+	}
+}

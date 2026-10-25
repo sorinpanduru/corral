@@ -82,9 +82,11 @@ func TestKillSessionsBlockedWhenEmpty_FR33(t *testing.T) {
 		})
 	}
 	forwarded := map[string]bson.D{
-		"one lsid":        {{Key: "killSessions", Value: bson.A{lsid}}, {Key: "$db", Value: "admin"}},
-		"two lsids":       {{Key: "killSessions", Value: bson.A{lsid, lsid}}, {Key: "$db", Value: "admin"}},
-		"lsid with extra": {{Key: "killSessions", Value: bson.A{bson.D{{Key: "id", Value: bson.Binary{Subtype: 4, Data: make([]byte, 16)}}, {Key: "uid", Value: bson.Binary{Subtype: 0, Data: make([]byte, 32)}}}}}, {Key: "$db", Value: "admin"}},
+		"one lsid":                     {{Key: "killSessions", Value: bson.A{lsid}}, {Key: "$db", Value: "admin"}},
+		"two lsids":                    {{Key: "killSessions", Value: bson.A{lsid, lsid}}, {Key: "$db", Value: "admin"}},
+		"array with an empty document": {{Key: "killSessions", Value: bson.A{bson.D{}}}, {Key: "$db", Value: "admin"}},
+		"array of scalars":             {{Key: "killSessions", Value: bson.A{1, 2}}, {Key: "$db", Value: "admin"}},
+		"lsid with extra":              {{Key: "killSessions", Value: bson.A{bson.D{{Key: "id", Value: bson.Binary{Subtype: 4, Data: make([]byte, 16)}}, {Key: "uid", Value: bson.Binary{Subtype: 0, Data: make([]byte, 32)}}}}}, {Key: "$db", Value: "admin"}},
 	}
 	for name, body := range forwarded {
 		t.Run("forward/"+name, func(t *testing.T) {
@@ -94,6 +96,8 @@ func TestKillSessionsBlockedWhenEmpty_FR33(t *testing.T) {
 			}
 		})
 	}
+	// Owner decision (wave 4 review): any non-empty array is forwarded; the proxy
+	// does not judge its elements.
 	// Case-sensitive: other spellings are ordinary commands.
 	for _, c := range []string{"KillSessions", "killsessions"} {
 		d := decideBytes(t, opMsgBytes(bson.D{{Key: c, Value: bson.A{}}, {Key: "$db", Value: "admin"}}))
