@@ -363,7 +363,7 @@ func Run(ctx context.Context, in Inputs, hooks Hooks) int {
 	if hooks.Stopping != nil {
 		hooks.Stopping(ctx)
 	}
-	stopForce := watchForce(life, svc, in.Force)
+	stopForce := watchForce(ctx, noDelay, life, svc, in.Force)
 	defer stopForce()
 	if svc != nil {
 		if noDelay {
@@ -389,16 +389,24 @@ const msgForced = "shutdown forced by second signal"
 // (FR-63). It runs for the whole shutdown, so a second signal that arrives
 // after the proxy has stopped (during admin or tracing shutdown) is still
 // recorded. Further signals change nothing. The returned func stops it.
-func watchForce(life *slog.Logger, svc *proxyapp.Service, force <-chan struct{}) (stop func()) {
+func watchForce(ctx context.Context, ctxForces bool, life *slog.Logger, svc *proxyapp.Service, force <-chan struct{}) (stop func()) {
 	done := make(chan struct{})
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
-		if force == nil {
-			<-done
-			return
+		// After a permanent accept error (FR-66) no signal has arrived yet, so
+		// the operator's first signal (the cancelled ctx) is the one that ends
+		// the drain, as the second one does after an ordinary shutdown.
+		var cancelled <-chan struct{}
+		if ctxForces {
+			cancelled = ctx.Done()
 		}
 		select {
+		case <-cancelled:
+			life.Warn(msgForced)
+			if svc != nil {
+				svc.ForceDrainEnd()
+			}
 		case <-force:
 			life.Warn(msgForced)
 			if svc != nil {
@@ -477,4 +485,26 @@ func recoverPanic(l *slog.Logger) {
 		err := errclass.FromPanic(r, debug.Stack())
 		l.LogAttrs(context.Background(), slog.LevelError, msgPanic, errclass.LogAttrs(err)...)
 	}
+}
+
+// WatchSignals maps the termination signals to the shutdown controls (FR-63).
+// It starts a goroutine that reads sigs: the first signal calls cancel, which
+// starts the graceful shutdown; the second closes the returned channel, which
+// the runtime takes as Inputs.Force; any further signal is drained and
+// ignored. The goroutine ends when sigs is closed.
+func WatchSignals(sigs <-chan os.Signal, cancel context.CancelFunc) (force <-chan struct{}) {
+	f := make(chan struct{})
+	go func() {
+		if _, ok := <-sigs; !ok {
+			return
+		}
+		cancel()
+		if _, ok := <-sigs; !ok {
+			return
+		}
+		close(f)
+		for range sigs {
+		}
+	}()
+	return f
 }

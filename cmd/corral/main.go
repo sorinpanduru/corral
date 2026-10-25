@@ -21,20 +21,11 @@ func main() {
 	// (terminate) before any argument is looked at.
 	signal.Notify(hup, syscall.SIGHUP)
 	// SIGINT and SIGTERM stay on one channel for the whole run (FR-63): the
-	// first starts the graceful shutdown, the second forces the drain to end,
-	// and any further one is drained and ignored.
+	// first starts the graceful shutdown, the second forces the drain to end.
 	sigs := make(chan os.Signal, 4)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	ctx, cancel := context.WithCancel(context.Background())
-	force := make(chan struct{})
-	go func() {
-		<-sigs
-		cancel()
-		<-sigs
-		close(force)
-		for range sigs {
-		}
-	}()
+	force := runtime.WatchSignals(sigs, cancel)
 	reg, hooks := testBuild()
 	code := runtime.Run(ctx, runtime.Inputs{
 		Args:     os.Args[1:],
