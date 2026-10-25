@@ -3,8 +3,12 @@
 package twin
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
+	"github.com/sorinpanduru/corral/internal/testkit/otlpcollector"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"net"
 	"regexp"
 	"sort"
@@ -418,3 +422,66 @@ func holdAction() mongosim.Action                { return mongosim.Hold() }
 
 // with returns a view of c that reports failures through t (for subtests).
 func (c *corral) with(t *testing.T) *corral { cc := *c; cc.t = t; return &cc }
+
+// ---- tracing and drivers ----
+
+// traced returns opts that export spans to a fake OTLP/HTTP collector.
+func traced(t *testing.T, o opts) (opts, *otlpcollector.Collector) {
+	t.Helper()
+	col := otlpcollector.Start(t)
+	if o.set == nil {
+		o.set = map[string]string{}
+	}
+	o.set["tracing.enabled"] = "true"
+	o.env = append(o.env,
+		"OTEL_EXPORTER_OTLP_ENDPOINT=http://"+col.HTTPEndpoint(),
+		"OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf")
+	return o, col
+}
+
+// stop sends SIGTERM and waits for exit 0 (spans are flushed on shutdown).
+func (c *corral) stop() {
+	c.t.Helper()
+	c.p.Signal(syscall.SIGTERM)
+	code, err := c.p.Wait(30 * time.Second)
+	if err != nil || code != 0 {
+		c.t.Fatalf("exit %d, %v", code, err)
+	}
+}
+
+func spansNamed(sp []otlpcollector.RecordedSpan, name string) []otlpcollector.RecordedSpan {
+	var out []otlpcollector.RecordedSpan
+	for _, s := range sp {
+		if s.Name == name {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func isErrSpan(s otlpcollector.RecordedSpan) bool { return s.StatusCode == 2 }
+
+// goClient connects the official Go driver to corral.
+func goClient(t *testing.T, addr string, mod ...func(*options.ClientOptions)) *mongo.Client {
+	t.Helper()
+	o := options.Client().ApplyURI("mongodb://" + addr).SetServerSelectionTimeout(15 * time.Second).SetTimeout(30 * time.Second)
+	for _, f := range mod {
+		f(o)
+	}
+	cl, err := mongo.Connect(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cl.Disconnect(context.Background()) })
+	return cl
+}
+
+func names(sp []otlpcollector.RecordedSpan) []string {
+	var out []string
+	for _, s := range sp {
+		out = append(out, s.Name)
+	}
+	return out
+}
+
+func itoa(n int32) string { return strconv.Itoa(int(n)) }
