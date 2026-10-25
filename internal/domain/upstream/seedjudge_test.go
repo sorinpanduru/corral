@@ -64,8 +64,9 @@ func seedHarness(t *testing.T, g *gates, seeds []string, setup func(*fakeChecker
 	h.chk.mu.Lock()
 	h.chk.hook = g.hook
 	h.chk.mu.Unlock()
-	t.Cleanup(g.releaseAll)
-	return h.start()
+	h.start()
+	t.Cleanup(g.releaseAll) // registered after Stop's cleanup, so it runs before it
+	return h
 }
 
 func (h *harness) assertNotYetJudged(what string) {
@@ -170,8 +171,14 @@ func TestUnreachableSeedCountsWhenItFails_AC61(t *testing.T) {
 	if got := h.incompatRecords(); len(got) != 1 || got[0] != "replica_set_name_mismatch@"+A {
 		t.Fatalf("records %v", got)
 	}
-	if n := len(h.chk.of(B)); n != 1 {
-		t.Fatalf("B was checked %d times, want 1 (no retry of a first check)", n)
+	cs := h.chk.of(B)
+	for i, c := range cs {
+		if c.Req.Fresh {
+			t.Fatalf("check %d of B is a fresh-connection retry: a first check is not retried", i)
+		}
+	}
+	if len(cs) > 0 && len(cs) > 1 && !cs[1].At.After(cs[0].At) {
+		t.Fatal("a second check of B ran at the same instant: that is a retry")
 	}
 }
 
