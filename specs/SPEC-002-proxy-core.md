@@ -1,8 +1,8 @@
 # SPEC-002: Proxy core (wire listener, handshake, multiplexing pool, upstream)
 
-Status: approved (Owner, 2026-10-24; revision 5); Amendment 1 approved (Owner, 2026-10-24); Amendment 2 approved (Owner, 2026-10-24); Amendment 3 approved (Owner, 2026-10-25); Amendment 4 approved (Owner, 2026-10-25); Amendment 5 approved (Owner, 2026-10-25)
+Status: approved (Owner, 2026-10-24; revision 5); Amendment 1 approved (Owner, 2026-10-24); Amendment 2 approved (Owner, 2026-10-24); Amendment 3 approved (Owner, 2026-10-25); Amendment 4 approved (Owner, 2026-10-25); Amendment 5 approved (Owner, 2026-10-25); Amendment 6 approved (Owner, 2026-10-25)
 Owner: Sorin Panduru
-Last updated: 2026-10-25 (Amendment 5)
+Last updated: 2026-10-25 (Amendment 6)
 
 ## Goal
 
@@ -326,7 +326,9 @@ the connection string pointing at corral.
     only (SPEC-001 FR-24).
   - **From upstream replies forwarded to clients:** `ok`, `code`, `codeName`,
     `writeConcernError.code` (FR-35) and `cursor.id` (span attribute only).
-    *(Amendment 1, G-20)* `writeErrors` is not read.
+    *(Amendment 1, G-20)* `writeErrors` is not read. *(Amendment 6)*
+    `writeConcernError.codeName` is not read; FR-35 takes the code name of a
+    not-primary code from its fixed table.
   - **From corral's own upstream exchanges** (handshake, authentication,
     monitoring and barrier `ping`):
     - the upstream parameters;
@@ -693,8 +695,9 @@ the connection string pointing at corral.
     single-`mongos` rule applies.
     - *(Amendment 2, R-5)* "Exactly as for a forwarded reply" includes the
       `upstream target marked not primary` warn record (rate-limited, FR-49),
-      with `db.response.status_code` and `corral.db.response.code_name` from
-      the ping reply.
+      with `db.response.status_code` from the ping reply. *(Changed by
+      Amendment 6)* Its `corral.db.response.code_name` follows the FR-35
+      "Code name in the record" rule.
     - The `upstream barrier failed` record is emitted as well; the two
       records report different things (the host state and the barrier
       outcome).
@@ -812,6 +815,20 @@ the connection string pointing at corral.
     counts, and any `writeConcernError` it carries is ignored for marking.
   - *(Amendment 1, G-20)* These codes found only inside `writeErrors[]` do
     not mark the host. `writeErrors` is not read (FR-9).
+  - *(Amendment 6, Owner decision 2026-10-25)* **Code name in the record.**
+    The `upstream target marked not primary` record (FR-49) carries:
+    - `db.response.status_code`: the code that caused the marking. That is
+      the top-level `code` for the `ok: 0` form and the barrier `ping`
+      reply (FR-29), and `writeConcernError.code` for the `ok: 1` form;
+    - `corral.db.response.code_name`: the name of that code in the fixed
+      table above, for example 91 gives `ShutdownInProgress`.
+    - For the `ok: 1` form the name always comes from the table, because
+      FR-9 does not read `writeConcernError.codeName`. FR-9 reads nothing new.
+    - *(Owner decision 2026-10-25)* The `ok: 0` form and the barrier `ping`
+      reply also take the name from the table, not from the reply's
+      `codeName`. So one code always gives the same name in this record,
+      whatever the upstream sends. FR-9 still reads `codeName` of those
+      replies for the SPEC-001 FR-23 span attributes.
   - **Single `mongos` target** *(replaced by Amendment 1, G-13)*. A `mongos`
     passes through errors from the shards behind it, so most of these codes
     describe a shard, not the `mongos`. In single-`mongos` mode:
@@ -1760,7 +1777,7 @@ declares its enumeration. Records carrying `error` also carry
 | `upstream` | error | `upstream incompatible` | `reason` (incompatibility reasons), `server.address`, `server.port` | on transition only; *(Amendment 5)* in replica-set mode, not before every seed has finished its first check (FR-18) |
 | `upstream` | info | `upstream available` | none | on transition only |
 | `upstream` | info | `upstream primary changed` | `server.address`, `server.port` | |
-| `upstream` | warn | `upstream target marked not primary` | `error` (`server`), `corral.error.detail` (`other`), `server.address`, `server.port`, `db.response.status_code`, `corral.db.response.code_name` (from the forwarded upstream reply or, per Amendment 2 R-5, from the barrier `ping` reply, so SPEC-001 FR-23 allows them) | rate-limited; an error record reporting the upstream's error |
+| `upstream` | warn | `upstream target marked not primary` | `error` (`server`), `corral.error.detail` (`other`), `server.address`, `server.port`, `db.response.status_code` (the code that caused the marking: top-level `code`, or `writeConcernError.code` in an `ok: 1` reply), `corral.db.response.code_name` (*changed by Amendment 6:* that code's name from the FR-35 fixed table, never read from `writeConcernError`; the same for every form, Owner decision 2026-10-25). Both come from an upstream reply (forwarded, or the barrier `ping` reply per Amendment 2 R-5), so SPEC-001 FR-23 allows them | rate-limited; an error record reporting the upstream's error |
 | `upstream` | warn | `upstream protocol error` | `error`, `corral.error.detail`, `server.address`, `server.port` | rate-limited; also used for FR-62 unsolicited data |
 | `upstream` | warn | `upstream barrier failed` | `error`, `corral.error.detail`, `server.address`, `server.port` | rate-limited |
 | `lifecycle` | warn | `shutdown forced by second signal` | none | FR-63 (Amendments 1 and 2); once per process |
@@ -1814,6 +1831,9 @@ Amendment 5 needs none either: its record uses the existing `lifecycle`
 component and the existing keys `error` and `corral.error.detail`, and the
 FR-18 clarification adds no signal. Transient accept errors produce no
 record and no metric (Owner decision 2026-10-25).
+Amendment 6 needs none either. It changes only where the value of an
+existing key comes from. The record still reports an error carried in an
+upstream reply, so SPEC-001 FR-23 (item 7 above) still allows the key.
 
 ## Behavior on failure
 
@@ -1835,7 +1855,7 @@ record and no metric (Owner decision 2026-10-25).
 | Replica-set seeds still finishing their first checks at startup, no matching member yet (Amendment 5) | error 6 with detail `upstream_unavailable` | readiness `upstream_unavailable`; incompatibility is judged only after every seed's first check (FR-18) |
 | Election, target marked not primary, connect attempts failing | requests wait, then error 262 | checks the topology; backoff on reconnects (FR-35, FR-56) |
 | Replica-set member in a ghost state, unreachable, or reporting a different `setName` during a rolling restart or re-configuration (Amendment 3) | nothing directly | ghost and unreachable members stay known and are re-checked; a foreign member is ignored but re-checked every heartbeat and re-admitted when it matches again (FR-37) |
-| Not-primary error in a reply (including `writeConcernError` in an `ok: 1` reply) | the reply, unchanged | marks the host, holds leases, re-checks (FR-35); in single-`mongos` mode only top-level 91 / 11600 mark; codes in `writeErrors`, and a `writeConcernError` inside an `ok: 0` reply, never mark (Amendments 1 and 3) |
+| Not-primary error in a reply (including `writeConcernError` in an `ok: 1` reply) | the reply, unchanged | marks the host, holds leases, re-checks (FR-35); in single-`mongos` mode only top-level 91 / 11600 mark; codes in `writeErrors`, and a `writeConcernError` inside an `ok: 0` reply, never mark (Amendments 1 and 3); the record's code name comes from the FR-35 table (Amendment 6) |
 | Upstream connection fails after the request was sent, or late request validation failure | client connection closed | upstream connection discarded (FR-38, FR-40) |
 | Upstream protocol violation (unknown `responseTo`, `moreToCome` reply, oversize, bad checksum) | client connection closed | upstream connection discarded (FR-11, FR-58) |
 | Unsolicited bytes or close on an idle pool connection (Amendment 1) | nothing | connection discarded; the checkout uses another connection (FR-62) |
@@ -2444,6 +2464,8 @@ hook" means a `corraltest`-build hook (FR-64).
     primary` record is emitted;
   - the same happens for an `ok: 1` reply with `writeConcernError.code` 91;
   - an `ok: 0` reply with code 11000 does not mark the host.
+  - *(Amendment 6)* The code name carried by these records is checked by
+    AC-62.
 - **AC-34** (FR-57): Twin:
   - a raw client that sends a header and stalls is closed after
     `proxy.client_io_timeout` (`reason=io_timeout`);
@@ -2868,13 +2890,40 @@ Added by Amendment 5:
     - in the unit variant (fake clock), all three first checks are started
       at startup, before any of them completes.
 
+Added by Amendment 6:
+
+- **AC-62** (FR-35, FR-9, FR-29, FR-49; Owner decision 2026-10-25): Unit
+  (domain) and twin, replica-set mode. Each run starts with a fresh rate
+  limiter.
+  - **Table:** the unit test checks that the fixed table maps exactly these
+    codes: 10107 `NotWritablePrimary`, 13435 `NotPrimaryNoSecondaryOk`, 13436
+    `NotPrimaryOrSecondary`, 11602 `InterruptedDueToReplStateChange`, 11600
+    `InterruptedAtShutdown`, 189 `PrimarySteppedDown` and 91
+    `ShutdownInProgress`.
+  - **`ok: 1` form:**
+    - the twin sends an `ok: 1` reply whose `writeConcernError` has
+      `code: 91` and a different `codeName` (a marker string);
+    - the `upstream target marked not primary` record has
+      `db.response.status_code="91"` and
+      `corral.db.response.code_name="ShutdownInProgress"`;
+    - the marker string appears in no output (marker harness);
+    - the same holds with no `codeName` in `writeConcernError`;
+    - the reply reaches the client byte-identical (FR-10).
+  - **Reads nothing new:** the reply parser exposes `writeConcernError.code`
+    but not `writeConcernError.codeName` (AC-7).
+  - **`ok: 0` form and barrier `ping` reply** (Owner decision 2026-10-25):
+    - an `ok: 0` reply with `code: 10107` and the legacy `codeName:
+      "NotMaster"` gives `corral.db.response.code_name="NotWritablePrimary"`;
+    - a barrier `ping` reply with `code: 91` and a different `codeName`
+      gives `corral.db.response.code_name="ShutdownInProgress"`;
+    - the forwarded `ok: 0` reply reaches the client unchanged.
+
 ## Open questions
 
 Must be empty before approval.
 
-None for Amendment 5. The Owner answered OPEN-B1 to OPEN-B3 on 2026-10-25
-(Decisions log), and the text is updated to match. The Owner still approves
-the text.
+None for Amendment 6. The Owner answered OPEN-C1 on 2026-10-25: the table
+applies to every form (Decisions log). The Owner still approves the text.
 
 ## Decisions log
 
@@ -2923,3 +2972,5 @@ part of Q1 (standalone) and Q5 (cross-client commands), and refined Q11/Q9
 | 2026-10-25 | **Amendment 4.** A gap found in code review: FR-1 required a record when the wire listener cannot bind, but did not name it. The record is now declared as the implementation emits it: level error, `component=config`, the fixed message `wire listener bind failed`, `setting=proxy.listen`, `error` (class `config`) and `corral.error.detail` from the bind error (for example `EADDRINUSE`), and no address, host or port; exit 1. It mirrors SPEC-003 Amendment 3's `admin listener bind failed`, so that `invalid configuration` alone still identifies load-time config errors (exit 2). FR-1, the log events table (new `config` row), Behavior on failure, AC-1 (adjusted) and new AC-59 are updated. No SPEC-001 change is needed: the record uses an existing component and existing keys. <br>**Owner decision 2026-10-25 ("document only"), session-enumeration exposure:** <br>- The Amendment 3 residual-exposure text was wrong to say least privilege mitigates `$listSessions` / `$listLocalSessions`. For the caller's own user these stages need no special privilege. <br>- Under the shared upstream identity, any client can therefore list every client's session IDs, then end those sessions through `killSessions` with explicit IDs, which FR-33 forwards. `endSessions` and `abortTransaction` / `commitTransaction` with another client's `lsid` work the same way. <br>- Least privilege does not prevent this. corral does not block it, by Owner decision. FR-51 operator documentation must state it. <br>- Changes: Data and compliance (the first residual list now has only the `allUsers` / other-users forms; a new session enumeration and termination route; the explicit-`lsid` bullet no longer says a leaked ID is needed; the closing mitigation paragraph), NFR Security "Cross-client effects", and a new FR-51 bullet. FR-33 and blocking behaviour are unchanged, and no AC changes, because the change is documentation only. | Gap found in code review, relayed by the Orchestrator, 2026-10-25; Owner decision "document only" on the session-enumeration exposure, relayed by the Orchestrator, 2026-10-25. Promotion awaits Owner approval of the text. |
 | 2026-10-25 | Amendment 4 approved by the Owner and promoted (bind-failure record; session enumeration/termination residual exposure documented by Owner decision, flagged for security@emag.ro). | Owner approval, 2026-10-25. |
 | 2026-10-25 | **Amendment 5.** Two points from code review. <br>**(1) Wire listener accept errors (new FR-66):** <br>- Transient accept errors (timeouts, temporary errors, `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`, `ECONNABORTED`, `EINTR`) are retried after 5 ms, doubling to a 1 s cap, and the delay resets after a successful accept. <br>- A listener closed by shutdown is not an error. <br>- Any other accept error is permanent. It produces one record (level error, `component=lifecycle`, fixed message `wire listener serve failed`, `error` and `corral.error.detail` only, no address, host or port), then shutdown and exit 1. This declares a record that was emitted but not declared, in the same way as Amendment 4. <br>- Also updated: FR-1 cross-reference, FR-47 note, log events table (new `lifecycle` row), Behavior on failure (two rows), NFR Availability, and new AC-60. <br>**(2) FR-18 clarification:** <br>- In replica-set mode, incompatibility from seed results is judged only once every seed has finished its first check. An unreachable seed counts once its check fails, with no FR-35 retry. The reason comes from the first qualifying seed in `upstream.hosts` order. <br>- Until then, readiness and fail-fast report `upstream_unavailable`, for at most about one `upstream.connect_timeout`. <br>- Rationale: the reason no longer depends on the order checks finish, and there is no spurious `upstream incompatible` record when a foreign seed answers first. <br>- Also updated: log events table note on `upstream incompatible`, Behavior on failure (one row), AC-18 (note), and new AC-61. <br>No SPEC-001 change is needed. <br>**Owner decisions 2026-10-25 on the open questions:** <br>- **OPEN-B1 = (a):** after a permanent accept error, corral runs the FR-47 graceful sequence without the listener-close delay (`/readyz` `shutting_down`, drain within `proxy.shutdown.drain_timeout`, pools closed, tracing flushed), then exits 1. A second signal during it ends the drain per FR-63 but still exits 1 (FR-47 note, FR-63, FR-66, Behavior on failure, AC-60). <br>- **OPEN-B2:** transient accept errors produce no record and no metric, and the backoff has no jitter (FR-66, SPEC-001 note, Behavior on failure, AC-60). <br>- **OPEN-B3:** every seed's first check starts concurrently at startup, so the FR-18 "not yet judged" period lasts at most about one `upstream.connect_timeout` (FR-18, FR-37, AC-61). | Gaps from code review, relayed by the Orchestrator, 2026-10-25; Owner decisions on OPEN-B1 to OPEN-B3, relayed by the Orchestrator, 2026-10-25. Promotion awaits Owner approval of the text. |
+| 2026-10-25 | Amendment 5 (incl. Owner decisions on OPEN-B1 to OPEN-B3) approved by the Owner and promoted. This row was added in Amendment 6 to record an approval that the header already showed. | Owner approval, 2026-10-25, relayed by the Orchestrator. |
+| 2026-10-25 | **Amendment 6.** Resolves a conflict between FR-9 and FR-49: the `upstream target marked not primary` row said `corral.db.response.code_name` came "from the forwarded upstream reply", but for the `ok: 1` form with `writeConcernError`, FR-9 reads only `writeConcernError.code`, not its `codeName`. <br>**Owner decision 2026-10-25:** the code name is taken from corral's fixed table of not-primary codes in FR-35 (10107 `NotWritablePrimary`, 13435 `NotPrimaryNoSecondaryOk`, 13436 `NotPrimaryOrSecondary`, 11602 `InterruptedDueToReplStateChange`, 11600 `InterruptedAtShutdown`, 189 `PrimarySteppedDown`, 91 `ShutdownInProgress`). These names match the spec's existing FR-35 list exactly. FR-9 reads nothing new, and now states that `writeConcernError.codeName` is not read. `db.response.status_code` is the code that caused the marking. <br>**OPEN-C1, Owner decision 2026-10-25:** the table applies to every form: the `ok: 0` reply, the `ok: 1` reply with `writeConcernError`, and the barrier `ping` reply. This was the spec-writer's recommendation, for consistency. <br>Changes: FR-9 (one sentence), FR-29 R-5 note, FR-35 (new "Code name in the record" bullet), log events table (`upstream target marked not primary` row), SPEC-001 note, Behavior on failure (not-primary row), AC-33 (pointer), and new AC-62. No SPEC-001 change is needed. | Conflict found in code review, relayed by the Orchestrator, 2026-10-25; Owner decisions of 2026-10-25 (code-name source; OPEN-C1) relayed by the Orchestrator. Promotion awaits Owner approval of the text. |
