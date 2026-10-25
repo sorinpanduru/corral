@@ -3,6 +3,8 @@
 - Status: Accepted (planner, 2026-10-24, for SPEC-002). Updated the same
   day after the Owner's answers: SCRAM uses `github.com/xdg-go/scram` behind
   a thin adapter, and the "planner choice" close reasons (P7) are accepted.
+  Updated 2026-10-25 with two implementation decisions from code review
+  (check spacing; the `authBad` target rule, confirmed by the Owner 2026-10-25).
 - Related: SPEC-002 FR-18, FR-22, FR-24, FR-25, FR-28, FR-35, FR-37, FR-45,
   FR-46, FR-56; ADR-0002 (dependency pins), ADR-0015
 
@@ -117,6 +119,46 @@ client.
   `arbiters`, so arbiter-only servers are never learned and never
   monitored. A server that reports `arbiterOnly: true` is dropped from the
   known members.
+
+### Implementation decisions recorded at code review (2026-10-25)
+
+1. **Check spacing is measured from the end of the previous check.**
+   - SPEC-002 FR-37 requires checks of a member to be "at least 500 ms
+     apart" (`upstream.MinHeartbeat`), but does not say whether that is
+     measured from the start or the end of a check.
+   - corral measures it SDAM-style: the next check of a member starts no
+     earlier than 500 ms after the **end** of that member's previous check.
+   - This applies to every kind of check: regular heartbeats, fast checks
+     while no target is known, the check run on a target change (Amendment 3
+     clarification of FR-22) and immediate checks (FR-37).
+   - Reason: a check that takes a long time (up to
+     `upstream.connect_timeout`) cannot be followed at once by another, so
+     the per-member load stays bounded even when the upstream is slow. This
+     is stricter than, never looser than, start-to-start spacing.
+2. **A host whose authenticating check failed transiently is not a usable
+   target until an authenticating check succeeds. Confirmed by the Owner,
+   2026-10-25.**
+   - When a check that authenticates (FR-22, Amendment 3 clarification (c):
+     the check that makes a server the target) fails with a transient error
+     (network, TLS, timeout, or an error reply other than 18 or 334), the
+     monitor sets an `authBad` flag on that host.
+   - While the flag is set:
+     - the host is not selected as the usable target;
+     - its monitoring checks keep authenticating, even though it is not the
+       current target.
+   - The flag clears on the first authenticating check that succeeds. The
+     host can then become the target.
+   - Reading: Amendment 3 clarification (c) says authentication happens as
+     part of the check that would make the server the target, so a host is
+     not treated as the target until that authentication has completed.
+   - This **deviates from the literal FR-22 sentence** "Of the monitoring
+     connections, only the one to the current target authenticates", because
+     a flagged host that is not the current target still authenticates. The
+     Owner confirmed this reading on 2026-10-25 and chose to record it here
+     rather than amend the spec. The rejected alternative was to select the
+     host as target at once and authenticate only on its next check,
+     accepting a window in which leases go to a target whose authentication
+     was never confirmed.
 
 ### Amendment 1 rules for upstream connections
 
