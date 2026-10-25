@@ -99,7 +99,7 @@
     {
       "name": "corral_requests_total",
       "type": "counter",
-      "help": "Forwarded and refused requests by command and outcome.",
+      "help": "Requests by command and outcome, including locally answered handshakes and refusals and moreToCome messages.",
       "labels": [
         {
           "name": "command",
@@ -390,7 +390,7 @@
     {
       "name": "corral_upstream_available",
       "type": "gauge",
-      "help": "1 when a usable upstream target is known, else 0.",
+      "help": "1 when the proxy is ready with respect to the upstream (FR-46), else 0.",
       "labels": []
     },
     {

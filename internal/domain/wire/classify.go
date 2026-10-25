@@ -58,6 +58,9 @@ type Request struct {
 	CursorID      int64
 	HasCursorID   bool
 	FirstStage    string
+	// KillSessionsEmpty is set for killSessions with an empty or absent
+	// list of sessions (Amendment 3: refused like killAllSessions).
+	KillSessionsEmpty bool
 
 	Handshake  *Handshake
 	FitsPrefix bool
@@ -217,11 +220,12 @@ func classifyMsg(h Header, prefix []byte, fits bool) (Request, error) {
 		}
 	}
 	first, st, err := bson.FirstElementPartial(doc)
-	if err != nil || st != bson.PartialOK {
+	if err != nil || (st != bson.PartialOK && st != bson.PartialKeyOnly) {
 		return Request{}, ErrMalformed()
 	}
 	r.Command = first.Key()
 	cmd := r.Command
+	whole := st == bson.PartialOK // the first value is complete
 
 	var p capPlan
 	p.add("db", bson.CaptureValue, "$db")
@@ -257,14 +261,17 @@ func classifyMsg(h Header, prefix []byte, fits bool) (Request, error) {
 	}
 	r.StartTransaction = p.flag(w, "startTxn")
 
-	if slices.Contains(collectionCommands, cmd) {
+	if cmd == "killSessions" {
+		r.KillSessionsEmpty = killSessionsEmpty(first, whole)
+	}
+	if whole && slices.Contains(collectionCommands, cmd) {
 		if s, ok := first.StringValue(); ok {
 			r.Collection, r.HasCollection = s, true
 		}
 	}
 	switch {
 	case cmd == "getMore":
-		if n, ok := first.Int64(); ok {
+		if n, ok := first.Int64(); whole && ok {
 			r.CursorID, r.HasCursorID = n, true
 		}
 		if s := p.str(w, "collection"); s != "" {
@@ -281,7 +288,7 @@ func classifyMsg(h Header, prefix []byte, fits bool) (Request, error) {
 	}
 
 	local := r.Handshake != nil || slices.Contains(localCommands, cmd) ||
-		(cmd == "aggregate" && r.FirstStage == "$currentOp")
+		(cmd == "aggregate" && r.FirstStage == "$currentOp") || r.KillSessionsEmpty
 	if local && !fits {
 		return Request{}, ErrMessageTooLarge()
 	}
@@ -389,4 +396,34 @@ func splitDoc(b []byte, fits bool) (doc, rest []byte, err error) {
 		return b, nil, nil
 	}
 	return b[:l], b[l:], nil
+}
+
+// killSessionsEmpty reports whether the first value of killSessions names no
+// session: an empty, absent or non-array list, or one with no document that
+// has a binary id. When the value is only partly
+// inside the prefix it is non-empty if its declared length says so.
+func killSessionsEmpty(first bson.Element, whole bool) bool {
+	if first.Type() != bson.TypeArray {
+		return true
+	}
+	if !whole {
+		return false // a value too large for the prefix cannot be empty
+	}
+	arr, _ := first.Array()
+	empty := true
+	// Explicit lsids: at least one element is a document with a binary id.
+	_ = bson.ForEach(arr, func(it bson.Element) bool {
+		d, ok := it.Document()
+		if !ok {
+			return true
+		}
+		if e, found, err := bson.Lookup(d, "id"); err == nil && found {
+			if _, _, isBin := e.Binary(); isBin {
+				empty = false
+				return false
+			}
+		}
+		return true
+	})
+	return empty
 }

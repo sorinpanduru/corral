@@ -8,14 +8,16 @@
 // ok:0 reply, the server code and code name). Message bytes never appear.
 //
 // With tracing disabled the Factory never calls Tracer.Start and the
-// Start, Checkout, RoundTrip and End calls allocate nothing.
+// Start, Checkout, RoundTrip and End calls allocate nothing, provided the
+// error passed to End is already boxed without allocation (a pointer type,
+// as every production error is).
 package spans
 
 import (
 	"context"
 	"net/netip"
 	"strconv"
-	"unsafe"
+	"strings"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -184,7 +186,7 @@ func (e Exchange) End(err error, reply *wire.ReplyFields) {
 	if e.f == nil {
 		return
 	}
-	finish(e.root, hideErr(err), reply)
+	finish(e.root, err, reply)
 }
 
 // End ends the child span the same way.
@@ -192,28 +194,7 @@ func (s Step) End(err error, reply *wire.ReplyFields) {
 	if s.span == nil {
 		return
 	}
-	finish(s.span, hideErr(err), reply)
-}
-
-// hideErr returns a copy of err whose escape-analysis flow is cut, so that
-// passing an error to End does not force the caller to heap-allocate the
-// boxed value. This is what lets End allocate nothing when tracing is off
-// (SPEC-001 FR-19, AC-22): the compiler cannot prove err stays unretained,
-// because it is handed to errclass, which calls methods on it.
-//
-// It is sound because errclass only reads the error during the call and keeps
-// nothing that points into the box (class and detail are constants, and the
-// code name is a string value copied out). The copy is a byte copy of the two
-// interface words into a local interface variable on the stack, so the GC
-// and stack growth still see ordinary pointers.
-func hideErr(err error) error {
-	if err == nil {
-		return nil
-	}
-	var out error
-	copy(unsafe.Slice((*byte)(unsafe.Pointer(&out)), unsafe.Sizeof(out)),
-		unsafe.Slice((*byte)(unsafe.Pointer(&err)), unsafe.Sizeof(err)))
-	return out
+	finish(s.span, err, reply)
 }
 
 func finish(span trace.Span, err error, reply *wire.ReplyFields) {
@@ -237,10 +218,10 @@ func (e *replyErr) ServerCodeName() string { return e.name }
 
 // ReplyError returns a ServerError for an ok:0 reply, and nil otherwise.
 func ReplyError(f wire.ReplyFields) error {
-	if !f.HasOK || f.OK != 0 {
+	if !f.IsError() {
 		return nil
 	}
-	e := &replyErr{name: f.CodeName}
+	e := &replyErr{name: strings.Clone(f.CodeName)}
 	if f.HasCode {
 		e.code = f.Code
 	}

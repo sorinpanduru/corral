@@ -27,6 +27,7 @@ func serverAttrs(nodes []error) (code, name string, ok bool) {
 			if !validCodeName(name) {
 				name = ""
 			}
+			name = strings.Clone(name) // never alias memory owned by the error
 			return strconv.FormatInt(int64(se.ServerCode()), 10), name, true
 		}
 	}

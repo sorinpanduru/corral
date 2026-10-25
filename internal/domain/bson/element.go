@@ -266,6 +266,10 @@ const (
 	PartialNeedMore
 	// PartialEmpty means the document is complete and has no elements.
 	PartialEmpty
+	// PartialKeyOnly means the first element's key is complete but its value
+	// is not: the Element carries the key, its type, and the value bytes seen
+	// so far (not a whole value, so typed accessors must not be used).
+	PartialKeyOnly
 )
 
 // FirstElementPartial reads the first element of a document of which only a
@@ -313,7 +317,7 @@ func FirstElementPartial(b []byte) (Element, PartialStatus, error) {
 		if complete {
 			return Element{}, PartialNeedMore, ErrMalformed
 		}
-		return Element{}, PartialNeedMore, nil
+		return Element{key: b[5:ke], typ: t, val: b[vs:limit:limit]}, PartialKeyOnly, nil
 	}
 	return Element{key: b[5:ke], typ: t, val: b[vs : vs+size : vs+size]}, PartialOK, nil
 }

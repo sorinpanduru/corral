@@ -483,6 +483,11 @@ type ReplyFields struct {
 	CursorID    int64
 }
 
+// IsError reports whether the reply is a server error: an ok that is not 1
+// (SPEC-001 FR-29). It is the one predicate behind proxy.OutcomeForReply and
+// spans.ReplyError.
+func (f ReplyFields) IsError() bool { return f.HasOK && f.OK != 1 }
+
 // ReplyScanner validates an upstream OP_MSG reply as it streams and reads the
 // FR-9 reply fields. Write, Close and Done come from the embedded validator.
 type ReplyScanner struct {

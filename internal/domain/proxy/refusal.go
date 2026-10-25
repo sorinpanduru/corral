@@ -170,7 +170,9 @@ func HandshakeReply(h wire.Handshake, p upstream.Params, connID int32, now time.
 	b.AppendInt32("maxBsonObjectSize", p.MaxBsonObjectSize)
 	b.AppendInt32("maxMessageSizeBytes", p.MaxMessageSizeBytes)
 	b.AppendInt32("maxWriteBatchSize", p.MaxWriteBatchSize)
-	b.AppendInt32("logicalSessionTimeoutMinutes", p.LogicalSessionTimeoutMinutes)
+	if p.HasLSTM {
+		b.AppendInt32("logicalSessionTimeoutMinutes", p.LogicalSessionTimeoutMinutes)
+	}
 	b.AppendInt32("minWireVersion", p.MinWire)
 	maxWire := p.MaxWire
 	if maxWire > upstream.WireMax {
@@ -205,7 +207,7 @@ func (o Outcome) String() string {
 
 // OutcomeForReply classifies a forwarded reply: ok 0 is a server error.
 func OutcomeForReply(f wire.ReplyFields) Outcome {
-	if f.HasOK && f.OK != 1 {
+	if f.IsError() {
 		return OutcomeServerError
 	}
 	return OutcomeOK

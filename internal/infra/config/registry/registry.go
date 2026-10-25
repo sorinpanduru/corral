@@ -10,6 +10,8 @@ package registry
 
 import (
 	"errors"
+	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -59,6 +61,13 @@ type FileValue struct {
 	Path    string
 	Content []byte
 }
+
+// String, GoString, Format and LogValue show the path only, so a FileValue
+// never prints its content (SPEC-003 FR-11, SPEC-002 FR-24).
+func (v FileValue) String() string             { return "file:" + v.Path }
+func (v FileValue) GoString() string           { return "registry.FileValue{Path:" + strconv.Quote(v.Path) + "}" }
+func (v FileValue) Format(f fmt.State, _ rune) { _, _ = f.Write([]byte(v.String())) }
+func (v FileValue) LogValue() slog.Value       { return slog.StringValue(v.String()) }
 
 // CrossRule is a rule over several settings (FR-30). Primary names the setting
 // a failure is reported under; it must be among Involves.

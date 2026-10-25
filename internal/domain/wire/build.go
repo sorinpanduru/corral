@@ -57,6 +57,17 @@ func HelloBody(app, driverVersion, osType string) []byte {
 	return b.Bytes()
 }
 
+// HelloPollBody is corral's repeated monitoring hello on an established
+// connection. The client metadata document is sent only once per connection
+// (a second one is refused with code 186), so later checks omit it.
+func HelloPollBody() []byte {
+	b := bson.NewBuilder()
+	b.AppendInt32("hello", 1)
+	b.AppendBool("helloOk", true)
+	b.AppendString("$db", "admin")
+	return b.Bytes()
+}
+
 // SaslStartBody starts a SCRAM-SHA-256 conversation against source.
 func SaslStartBody(source string, payload []byte) []byte {
 	b := bson.NewBuilder()

@@ -63,6 +63,10 @@ func (*unsolicitedError) CorralErrorDetail() string { return "unexpected_respons
 // maxOwnReply bounds replies to corral's own exchanges (hello, SASL, ping).
 const maxOwnReply = 1 << 20
 
+// maxSASLRounds bounds the SASL conversation: the start reply plus a few
+// continues (SCRAM needs two, plus an empty one without skipEmptyExchange).
+const maxSASLRounds = 4
+
 var connSeq atomic.Uint64
 
 // Conn is one upstream connection. It satisfies pool.Conn.
@@ -74,6 +78,7 @@ type Conn struct {
 	maxMsg   int32
 	closeOne sync.Once
 	authed   bool
+	helloed  bool // a hello with client metadata has been sent
 
 	wmu     sync.Mutex
 	watchMu sync.Mutex
@@ -233,7 +238,13 @@ func (c *Conn) exchange(ctx context.Context, body []byte) ([]byte, error) {
 	if end < 9 || buf[4] != 0 {
 		return nil, wire.ErrMalformed()
 	}
-	return buf[5:end], nil
+	doc := buf[5:end]
+	if l := int(binary.LittleEndian.Uint32(doc)); l < 5 || l > len(doc) {
+		return nil, wire.ErrMalformed()
+	} else {
+		doc = doc[:l] // the body only; kind-1 sections or padding do not belong to it
+	}
+	return doc, nil
 }
 
 // RoundTrip sends one command document and returns the reply document.
@@ -305,7 +316,12 @@ func connect(ctx context.Context, cfg Config, host string) (*Conn, error) {
 
 // hello runs the handshake with the given appName and returns the parsed reply.
 func (c *Conn) hello(ctx context.Context, cfg Config, app string) (wire.HelloReply, error) {
-	doc, err := c.exchange(ctx, wire.HelloBody(app, cfg.Version, runtime.GOOS))
+	body := wire.HelloPollBody()
+	if !c.helloed {
+		body = wire.HelloBody(app, cfg.Version, runtime.GOOS) // client metadata, once per connection
+		c.helloed = true
+	}
+	doc, err := c.exchange(ctx, body)
 	if err != nil {
 		return wire.HelloReply{}, err
 	}
@@ -352,7 +368,16 @@ func (o *opener) Open(ctx context.Context, host string) (*Conn, error) {
 }
 
 // errNoCreds is returned when credentials were configured but unusable.
-var errBadCredentials = errors.New("upstreamconn: the configured credentials cannot be used")
+var errBadCredentials error = &badCredentialsError{}
+
+// badCredentialsError is a configuration problem (the password cannot be
+// prepared), classed as config so it is never retried as transient.
+type badCredentialsError struct{}
+
+func (*badCredentialsError) Error() string {
+	return "upstreamconn: the configured credentials cannot be used"
+}
+func (*badCredentialsError) ConfigSetting() string { return "upstream.auth.password" }
 
 type authenticator struct {
 	cl  *scram.Client
@@ -395,7 +420,10 @@ func (a *authenticator) authenticate(ctx context.Context, c *Conn) error {
 		return err
 	}
 	convDone := false
-	for {
+	for round := 0; ; round++ {
+		if round > maxSASLRounds {
+			return wire.ErrUnexpectedResponse()
+		}
 		r, err := parseSasl(doc)
 		if err != nil {
 			return err

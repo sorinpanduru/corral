@@ -38,17 +38,37 @@ func NewChecker(cfg Config, obs upstream.Observer) upstream.Checker {
 
 var _ io.Closer = (*Checker)(nil)
 
-// Close closes all monitoring connections.
+// Close closes all monitoring connections, reporting each as closed with
+// reason shutdown.
 func (k *Checker) Close() error {
 	k.mu.Lock()
-	defer k.mu.Unlock()
-	for _, m := range k.hosts {
-		if m.c != nil {
-			m.c.Close(pool.CloseShutdown)
-			m.c = nil
-		}
+	hosts := make(map[string]*monitorConn, len(k.hosts))
+	for h, m := range k.hosts {
+		hosts[h] = m
+	}
+	k.mu.Unlock()
+	for h, m := range hosts {
+		m.mu.Lock()
+		m.drop(k, context.Background(), h, pool.CloseShutdown)
+		m.mu.Unlock()
 	}
 	return nil
+}
+
+// CloseHost closes the monitoring connection to a host the monitor no longer
+// tracks (an arbiter, for example), with the given reason (idle). A member that
+// reports a different replica-set name is still re-checked by the monitor, so
+// its connection is kept and this is not called for it.
+func (k *Checker) CloseHost(host string, reason pool.CloseReason) {
+	k.mu.Lock()
+	m := k.hosts[host]
+	k.mu.Unlock()
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.drop(k, context.Background(), host, reason)
+	m.mu.Unlock()
 }
 
 func (k *Checker) monitor(host string) *monitorConn {
@@ -62,11 +82,13 @@ func (k *Checker) monitor(host string) *monitorConn {
 	return m
 }
 
-func (m *monitorConn) drop(k *Checker, ctx context.Context, host, reason string) {
+// drop closes the monitoring connection and reports it. The reason is a
+// pool.CloseReason, so only values of the closed enum can be reported.
+func (m *monitorConn) drop(k *Checker, ctx context.Context, host string, reason pool.CloseReason) {
 	if m.c != nil {
-		m.c.Close(pool.CloseError)
+		m.c.Close(reason)
 		m.c = nil
-		k.obs.MonitorConnClosed(ctx, host, reason)
+		k.obs.MonitorConnClosed(ctx, host, string(reason))
 	}
 }
 
@@ -82,7 +104,7 @@ func (k *Checker) Check(ctx context.Context, req upstream.CheckRequest) upstream
 	defer m.mu.Unlock()
 
 	if req.Fresh {
-		m.drop(k, ctx, host, "fresh_check")
+		m.drop(k, ctx, host, pool.CloseError) // a fresh check replaces the old connection
 	}
 	var hr wire.HelloReply
 	var err error
@@ -105,7 +127,7 @@ func (k *Checker) Check(ctx context.Context, req upstream.CheckRequest) upstream
 	} else {
 		hr, err = m.c.hello(ctx, k.cfg, "corral-monitor")
 		if err != nil {
-			m.drop(k, ctx, host, "error")
+			m.drop(k, ctx, host, pool.CloseError)
 			k.obs.MonitorConnFailed(ctx, host, err)
 			rep.Err = err
 			return rep
@@ -119,7 +141,7 @@ func (k *Checker) Check(ctx context.Context, req upstream.CheckRequest) upstream
 			if upstream.IsAuthFailed(aerr) {
 				k.obs.AuthFailed(ctx, "monitor", host, aerr)
 			} else {
-				m.drop(k, ctx, host, "error")
+				m.drop(k, ctx, host, pool.CloseError)
 			}
 		} else {
 			k.obs.AuthSucceeded(ctx, "monitor", host)

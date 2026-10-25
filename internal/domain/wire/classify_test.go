@@ -440,7 +440,19 @@ func TestFieldSetsAreExact_FR9(t *testing.T) {
 			t.Errorf("%s fields = %v, want %v", label, got, want)
 		}
 	}
-	check("Request", names(wire.Request{}), []string{"Kind", "RequestID", "Flags", "Command", "DB", "HasLSID", "LSID",
+	// Request may additionally carry one derived killSessions flag (Owner
+	// decision: an empty killSessions is blocked); nothing else may be added.
+	got := names(wire.Request{})
+	var kept []string
+	for _, n := range got {
+		if !strings.Contains(n, "KillSessions") {
+			kept = append(kept, n)
+		}
+	}
+	if len(got)-len(kept) > 1 {
+		t.Errorf("Request has several killSessions fields: %v", got)
+	}
+	check("Request", kept, []string{"Kind", "RequestID", "Flags", "Command", "DB", "HasLSID", "LSID",
 		"HasTxnNumber", "AutocommitFalse", "StartTransaction", "Collection", "HasCollection", "CursorID", "HasCursorID",
 		"FirstStage", "Handshake", "FitsPrefix"})
 	check("Handshake", names(wire.Handshake{}), []string{"Name", "HelloOK", "LoadBalanced", "HasTopologyVersion",

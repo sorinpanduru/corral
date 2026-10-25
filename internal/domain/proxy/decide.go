@@ -75,6 +75,9 @@ func isBlocked(req wire.Request) bool {
 			return true
 		}
 	}
+	if req.Command == "killSessions" && req.KillSessionsEmpty {
+		return true // an empty list kills every session, like killAllSessions
+	}
 	return req.Command == "aggregate" && req.FirstStage == "$currentOp"
 }
 

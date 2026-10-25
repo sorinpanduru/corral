@@ -129,7 +129,11 @@ func (s *Shutdown) DelayExpired() <-chan struct{} { return s.delayCh }
 // DrainExpired is closed when the drain is over (or forced).
 func (s *Shutdown) DrainExpired() <-chan struct{} { return s.drainCh }
 
-// ConnAction is the FR-47 step 3 decision for one connection.
+// ConnAction is the FR-47 step 3 decision for one connection. Precedence: an
+// exchange in progress always finishes first (finish-then-close), even if a
+// later byte has already arrived; only an idle connection whose first byte
+// came after step 3 is refused with 91; any other idle connection closes at
+// once.
 func (s *Shutdown) ConnAction(exchangeInProgress, firstByteReadAfterStep3 bool) Action {
 	switch {
 	case exchangeInProgress:
