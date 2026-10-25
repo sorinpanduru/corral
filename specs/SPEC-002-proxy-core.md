@@ -1,8 +1,8 @@
 # SPEC-002: Proxy core (wire listener, handshake, multiplexing pool, upstream)
 
-Status: approved (Owner, 2026-10-24; revision 5); Amendment 1 approved (Owner, 2026-10-24); Amendment 2 approved (Owner, 2026-10-24); Amendment 3 approved (Owner, 2026-10-25); Amendment 4 approved (Owner, 2026-10-25); Amendment 5 approved (Owner, 2026-10-25); Amendment 6 approved (Owner, 2026-10-25)
+Status: approved (Owner, 2026-10-24; revision 5); Amendment 1 approved (Owner, 2026-10-24); Amendment 2 approved (Owner, 2026-10-24); Amendment 3 approved (Owner, 2026-10-25); Amendment 4 approved (Owner, 2026-10-25); Amendment 5 approved (Owner, 2026-10-25); Amendment 6 approved (Owner, 2026-10-25); Amendment 7 approved (Owner, 2026-10-25)
 Owner: Sorin Panduru
-Last updated: 2026-10-25 (Amendment 6)
+Last updated: 2026-10-25 (Amendment 7)
 
 ## Goal
 
@@ -1006,6 +1006,14 @@ the connection string pointing at corral.
   that client connection and discards any upstream connection it held. Other
   connections and the process continue. It is reported per SPEC-001 FR-29
   (class `internal`).
+  - *(Amendment 7, security review RC5)* The `request handler panic
+    recovered` record is rate-limited per FR-49, like the other
+    rate-limited records: at most one record per 30 seconds, carrying a
+    `suppressed_count`. Otherwise a client that can trigger a recovered
+    panic could flood the logs. Only the record is limited. Every panic
+    still closes its connection, and every close is still counted
+    (`corral_client_connections_closed_total{reason="internal_error"}`,
+    FR-48). No metric is limited.
 - **FR-43:** Upstream unavailability never closes existing client connections
   by itself. Clients keep getting handshake replies (FR-19), waits or
   synthesized errors (FR-56) until the upstream recovers.
@@ -1767,7 +1775,7 @@ declares its enumeration. Records carrying `error` also carry
 | `proxy` | warn | `client protocol error` | `error`, `corral.error.detail`, `corral.connection.id` | rate-limited |
 | `proxy` | warn | `client I/O timed out` | `error`, `corral.error.detail`, `corral.connection.id` | rate-limited |
 | `proxy` | warn | `client TLS handshake failed` | `error`, `corral.error.detail` | rate-limited; no certificate identity |
-| `proxy` | error | `request handler panic recovered` | `error`, `corral.error.detail`, `stack` | SPEC-001 FR-29 |
+| `proxy` | error | `request handler panic recovered` | `error`, `corral.error.detail`, `stack` | SPEC-001 FR-29; rate-limited *(Amendment 7, FR-42)* |
 | `pool` | warn | `pool checkout timed out` / `pool wait queue full` | none | rate-limited |
 | `upstream` | debug | `upstream connection opened` / `upstream monitoring connection opened` | `server.address`, `server.port`, `corral.upstream.connection.id` | |
 | `upstream` | debug | `upstream connection closed` / `upstream monitoring connection closed` | `reason` (upstream close reasons), `server.address`, `server.port` | |
@@ -1834,6 +1842,10 @@ record and no metric (Owner decision 2026-10-25).
 Amendment 6 needs none either. It changes only where the value of an
 existing key comes from. The record still reports an error carried in an
 upstream reply, so SPEC-001 FR-23 (item 7 above) still allows the key.
+Amendment 7 needs none either. It applies this spec's existing FR-49 rate
+limit, which follows SPEC-001 FR-33, to one more record. SPEC-001 FR-29
+still governs that record's content (error level, class `internal`, an
+optional `stack`, and never the panic value).
 
 ## Behavior on failure
 
@@ -1864,7 +1876,7 @@ upstream reply, so SPEC-001 FR-23 (item 7 above) still allows the key.
 | Client closes mid-message (Amendment 2) | n/a | one `proxy_error` request, class `network`, `reason=client_closed`; a partly streamed upstream connection is discarded (FR-41) |
 | Barrier `ping` fails after a `moreToCome` message | nothing | upstream connection discarded; client connection open; a not-primary code in the ping reply also marks the host and logs it (FR-29) |
 | `moreToCome` message refused | nothing | dropped and counted (FR-59) |
-| Panic in a connection handler | that client connection closed | recovered; other clients unaffected (FR-42) |
+| Panic in a connection handler | that client connection closed | recovered; other clients unaffected; rate-limited error record, every close counted (FR-42, Amendment 7) |
 | Graceful shutdown | in-flight exchanges finish; late messages get error 91; connections closed | FR-47 |
 | Second SIGTERM/SIGINT during shutdown (Amendments 1 and 2) | remaining connections closed | rest of `listener_close_delay` skipped, drain ends at once; exit 0 (FR-63) |
 | Client TLS handshake fails, stalls, or no client certificate under mutual TLS | connection closed | counts; rate-limited warn (FR-44) |
@@ -2321,6 +2333,16 @@ hook" means a `corraltest`-build hook (FR-64).
   connection's handler. That client connection closes, a concurrent client
   completes its request, and the error record has class `internal` and no
   panic value.
+  - *(Amendment 7, FR-49)* **Rate limit.** On a fake clock, the hook panics
+    on 10 client connections within 30 s:
+    - exactly one `request handler panic recovered` record is emitted in
+      that window;
+    - an 11th panic after the window emits one record with
+      `suppressed_count` 9;
+    - all 11 connections are closed, and
+      `corral_client_connections_closed_total{reason="internal_error"}`
+      increases by exactly 11;
+    - a concurrent client still completes its request.
 - **AC-23** (FR-43): Twin: while the upstream is down, open client connections
   stay open. After recovery, the same connections succeed.
 - **AC-24** (FR-44, FR-45): Functional, with a synthetic test CA and
@@ -2397,7 +2419,8 @@ hook" means a `corraltest`-build hook (FR-64).
     only its allowed keys, and `reason` values only from its enumeration
     (one marker test per event, marker harness);
   - each rate-limited event, triggered 10 times in 30 s on a fake clock,
-    produces one record and then `suppressed_count` 9;
+    produces one record and then `suppressed_count` 9. *(Amendment 7)*
+    This includes `request handler panic recovered` (AC-22);
   - no record or span for a synthesized error carries
     `db.response.status_code`.
 - **AC-28** (FR-51, FR-65): Review: the operator documentation file
@@ -2922,8 +2945,9 @@ Added by Amendment 6:
 
 Must be empty before approval.
 
-None for Amendment 6. The Owner answered OPEN-C1 on 2026-10-25: the table
-applies to every form (Decisions log). The Owner still approves the text.
+None for Amendment 7. It declares behaviour the implementation already has,
+for the security reason recorded in the Decisions log, so it involves no new
+product decision. The Owner approves the text.
 
 ## Decisions log
 
@@ -2974,3 +2998,5 @@ part of Q1 (standalone) and Q5 (cross-client commands), and refined Q11/Q9
 | 2026-10-25 | **Amendment 5.** Two points from code review. <br>**(1) Wire listener accept errors (new FR-66):** <br>- Transient accept errors (timeouts, temporary errors, `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`, `ECONNABORTED`, `EINTR`) are retried after 5 ms, doubling to a 1 s cap, and the delay resets after a successful accept. <br>- A listener closed by shutdown is not an error. <br>- Any other accept error is permanent. It produces one record (level error, `component=lifecycle`, fixed message `wire listener serve failed`, `error` and `corral.error.detail` only, no address, host or port), then shutdown and exit 1. This declares a record that was emitted but not declared, in the same way as Amendment 4. <br>- Also updated: FR-1 cross-reference, FR-47 note, log events table (new `lifecycle` row), Behavior on failure (two rows), NFR Availability, and new AC-60. <br>**(2) FR-18 clarification:** <br>- In replica-set mode, incompatibility from seed results is judged only once every seed has finished its first check. An unreachable seed counts once its check fails, with no FR-35 retry. The reason comes from the first qualifying seed in `upstream.hosts` order. <br>- Until then, readiness and fail-fast report `upstream_unavailable`, for at most about one `upstream.connect_timeout`. <br>- Rationale: the reason no longer depends on the order checks finish, and there is no spurious `upstream incompatible` record when a foreign seed answers first. <br>- Also updated: log events table note on `upstream incompatible`, Behavior on failure (one row), AC-18 (note), and new AC-61. <br>No SPEC-001 change is needed. <br>**Owner decisions 2026-10-25 on the open questions:** <br>- **OPEN-B1 = (a):** after a permanent accept error, corral runs the FR-47 graceful sequence without the listener-close delay (`/readyz` `shutting_down`, drain within `proxy.shutdown.drain_timeout`, pools closed, tracing flushed), then exits 1. A second signal during it ends the drain per FR-63 but still exits 1 (FR-47 note, FR-63, FR-66, Behavior on failure, AC-60). <br>- **OPEN-B2:** transient accept errors produce no record and no metric, and the backoff has no jitter (FR-66, SPEC-001 note, Behavior on failure, AC-60). <br>- **OPEN-B3:** every seed's first check starts concurrently at startup, so the FR-18 "not yet judged" period lasts at most about one `upstream.connect_timeout` (FR-18, FR-37, AC-61). | Gaps from code review, relayed by the Orchestrator, 2026-10-25; Owner decisions on OPEN-B1 to OPEN-B3, relayed by the Orchestrator, 2026-10-25. Promotion awaits Owner approval of the text. |
 | 2026-10-25 | Amendment 5 (incl. Owner decisions on OPEN-B1 to OPEN-B3) approved by the Owner and promoted. This row was added in Amendment 6 to record an approval that the header already showed. | Owner approval, 2026-10-25, relayed by the Orchestrator. |
 | 2026-10-25 | **Amendment 6.** Resolves a conflict between FR-9 and FR-49: the `upstream target marked not primary` row said `corral.db.response.code_name` came "from the forwarded upstream reply", but for the `ok: 1` form with `writeConcernError`, FR-9 reads only `writeConcernError.code`, not its `codeName`. <br>**Owner decision 2026-10-25:** the code name is taken from corral's fixed table of not-primary codes in FR-35 (10107 `NotWritablePrimary`, 13435 `NotPrimaryNoSecondaryOk`, 13436 `NotPrimaryOrSecondary`, 11602 `InterruptedDueToReplStateChange`, 11600 `InterruptedAtShutdown`, 189 `PrimarySteppedDown`, 91 `ShutdownInProgress`). These names match the spec's existing FR-35 list exactly. FR-9 reads nothing new, and now states that `writeConcernError.codeName` is not read. `db.response.status_code` is the code that caused the marking. <br>**OPEN-C1, Owner decision 2026-10-25:** the table applies to every form: the `ok: 0` reply, the `ok: 1` reply with `writeConcernError`, and the barrier `ping` reply. This was the spec-writer's recommendation, for consistency. <br>Changes: FR-9 (one sentence), FR-29 R-5 note, FR-35 (new "Code name in the record" bullet), log events table (`upstream target marked not primary` row), SPEC-001 note, Behavior on failure (not-primary row), AC-33 (pointer), and new AC-62. No SPEC-001 change is needed. | Conflict found in code review, relayed by the Orchestrator, 2026-10-25; Owner decisions of 2026-10-25 (code-name source; OPEN-C1) relayed by the Orchestrator. Promotion awaits Owner approval of the text. |
+| 2026-10-25 | Amendment 6 (incl. Owner decision on OPEN-C1) approved by the Owner and promoted. | Owner approval, 2026-10-25, relayed by the Orchestrator. |
+| 2026-10-25 | **Amendment 7.** A gap from code review. The implementation rate-limits the `request handler panic recovered` record with the same per-event limiter as the other rate-limited records, but the log events table did not mark that row rate-limited, and FR-49 limits only marked events. <br>**Reason (security review RC5):** a client that can trigger a recovered panic could otherwise flood the logs. <br>**Change:** <br>- the row is marked rate-limited: at most one record per 30 s, with `suppressed_count`, per FR-49 and SPEC-001 FR-33; <br>- FR-42 states that only the record is limited: every panic still closes its connection, and every close is still counted (`corral_client_connections_closed_total{reason="internal_error"}`); no metric is limited; <br>- also updated: Behavior on failure (panic row), the SPEC-001 note, AC-22 (rate-limit case) and AC-27 (names the record). <br>No SPEC-001 change is needed: SPEC-001 FR-29 still governs the record's content. | Gap from code review, security review RC5, relayed by the Orchestrator, 2026-10-25. Text approved by the Owner, 2026-10-25, relayed by the Orchestrator. |
