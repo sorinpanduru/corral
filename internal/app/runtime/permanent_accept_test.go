@@ -213,3 +213,96 @@ func TestSecondSignalAfterPermanentErrorExits1_AC60(t *testing.T) {
 		t.Fatalf("records %v, want exactly one of each", count)
 	}
 }
+
+// FR-63 / FR-66 through the real signal mapping (runtime.WatchSignals, the
+// function cmd/corral uses): after a permanent accept error no signal has
+// arrived yet, so one SIGTERM ends the held drain at once; the exit status
+// stays 1 and one `shutdown forced by second signal` record is emitted.
+func TestOneSignalAfterPermanentErrorForcesDrain_FR66(t *testing.T) {
+	twin := mongosim.Start(t, mongosim.Options{Hello: mongosim.HelloSpec{Role: mongosim.Mongos}})
+	hold := twin.AddRule(mongosim.Match{Marker: "stuck"}, mongosim.Hold())
+	t.Cleanup(hold.Release)
+	fl := newFault()
+	proxyAddr, adminAddr := reserveAddr(t), reserveAddr(t)
+	p := startProxy(t, proxyOpts{upstream: twin.Addr(), proxy: proxyAddr, admin: adminAddr, hooks: wrapWith(fl), signals: true,
+		extra: []string{"--proxy.shutdown.listener_close_delay=60s", "--proxy.shutdown.drain_timeout=10m"}})
+	p.waitStarted()
+	eventually(t, "ready", func() bool { r, err := get(adminAddr, "/readyz"); return err == nil && r.status == 200 })
+	c := rawwire.Dial(t, proxyAddr)
+	c.Send(rawwire.OpMsg(rawwire.OpMsgOpts{RequestID: 1, Body: bsonFind("stuck")}))
+	if !hold.WaitHeld(1, 10*time.Second) {
+		t.Fatal("the exchange was not held")
+	}
+	fl.arm()
+	eventually(t, "readyz shutting_down", func() bool { r, err := get(adminAddr, "/readyz"); return err == nil && r.body == "shutting_down\n" })
+	// The drain is held by the stuck exchange: the process is still running.
+	select {
+	case code := <-p.done:
+		t.Fatalf("exited %d before any signal", code)
+	case <-time.After(500 * time.Millisecond):
+	}
+	begin := time.Now()
+	p.sigs <- syscall.SIGTERM
+	code := p.wait()
+	if code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	if time.Since(begin) > 15*time.Second {
+		t.Fatalf("one signal did not end the drain at once (%v)", time.Since(begin))
+	}
+	count := map[string]int{}
+	for _, r := range p.out.records(t) {
+		switch str(r, "msg") {
+		case "shutdown forced by second signal", "wire listener serve failed":
+			count[str(r, "msg")]++
+		}
+	}
+	if count["shutdown forced by second signal"] != 1 || count["wire listener serve failed"] != 1 {
+		t.Fatalf("records %v, want exactly one of each", count)
+	}
+}
+
+// FR-63, the normal path through the same mapping: the first signal starts the
+// graceful shutdown (the held drain keeps the process up), the second forces
+// it, and further signals change nothing; exit 0.
+func TestFirstSignalGracefulSecondForces_FR63(t *testing.T) {
+	twin := mongosim.Start(t, mongosim.Options{Hello: mongosim.HelloSpec{Role: mongosim.Mongos}})
+	hold := twin.AddRule(mongosim.Match{Marker: "stuck"}, mongosim.Hold())
+	t.Cleanup(hold.Release)
+	proxyAddr, adminAddr := reserveAddr(t), reserveAddr(t)
+	p := startProxy(t, proxyOpts{upstream: twin.Addr(), proxy: proxyAddr, admin: adminAddr, signals: true,
+		extra: []string{"--proxy.shutdown.drain_timeout=10m"}})
+	p.waitStarted()
+	eventually(t, "ready", func() bool { r, err := get(adminAddr, "/readyz"); return err == nil && r.status == 200 })
+	c := rawwire.Dial(t, proxyAddr)
+	c.Send(rawwire.OpMsg(rawwire.OpMsgOpts{RequestID: 1, Body: bsonFind("stuck")}))
+	if !hold.WaitHeld(1, 10*time.Second) {
+		t.Fatal("the exchange was not held")
+	}
+	p.sigs <- syscall.SIGTERM // the first: graceful
+	eventually(t, "readyz shutting_down", func() bool { r, err := get(adminAddr, "/readyz"); return err == nil && r.body == "shutting_down\n" })
+	select {
+	case code := <-p.done:
+		t.Fatalf("the first signal ended the process (exit %d) instead of draining", code)
+	case <-time.After(700 * time.Millisecond):
+	}
+	for _, r := range p.out.records(t) {
+		if str(r, "msg") == "shutdown forced by second signal" {
+			t.Fatal("the first signal was treated as forcing")
+		}
+	}
+	p.sigs <- syscall.SIGTERM // the second: forces
+	p.sigs <- syscall.SIGINT  // further signals change nothing
+	if code := p.wait(); code != 0 {
+		t.Fatalf("exit %d, want 0", code)
+	}
+	n := 0
+	for _, r := range p.out.records(t) {
+		if str(r, "msg") == "shutdown forced by second signal" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("%d forced records, want 1", n)
+	}
+}

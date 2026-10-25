@@ -35,6 +35,7 @@ type proxyRun struct {
 	admin   string
 	proxy   string
 	force   chan struct{}
+	sigs    chan os.Signal
 }
 
 type proxyOpts struct {
@@ -42,6 +43,7 @@ type proxyOpts struct {
 	extra    []string
 	hooks    func(*corralrt.Hooks)
 	env      []string
+	signals  bool   // drive shutdown through runtime.WatchSignals (p.sigs)
 	proxy    string // pre-reserved addresses, for hooks that need them
 	admin    string
 }
@@ -91,7 +93,12 @@ func startProxy(t *testing.T, o proxyOpts) *proxyRun {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
-	in := corralrt.Inputs{Args: args, Env: o.env, ReadFile: osfile.Read, Stdout: p.out, HUP: make(chan os.Signal, 4), Version: "test", Registry: reg, Force: p.force}
+	var forceIn <-chan struct{} = p.force
+	if o.signals {
+		p.sigs = make(chan os.Signal, 4)
+		forceIn = corralrt.WatchSignals(p.sigs, cancel)
+	}
+	in := corralrt.Inputs{Args: args, Env: o.env, ReadFile: osfile.Read, Stdout: p.out, HUP: make(chan os.Signal, 4), Version: "test", Registry: reg, Force: forceIn}
 	_ = source.NewEnv
 	go func() { p.done <- corralrt.Run(ctx, in, hooks) }()
 	t.Cleanup(func() {
