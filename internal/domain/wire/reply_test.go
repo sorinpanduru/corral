@@ -414,3 +414,23 @@ func TestHelloBodyHasHelloOK_FR28(t *testing.T) {
 		t.Fatal("monitoring hello lacks helloOk:true")
 	}
 }
+
+// AC-62 / AC-7 (Amendment 6): the reply parser exposes writeConcernError.code
+// but never writeConcernError.codeName: the marker in it appears in no field,
+// and the top-level code name stays empty.
+func TestReplyScannerDoesNotReadWriteConcernCodeName_AC62(t *testing.T) {
+	const marker = "SynthWceNameMarkerQ7"
+	for _, chunk := range []int{3, 4096} {
+		s, err := scan(reply(eDouble("ok", 1), eInt32("n", 1), eDoc("writeConcernError", doc(eInt32("code", 91), eString("codeName", marker), eString("errmsg", "x")))), chunk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := s.Fields()
+		if !f.HasWCECode || f.WCECode != 91 {
+			t.Fatalf("fields: %+v", f)
+		}
+		if f.CodeName != "" || strings.Contains(fmt.Sprintf("%+v %#v", f, f), marker) {
+			t.Fatalf("the writeConcernError codeName was read: %+v", f)
+		}
+	}
+}
