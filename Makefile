@@ -23,10 +23,11 @@ test:
 	go vet ./...
 	go test -race -count=1 ./...
 
-# 32-bit check of the domain packages (BSON length arithmetic must not wrap).
-# CI step: run next to `make test`. No -race on 386.
+# 32-bit check of the packages that do wire size arithmetic on untrusted
+# lengths: the domain packages (BSON, wire parser, ...) and the exchange engine
+# (kind-1 section skips). CI step: run next to `make test`. No -race on 386.
 test-386:
-	GOARCH=386 go test -count=1 ./internal/domain/...
+	GOARCH=386 go test -count=1 ./internal/domain/... ./internal/infra/proxyserver/exchange/...
 
 # Twin suites: the corral binaries against simulated upstreams (no Docker).
 # The suites build the production and the corraltest binaries themselves.
