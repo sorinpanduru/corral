@@ -11,6 +11,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -202,44 +203,82 @@ func TestReadyzStartingAndNoWireListenerBeforeLastStep_AC1(t *testing.T) {
 	}
 }
 
-// FR-1: bind failure: exit 1, a config record for proxy.listen without the
-// address, no `wire listener bound`.
-func TestBindFailureExit1_FR1(t *testing.T) {
+// bindFailure runs corral with proxy.listen=addr and returns the exit code and
+// the captured output.
+func bindFailure(t *testing.T, addr string) (int, *syncBuf) {
+	t.Helper()
+	args := []string{"--upstream.hosts=" + reserveAddr(t), "--upstream.auth.mechanism=none", "--proxy.listen=" + addr, "--admin.listen=" + reserveAddr(t)}
+	reg, _ := settings.Registry()
+	out := &syncBuf{}
+	code := corralrt.Run(context.Background(), corralrt.Inputs{Args: args, ReadFile: osfile.Read, Stdout: out, HUP: make(chan os.Signal, 1), Version: "test", Registry: reg}, corralrt.Hooks{})
+	return code, out
+}
+
+// assertBindRecord checks AC-59 / AC-1 (Amendment 4): exit 1, exactly one record
+// `wire listener bind failed` (error level, component config, error=config,
+// setting=proxy.listen, the detail), no `invalid configuration` record, no
+// `wire listener bound`, and no host, address or port anywhere in the output.
+func assertBindRecord(t *testing.T, code int, out *syncBuf, detail string, leaks ...string) {
+	t.Helper()
+	if code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	n := 0
+	for _, r := range out.records(t) {
+		switch str(r, "msg") {
+		case "wire listener bind failed":
+			n++
+			if str(r, "level") != "ERROR" || str(r, "component") != "config" || str(r, "setting") != "proxy.listen" || str(r, "error") != "config" {
+				t.Fatalf("bind failure record: %v", r)
+			}
+			if got := str(r, "corral.error.detail"); got != detail {
+				t.Fatalf("corral.error.detail %q, want %q", got, detail)
+			}
+		case "invalid configuration":
+			t.Fatalf("an invalid configuration record on a bind failure: %v", r)
+		case "wire listener bound":
+			t.Fatal("wire listener bound logged on failure")
+		}
+	}
+	if n != 1 {
+		t.Fatalf("%d `wire listener bind failed` records, want exactly 1: %v", n, out.lines())
+	}
+	for _, l := range leaks {
+		if strings.Contains(string(out.bytes()), l) {
+			t.Fatalf("%q appears in the output", l)
+		}
+	}
+}
+
+// AC-59, AC-1 (FR-1, Amendment 4): "address already in use" gives the bind
+// failure record with detail EADDRINUSE and exit 1.
+func TestBindFailureRecordAddrInUse_AC59(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ln.Close()
 	addr := ln.Addr().String()
-	up := reserveAddr(t)
-	args := []string{"--upstream.hosts=" + up, "--upstream.auth.mechanism=none", "--proxy.listen=" + addr, "--admin.listen=" + reserveAddr(t)}
-	reg, _ := settings.Registry()
-	out := &syncBuf{}
-	code := corralrt.Run(context.Background(), corralrt.Inputs{Args: args, ReadFile: osfile.Read, Stdout: out, HUP: make(chan os.Signal, 1), Version: "test", Registry: reg}, corralrt.Hooks{})
-	if code != 1 {
-		t.Fatalf("exit %d, want 1", code)
+	port := addr[strings.LastIndex(addr, ":")+1:]
+	code, out := bindFailure(t, addr)
+	assertBindRecord(t, code, out, "EADDRINUSE", addr, "127.0.0.1")
+	if regexp.MustCompile(`\b` + port + `\b`).Match(out.bytes()) {
+		t.Fatalf("the port number %s appears in the output", port)
 	}
-	found := false
-	for _, r := range out.records(t) {
-		if str(r, "setting") == "proxy.listen" {
-			found = true
-			if str(r, "component") != "config" {
-				t.Fatalf("component %q", str(r, "component"))
-			}
-			if str(r, "corral.error.detail") != "EADDRINUSE" {
-				t.Fatalf("detail %q", str(r, "corral.error.detail"))
-			}
-		}
-		if str(r, "msg") == "wire listener bound" {
-			t.Fatal("wire listener bound logged on failure")
-		}
+}
+
+// AC-59: "permission denied" (a privileged port, bound by a process without the
+// privilege) gives detail `other` and exit 1.
+func TestBindFailureRecordPermissionDenied_AC59(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: no privileged port is denied")
 	}
-	if !found {
-		t.Fatalf("no record for proxy.listen: %v", out.lines())
+	if ln, err := net.Listen("tcp", "127.0.0.1:1"); err == nil {
+		ln.Close()
+		t.Skip("binding port 1 is allowed here (unprivileged ports lowered)")
 	}
-	if strings.Contains(string(out.bytes()), addr) {
-		t.Fatal("the address appears in the output")
-	}
+	code, out := bindFailure(t, "127.0.0.1:1")
+	assertBindRecord(t, code, out, "other", "127.0.0.1")
 }
 
 // FR-46: with an unreachable upstream, readiness is 503 upstream_unavailable

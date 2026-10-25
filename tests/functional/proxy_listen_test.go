@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -65,8 +66,10 @@ func TestInvalidListenAddressExits2_AC1(t *testing.T) {
 
 func asString(v any) string { s, _ := v.(string); return s }
 
-// An address already in use exits 1 with setting=proxy.listen and without the
-// address value.
+// AC-1 (Amendment 4), AC-59: an address already in use exits 1 with exactly one
+// `wire listener bind failed` record (error level, component config, error=config,
+// setting=proxy.listen, detail EADDRINUSE), no `invalid configuration` record and
+// no host, address or port anywhere in the output.
 func TestListenAddressInUseExits1_AC1(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -74,25 +77,33 @@ func TestListenAddressInUseExits1_AC1(t *testing.T) {
 	}
 	defer ln.Close()
 	addr := ln.Addr().String()
+	port := addr[strings.LastIndex(addr, ":")+1:]
 	c := pxStart(t, pxOpts{upstream: []string{pxAddr(t)}, set: map[string]string{"proxy.listen": addr}, noWait: true})
 	code, err := c.p.Wait(20 * time.Second)
 	if err != nil || code != 1 {
 		t.Fatalf("exit %d, %v", code, err)
 	}
-	found := false
+	n := 0
 	for _, r := range c.p.Records() {
-		if asString(r["setting"]) == "proxy.listen" {
-			found = true
+		switch r.Msg() {
+		case "wire listener bind failed":
+			n++
+			if asString(r["level"]) != "ERROR" || r.Component() != "config" || asString(r["setting"]) != "proxy.listen" || asString(r["error"]) != "config" || asString(r["corral.error.detail"]) != "EADDRINUSE" {
+				t.Fatalf("bind failure record: %v", r)
+			}
+		case "invalid configuration":
+			t.Fatalf("an invalid configuration record on a bind failure: %v", r)
+		case "wire listener bound":
+			t.Fatal("wire listener bound was logged")
 		}
 	}
-	if !found {
-		t.Fatalf("no record names proxy.listen: %s", c.p.Stdout())
+	if n != 1 {
+		t.Fatalf("%d bind failure records, want 1: %s", n, c.p.Stdout())
 	}
-	if strings.Contains(string(c.p.Stdout()), addr) || strings.Contains(string(c.p.Stderr()), addr) {
-		t.Fatal("the address appears in the output")
-	}
-	if len(c.records("wire listener bound")) != 0 {
-		t.Fatal("wire listener bound was logged")
+	for _, out := range [][]byte{c.p.Stdout(), c.p.Stderr()} {
+		if strings.Contains(string(out), addr) || regexp.MustCompile(`\b`+port+`\b`).Match(out) {
+			t.Fatal("the address or port appears in the output")
+		}
 	}
 }
 
