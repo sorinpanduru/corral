@@ -507,3 +507,80 @@ func TestKeysUsedAreAllowlisted_FR23(t *testing.T) {
 	}
 	_ = attribute.Key("")
 }
+
+//go:noinline
+func clobberStack(depth int) byte {
+	var pad [512]byte
+	for i := range pad {
+		pad[i] = 0xFF
+	}
+	if depth == 0 {
+		return pad[3]
+	}
+	return clobberStack(depth-1) ^ pad[depth%512]
+}
+
+//go:noinline
+func endWithLocalCodeName(ex spans.Exchange, ctx context.Context) {
+	// The code name is built from bytes held in this frame.
+	var buf [16]byte
+	n := copy(buf[:], "Unauthorized")
+	f := wire.ReplyFields{HasOK: true, OK: 0, HasCode: true, Code: 13, CodeName: string(buf[:n])}
+	st := ex.RoundTrip(ctx, server, 3)
+	st.End(nil, &f)
+	ex.End(nil, &f)
+	for i := range buf {
+		buf[i] = 'X' // the caller reuses its local storage
+	}
+}
+
+// Regression (security veto): a span attribute built from a caller's local
+// string stays correct after the caller's stack is reused. Nothing in a span
+// may alias the caller's stack memory.
+func TestAttributeSurvivesStackReuse_FR23(t *testing.T) {
+	f, rec := setup(t)
+	ctx, ex := f.Start(context.Background(), info())
+	endWithLocalCodeName(ex, ctx)
+	for i := 0; i < 20; i++ {
+		clobberStack(40)
+	}
+	var round sdktrace.ReadOnlySpan
+	for _, s := range rec.Ended() {
+		if s.SpanKind() == trace.SpanKindClient {
+			round = s
+		}
+	}
+	if round == nil {
+		t.Fatal("no round-trip span")
+	}
+	for _, s := range rec.Ended() {
+		if got := amap(s)[attr.DBResponseCodeName]; s.SpanKind() != trace.SpanKindInternal && got != "Unauthorized" {
+			t.Fatalf("span %q code name = %q after the caller's stack was reused", s.Name(), got)
+		}
+		if got := amap(s)[attr.DBResponseStatusCode]; s.SpanKind() != trace.SpanKindInternal && got != "13" {
+			t.Fatalf("span %q status code = %q", s.Name(), got)
+		}
+	}
+}
+
+// The same holds for an error whose text and detail live on the caller's
+// stack: the recorded detail is a copy.
+func TestErrorDetailSurvivesStackReuse_FR29(t *testing.T) {
+	f, rec := setup(t)
+	_, ex := f.Start(context.Background(), info())
+	func() {
+		var buf [32]byte
+		n := copy(buf[:], "shutting_down")
+		ex.End(&detailed{string(buf[:n])}, nil)
+		for i := range buf {
+			buf[i] = 'Z'
+		}
+	}()
+	for i := 0; i < 20; i++ {
+		clobberStack(40)
+	}
+	got := amap(rec.Ended()[0])[attr.ErrorDetail]
+	if got != "shutting_down" {
+		t.Fatalf("detail = %q", got)
+	}
+}

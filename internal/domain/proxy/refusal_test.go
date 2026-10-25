@@ -2,6 +2,7 @@ package proxy_test
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 
@@ -9,6 +10,7 @@ import (
 
 	"github.com/sorinpanduru/corral/internal/domain/proxy"
 	"github.com/sorinpanduru/corral/internal/domain/wire"
+	"github.com/sorinpanduru/corral/internal/infra/telemetry/spans"
 )
 
 type row struct {
@@ -234,5 +236,25 @@ func TestOutcomeForReply_FR48(t *testing.T) {
 	}
 	if proxy.OutcomeProxyError.String() != "proxy_error" {
 		t.Errorf("proxy_error text = %q", proxy.OutcomeProxyError.String())
+	}
+}
+
+// Review: proxy.OutcomeForReply and spans-side error detection use one ok:0
+// predicate. For every reply shape, a reply is a server_error exactly when it is
+// an upstream error, and the two agree.
+func TestOutcomeAndReplyErrorAgree_FR48(t *testing.T) {
+	nan := math.NaN()
+	cases := []wire.ReplyFields{
+		{}, {HasOK: true, OK: 1}, {HasOK: true, OK: 0}, {HasOK: true, OK: 0, HasCode: true, Code: 11000},
+		{HasOK: true, OK: 0.5}, {HasOK: true, OK: 2}, {HasOK: true, OK: -1}, {HasOK: true, OK: nan},
+		{HasOK: true, OK: math.Inf(1)}, {HasOK: true, OK: math.Copysign(0, -1)},
+		{HasOK: true, OK: 1, HasCode: true, Code: 10107}, {HasOK: true, OK: 1, HasWCECode: true, WCECode: 91},
+		{HasOK: false, OK: 0, HasCode: true, Code: 13}, {HasOK: false, OK: 1},
+	}
+	for i, f := range cases {
+		isErr := proxy.OutcomeForReply(f) == proxy.OutcomeServerError
+		if got := spans.ReplyError(f) != nil; got != isErr {
+			t.Errorf("case %d (%+v): OutcomeForReply server_error=%v, spans.ReplyError non-nil=%v", i, f, isErr, got)
+		}
 	}
 }

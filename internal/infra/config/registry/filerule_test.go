@@ -1,7 +1,11 @@
 package registry_test
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/sorinpanduru/corral/internal/infra/config/registry"
@@ -107,5 +111,37 @@ func TestNoFileRuleByDefault_ADR0020(t *testing.T) {
 	}
 	if s, _ := r.Lookup("t.plain"); s.File != nil {
 		t.Fatal("File rule appeared from nowhere")
+	}
+}
+
+// Review: a FileValue never prints its content, however it is formatted or
+// logged (it may hold a certificate chain read from a file).
+func TestFileValueFormattingHidesContent_ADR0020(t *testing.T) {
+	content := "SYNTHETIC-CONTENT-MARKER-4c19-" + string(bytes.Repeat([]byte("x"), 200))
+	v := registry.FileValue{Path: "/synthetic/path", Content: []byte(content)}
+	outputs := map[string]string{
+		"%v":  fmt.Sprintf("%v", v),
+		"%+v": fmt.Sprintf("%+v", v),
+		"%#v": fmt.Sprintf("%#v", v),
+		"%s":  fmt.Sprintf("%s", v),
+		"%q":  fmt.Sprintf("%q", v),
+		"%x":  fmt.Sprintf("%x", v),
+		"%d":  fmt.Sprintf("%d", v),
+		"&v":  fmt.Sprintf("%v %+v %#v", &v, &v, &v),
+		"[]":  fmt.Sprintf("%v %+v", []registry.FileValue{v}, map[string]registry.FileValue{"k": v}),
+		"any": fmt.Sprintf("%v", any(v)),
+	}
+	var jb, tb bytes.Buffer
+	slog.New(slog.NewJSONHandler(&jb, nil)).Info("synthetic", "v", v, "p", &v)
+	slog.New(slog.NewTextHandler(&tb, nil)).Info("synthetic", "v", v, "p", &v)
+	outputs["slog json"], outputs["slog text"] = jb.String(), tb.String()
+	hexContent := fmt.Sprintf("%x", []byte(content[:30]))
+	for name, out := range outputs {
+		if strings.Contains(out, "SYNTHETIC-CONTENT-MARKER") || strings.Contains(out, hexContent) {
+			t.Errorf("%s output shows the file content", name)
+		}
+		if len(out) > 1000 {
+			t.Errorf("%s output is %d bytes: content is probably dumped", name, len(out))
+		}
 	}
 }

@@ -34,7 +34,7 @@ func TestDisabledNoStartNoAllocs_FR19(t *testing.T) {
 		AppName: "app", DriverName: "drv", DriverVersion: "1"}
 	srv := netip.MustParseAddrPort("127.0.0.1:27017")
 	reply := &wire.ReplyFields{HasOK: true, OK: 0, HasCode: true, Code: 11000, CodeName: "DuplicateKey"}
-	err := detailed{"pool_wait_timeout"}
+	err := errPoolWait
 	ctx := context.Background()
 
 	run := func() {
@@ -85,3 +85,8 @@ func TestEnabledCallsTracer_FR19(t *testing.T) {
 		t.Fatalf("starts = %d", tr.starts.Load())
 	}
 }
+
+// errPoolWait is a package-level error value: passing it as an error costs no
+// allocation, so the zero-allocation check holds without any unsafe trick in
+// the code under test.
+var errPoolWait error = &detailed{"pool_wait_timeout"}
