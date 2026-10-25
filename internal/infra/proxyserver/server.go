@@ -242,8 +242,18 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.o.Engine.CloseIdle()
 	// Step 4: the drain. A held drain stays open as if an exchange were in
 	// progress.
+	// The hold is cancelled when the drain ends (timeout or forced end).
+	holdCtx, endHold := context.WithCancel(ctx)
+	defer endHold()
+	go func() {
+		select {
+		case <-sd.DrainExpired():
+			endHold()
+		case <-holdCtx.Done():
+		}
+	}()
 	held := make(chan struct{})
-	go func() { defer close(held); s.hold(ctx, HoldDrain) }()
+	go func() { defer close(held); s.hold(holdCtx, HoldDrain) }()
 	done := make(chan struct{})
 	go func() { s.wg.Wait(); <-held; close(done) }()
 	select {
