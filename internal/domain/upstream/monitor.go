@@ -337,6 +337,8 @@ func (m *Monitor) apply(h *host, req CheckRequest, rep Report, seq uint64) {
 		}
 	} else if rep.Err == nil && rep.AuthErr != nil && IsAuthFailed(rep.AuthErr) && !ev2.hasTarget && !ev2.incompat {
 		m.authFailing = true
+		err, addr := rep.AuthErr, h.addr
+		ev.add(func() { m.obs.AuthFailed(ctx, "monitor", addr, err) })
 	}
 	prevTarget := m.cur
 	m.commit(ctx, ev, ev2)
@@ -719,7 +721,7 @@ func (m *Monitor) prune(ev *events) {
 	}
 	kept := m.hosts[:0]
 	for _, h := range m.hosts {
-		if !h.seed && !listed[h.addr] && !(h.hasReport && m.matching(h.rep)) && !h.checking {
+		if !h.seed && !listed[h.addr] && !(h.up && h.hasReport && m.matching(h.rep)) && !h.checking {
 			delete(m.byAdr, h.addr)
 			addr := h.addr
 			ev.add(func() { m.chk.CloseHost(addr, pool.CloseIdle) })
