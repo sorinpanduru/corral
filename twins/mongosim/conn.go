@@ -38,6 +38,9 @@ type conn struct {
 	sigForged     bool
 	wmu           sync.Mutex // serialises writes (serve goroutine and SendRaw)
 
+	tlsMode   TLSMode       // mode in force when accepted
+	stallNext time.Duration // guarded by s.mu: delay for the next hello reply
+
 	conv *scramConv // owned by the serve goroutine
 }
 
@@ -87,13 +90,24 @@ func (p *progressReader) Read(b []byte) (int, error) {
 func (c *conn) readLoop() {
 	defer close(c.in)
 	if tl, ok := c.nc.(*tls.Conn); ok {
+		rec := TLSHandshake{Start: time.Now(), Remote: c.nc.RemoteAddr().String(), ConnIndex: c.idx, Mode: c.tlsMode}
 		_ = tl.SetDeadline(time.Now().Add(5 * time.Second))
 		err := tl.Handshake()
 		_ = tl.SetDeadline(time.Time{})
+		rec.End = time.Now()
+		rec.OK = err == nil
 		if err != nil {
-			c.s.mu.Lock()
+			rec.Err = err.Error()
+		} else {
+			rec.Version = tl.ConnectionState().Version
+		}
+		c.s.mu.Lock()
+		c.s.hsLog = append(c.s.hsLog, rec)
+		if err != nil {
 			c.s.tlsFailures++
-			c.s.mu.Unlock()
+		}
+		c.s.mu.Unlock()
+		if err != nil {
 			c.close(false)
 			return
 		}
@@ -220,6 +234,13 @@ func (c *conn) handle(raw []byte) bool {
 
 	// Monitoring-check failures.
 	if lower == "hello" || lower == "ismaster" {
+		s.mu.Lock()
+		stall := c.stallNext
+		c.stallNext = 0
+		s.mu.Unlock()
+		if stall > 0 && !c.sleep(stall) {
+			return false
+		}
 		if mode, gate, ok := s.takeCheck(appName); ok {
 			switch mode.kind {
 			case 1:
