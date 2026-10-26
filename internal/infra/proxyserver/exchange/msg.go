@@ -273,6 +273,15 @@ func (x *msg) forward() (proxy.CloseReason, bool) {
 			return proxy.CloseClientClosed, false
 		default:
 		}
+		if s.ctx.Err() != nil {
+			// The drain ended (FR-47 step 4) while the request waited: the
+			// connection is closed, with no synthesized error. Writing one
+			// would race with the close and sometimes reach the client.
+			co.End(err, nil)
+			ex.End(err, nil)
+			x.complete(proxy.OutcomeProxyError, err, false)
+			return proxy.CloseShutdown, false
+		}
 		return x.checkoutFailed(co, ex, err)
 	}
 	co.End(nil, nil)
