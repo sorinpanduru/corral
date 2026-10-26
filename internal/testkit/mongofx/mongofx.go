@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -75,12 +76,38 @@ mkdir -p /fx
 [ -z "$FX_KEYFILE_B64" ] || { echo "$FX_KEYFILE_B64" | base64 -d > /fx/keyfile; chmod 400 /fx/keyfile; }
 [ -z "$FX_CA_B64" ] || { echo "$FX_CA_B64" | base64 -d > /fx/ca.pem; }
 [ -z "$FX_PEM_B64" ] || { echo "$FX_PEM_B64" | base64 -d > /fx/server.pem; }
-chown -R mongodb:mongodb /fx /data/db
+chown -R mongodb:mongodb /fx /data/db /data/configdb
 exec gosu mongodb "$@"`
 
 type container struct {
 	name string
 	addr string
+}
+
+// remove deletes a container together with its anonymous volumes (-v): a
+// plain `docker rm -f` leaks them, and they filled a host disk once.
+func remove(name string) { _, _ = docker("rm", "-f", "-v", name) }
+
+// reapOnce removes fixture containers left behind by earlier runs that were
+// killed before their cleanup could run (a test timeout panics without running
+// cleanups), with their volumes. Only containers labelled corralfx=1 that are
+// more than two hours old are touched, so parallel runs are not disturbed.
+var reapOnce sync.Once
+
+func reap() {
+	reapOnce.Do(func() {
+		out, err := docker("ps", "-aq", "--filter", "label=corralfx=1")
+		if err != nil {
+			return
+		}
+		for _, id := range strings.Fields(out) {
+			created, _ := docker("inspect", "-f", "{{.Created}}", id)
+			t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(created))
+			if err == nil && time.Since(t) > 2*time.Hour {
+				remove(id)
+			}
+		}
+	})
 }
 
 func docker(args ...string) (string, error) {
@@ -93,10 +120,16 @@ func docker(args ...string) (string, error) {
 // up and retries with a new port if it failed to bind.
 func run(tb testing.TB, o Opts, prefix string, build func(port int) []string) *container {
 	tb.Helper()
+	reap()
 	for attempt := 0; attempt < 4; attempt++ {
 		port := freePorts(tb, 1)[0]
 		name := fmt.Sprintf("corralfx-%s-%s-%d", prefix, randHex(tb, 3), port)
-		dargs := []string{"run", "-d", "--name", name, "--network", "host"}
+		// The mongo image declares /data/db and /data/configdb as anonymous
+		// volumes, which outlive the container unless it is removed with -v.
+		// Mounting both as tmpfs means no volume is ever created and nothing
+		// persists; removal below still passes -v as a second guard.
+		dargs := []string{"run", "-d", "--name", name, "--network", "host", "--label", "corralfx=1",
+			"--tmpfs", "/data/db:rw,size=512m", "--tmpfs", "/data/configdb:rw,size=64m"}
 		if o.Auth != nil {
 			dargs = append(dargs, "-e", "FX_KEYFILE_B64="+base64.StdEncoding.EncodeToString(o.Auth.Keyfile))
 		}
@@ -109,13 +142,13 @@ func run(tb testing.TB, o Opts, prefix string, build func(port int) []string) *c
 		if out, err := docker(dargs...); err != nil {
 			tb.Fatalf("mongofx: docker run failed: %s", strings.TrimSpace(out))
 		}
-		tb.Cleanup(func() { _, _ = docker("rm", "-f", name) })
+		tb.Cleanup(func() { remove(name) })
 		time.Sleep(1500 * time.Millisecond)
 		if out, _ := docker("inspect", "-f", "{{.State.Running}}", name); strings.TrimSpace(out) == "true" {
 			return &container{name: name, addr: "127.0.0.1:" + strconv.Itoa(port)}
 		}
 		logs, _ := docker("logs", name)
-		_, _ = docker("rm", "-f", name)
+		remove(name)
 		if !strings.Contains(logs, "Address already in use") {
 			tb.Fatalf("mongofx: container exited early: %s", tail(logs))
 		}

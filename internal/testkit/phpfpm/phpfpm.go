@@ -84,11 +84,11 @@ func Start(tb testing.TB, o Opts) *Fixture {
 	ln.Close()
 	addr := "127.0.0.1:" + strconv.Itoa(port)
 	name := fmt.Sprintf("corralfx-php-%s-%d", hex.EncodeToString(sum[:3]), port)
-	if out, err := docker("run", "-d", "--name", name, "--network", "host",
+	if out, err := docker("run", "-d", "--name", name, "--network", "host", "--label", "corralfx=1",
 		"-e", "FPM_LISTEN="+addr, "-e", "FPM_WORKERS="+strconv.Itoa(o.Workers), tag); err != nil {
 		tb.Fatalf("phpfpm: docker run failed: %s", tail(out))
 	}
-	tb.Cleanup(func() { _, _ = docker("rm", "-f", name) })
+	tb.Cleanup(func() { _, _ = docker("rm", "-f", "-v", name) }) // -v: never leak anonymous volumes
 	if o.ScriptsDir != "" {
 		if out, err := docker("cp", o.ScriptsDir+"/.", name+":/srv/scripts"); err != nil {
 			tb.Fatalf("phpfpm: copying scripts failed: %s", tail(out))

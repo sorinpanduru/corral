@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -194,5 +195,63 @@ func TestShardedOneMongos_FR54(t *testing.T) {
 	}
 	if s, _ := shards["shards"].(bson.A); len(s) != 1 {
 		t.Fatalf("shards = %d, want 1", len(s))
+	}
+}
+
+func dockerOut(t *testing.T, args ...string) string {
+	t.Helper()
+	out, err := exec.Command("docker", args...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("docker %v: %v: %s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func volumeSet(t *testing.T) map[string]bool {
+	set := map[string]bool{}
+	for _, v := range strings.Fields(dockerOut(t, "volume", "ls", "-q")) {
+		set[v] = true
+	}
+	return set
+}
+
+// A fixture must not leak Docker volumes: the mongo image declares /data/db and
+// /data/configdb as anonymous volumes, and a `docker rm -f` without -v left two
+// per container behind (3,200 volumes and 404 GB once). The data directories
+// are tmpfs mounts now, so no volume is created at all; removal passes -v as a
+// second guard. The test starts and stops a 3-member set, then a sharded
+// cluster, and asserts (a) no container mounts a volume while running and (b)
+// the volume list is the same afterwards. (b) assumes no other process creates
+// volumes meanwhile.
+func TestNoVolumesLeak(t *testing.T) {
+	before := volumeSet(t)
+	t.Run("replica set", func(t *testing.T) {
+		rs := mongofx.StartReplicaSet(t, mongofx.Opts{Version: "7.0", Members: 3})
+		_ = rs
+		for _, id := range strings.Fields(dockerOut(t, "ps", "-q", "--filter", "label=corralfx=1")) {
+			mounts := dockerOut(t, "inspect", "-f", `{{range .Mounts}}{{.Type}} {{.Destination}}{{"\n"}}{{end}}`, id)
+			for _, l := range strings.Split(mounts, "\n") {
+				if strings.HasPrefix(l, "volume ") {
+					t.Errorf("container %s mounts an anonymous volume: %s", id, l)
+				}
+			}
+			tmpfs := dockerOut(t, "inspect", "-f", "{{json .HostConfig.Tmpfs}}", id)
+			if !strings.Contains(tmpfs, "/data/db") || !strings.Contains(tmpfs, "/data/configdb") {
+				t.Errorf("container %s does not mount its data directories as tmpfs: %s", id, tmpfs)
+			}
+		}
+	})
+	t.Run("sharded", func(t *testing.T) {
+		_ = mongofx.StartShardedOneMongos(t, mongofx.Opts{Version: "7.0"})
+	})
+	after := volumeSet(t)
+	for v := range after {
+		if !before[v] {
+			t.Errorf("volume %s leaked by the fixture", v)
+		}
+	}
+	if left := strings.Fields(dockerOut(t, "ps", "-aq", "--filter", "label=corralfx=1")); len(left) != 0 {
+		// Containers of other, parallel test processes are possible; none of ours may remain.
+		t.Logf("fixture containers still present (other processes?): %v", left)
 	}
 }
