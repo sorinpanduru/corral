@@ -107,24 +107,37 @@ func remove(name string) { _, _ = docker("rm", "-f", "-v", name) }
 
 // reapOnce removes fixture containers left behind by earlier runs that were
 // killed before their cleanup could run (a test timeout panics without running
-// cleanups), with their volumes. Only containers labelled corralfx=1 that are
-// more than two hours old are touched, so parallel runs are not disturbed.
+// cleanups), with their volumes. Only containers labelled corralfx=1, named
+// corralfx-*, and more than two hours old are touched, so parallel runs are not
+// disturbed.
 var reapOnce sync.Once
 
-func reap() {
-	reapOnce.Do(func() {
-		out, err := docker("ps", "-aq", "--filter", "label=corralfx=1")
-		if err != nil {
-			return
+// namePrefix is the name every fixture container starts with (mongofx and
+// phpfpm both use it). The reaper removes a container only if it carries the
+// corralfx=1 label AND its name starts with this prefix AND it is old enough, so
+// a stray label on someone else's container is not enough to lose it.
+const namePrefix = "corralfx-"
+
+func reap() { reapOnce.Do(func() { reapOlderThan(2*time.Hour, namePrefix) }) }
+
+// reapOlderThan removes labelled containers whose name starts with prefix and
+// that are older than age, with their volumes.
+func reapOlderThan(age time.Duration, prefix string) {
+	out, err := docker("ps", "-a", "--filter", "label=corralfx=1", "--format", "{{.ID}} {{.Names}}")
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 || !strings.HasPrefix(f[1], prefix) {
+			continue
 		}
-		for _, id := range strings.Fields(out) {
-			created, _ := docker("inspect", "-f", "{{.Created}}", id)
-			t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(created))
-			if err == nil && time.Since(t) > 2*time.Hour {
-				remove(id)
-			}
+		created, _ := docker("inspect", "-f", "{{.Created}}", f[0])
+		t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(created))
+		if err == nil && time.Since(t) >= age {
+			remove(f[0])
 		}
-	})
+	}
 }
 
 func docker(args ...string) (string, error) {
@@ -148,7 +161,7 @@ func run(tb testing.TB, o Opts, prefix string, fixed int, build func(port int) [
 		if port == 0 {
 			port = freePorts(tb, 1)[0]
 		}
-		name := fmt.Sprintf("corralfx-%s-%s-%d", prefix, randHex(tb, 3), port)
+		name := fmt.Sprintf(namePrefix+"%s-%s-%d", prefix, randHex(tb, 3), port)
 		// The mongo image declares /data/db and /data/configdb as anonymous
 		// volumes, which outlive the container unless it is removed with -v.
 		// Mounting both as tmpfs means no volume is ever created and nothing

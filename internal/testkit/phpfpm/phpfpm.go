@@ -83,6 +83,8 @@ func Start(tb testing.TB, o Opts) *Fixture {
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 	addr := "127.0.0.1:" + strconv.Itoa(port)
+	// The name must start with "corralfx-": the mongofx reaper only removes
+	// containers with both that prefix and the corralfx=1 label.
 	name := fmt.Sprintf("corralfx-php-%s-%d", hex.EncodeToString(sum[:3]), port)
 	if out, err := docker("run", "-d", "--name", name, "--network", "host", "--label", "corralfx=1",
 		"-e", "FPM_LISTEN="+addr, "-e", "FPM_WORKERS="+strconv.Itoa(o.Workers), tag); err != nil {
