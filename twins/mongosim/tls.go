@@ -185,17 +185,32 @@ func (s *Server) TLSHandshakeFailures() int {
 // generated in memory when the mode is set.
 func (s *Server) SetTLS(mode TLSMode) {
 	s.tb.Helper()
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if mode == TLSOff {
+		s.mu.Lock()
 		s.tlsCfg, s.tlsMode = nil, TLSOff
+		s.mu.Unlock()
 		return
 	}
-	if s.auth == nil {
-		s.auth = NewAuthority(s.tb)
+	// Key generation can call tb.Fatal, so do it before taking s.mu.
+	s.mu.Lock()
+	auth := s.auth
+	s.mu.Unlock()
+	if auth == nil {
+		auth = NewAuthority(s.tb)
 	}
-	s.tlsCfg = s.auth.serverConfig(s.tb, mode)
-	s.tlsMode = mode
+	cfg := auth.serverConfig(s.tb, mode)
+	s.mu.Lock()
+	if s.auth == nil {
+		s.auth = auth
+	} else if s.auth != auth {
+		// Another SetTLS installed an authority meanwhile; keep one CA.
+		auth = s.auth
+		s.mu.Unlock()
+		cfg = auth.serverConfig(s.tb, mode)
+		s.mu.Lock()
+	}
+	s.tlsCfg, s.tlsMode = cfg, mode
+	s.mu.Unlock()
 }
 
 // TLSMode returns the mode applied to new connections.
