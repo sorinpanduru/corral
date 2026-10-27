@@ -248,6 +248,11 @@ reach a usable upstream, and 503 with one of these reasons otherwise:
 | `upstream_incompatible` | The upstream is outside the supported wire version range (at any time), or is a standalone, the wrong topology or the wrong replica set while no matching member has been found since startup. Requests fail fast with code 6. |
 | `shutting_down` | Graceful shutdown has begun. |
 
+Readiness follows the monitoring checks, so with no traffic a primary
+step-down shows within about one `upstream.heartbeat_interval`, plus the
+check's `upstream.connect_timeout` and a single retry; under traffic it shows
+sooner, because a not-primary reply starts an immediate check.
+
 Startup does not wait for the upstream: corral binds the port as its last
 startup step, and answers handshakes with code 6 until an upstream is
 available. `corral_upstream_available` is 1 exactly when `/readyz` is 200 for
