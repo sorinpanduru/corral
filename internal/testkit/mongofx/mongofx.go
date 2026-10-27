@@ -36,6 +36,23 @@ type Opts struct {
 	Members int    // replica-set members (default 1)
 	Auth    *Auth
 	TLS     *TLSMaterial
+	// Ports, when set, are the host ports of the replica-set members, in member
+	// order; len(Ports) must equal Members (default 1). They let a caller know
+	// the members' addresses before the set exists, for example to point corral
+	// at an upstream that is not up yet when corral starts. Reserve them with
+	// ReservePorts. A port that is already in use fails the start (no retry on
+	// another port). Replica sets only: StartShardedOneMongos ignores it.
+	// Unset keeps the default: free ports are chosen at start.
+	Ports []int
+}
+
+// ReservePorts returns n free loopback ports for Opts.Ports. The ports are
+// released again before it returns, so another process could take one before
+// the set starts; that is the same small race the default start has, and it
+// fails the start instead of choosing another port.
+func ReservePorts(tb testing.TB, n int) []int {
+	tb.Helper()
+	return freePorts(tb, n)
 }
 
 // testDatabases are the databases the service user may read and write.
@@ -115,21 +132,31 @@ func docker(args ...string) (string, error) {
 	return string(out), err
 }
 
-// run starts a container on a freshly chosen port. Choosing a free port and
-// binding it in the container cannot be atomic, so it checks that mongod stayed
-// up and retries with a new port if it failed to bind.
-func run(tb testing.TB, o Opts, prefix string, build func(port int) []string) *container {
+// run starts a container on a freshly chosen port, or on the caller's port when
+// fixed is non-zero. Choosing a free port and binding it in the container cannot
+// be atomic, so it checks that mongod stayed up and retries with a new port if
+// it failed to bind; a fixed port is not retried.
+func run(tb testing.TB, o Opts, prefix string, fixed int, build func(port int) []string) *container {
 	tb.Helper()
 	reap()
-	for attempt := 0; attempt < 4; attempt++ {
-		port := freePorts(tb, 1)[0]
+	attempts := 4
+	if fixed != 0 {
+		attempts = 1
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
+		port := fixed
+		if port == 0 {
+			port = freePorts(tb, 1)[0]
+		}
 		name := fmt.Sprintf("corralfx-%s-%s-%d", prefix, randHex(tb, 3), port)
 		// The mongo image declares /data/db and /data/configdb as anonymous
 		// volumes, which outlive the container unless it is removed with -v.
 		// Mounting both as tmpfs means no volume is ever created and nothing
-		// persists; removal below still passes -v as a second guard.
+		// persists; removal below still passes -v as a second guard. The size is
+		// only a cap, tmpfs uses RAM for what is written: 2g because a real mongod
+		// refuses createIndexes when it sees less than about 500 MB free.
 		dargs := []string{"run", "-d", "--name", name, "--network", "host", "--label", "corralfx=1",
-			"--tmpfs", "/data/db:rw,size=512m", "--tmpfs", "/data/configdb:rw,size=64m"}
+			"--tmpfs", "/data/db:rw,size=2g", "--tmpfs", "/data/configdb:rw,size=64m"}
 		if o.Auth != nil {
 			dargs = append(dargs, "-e", "FX_KEYFILE_B64="+base64.StdEncoding.EncodeToString(o.Auth.Keyfile))
 		}
@@ -153,7 +180,7 @@ func run(tb testing.TB, o Opts, prefix string, build func(port int) []string) *c
 			tb.Fatalf("mongofx: container exited early: %s", tail(logs))
 		}
 	}
-	tb.Fatal("mongofx: no free port after 4 attempts")
+	tb.Fatalf("mongofx: could not start on a free port after %d attempts", attempts)
 	return nil
 }
 
@@ -344,10 +371,17 @@ func StartReplicaSet(tb testing.TB, o Opts) *ReplicaSet {
 	if n == 0 {
 		n = 1
 	}
+	if len(o.Ports) != 0 && len(o.Ports) != n {
+		tb.Fatalf("mongofx: Opts.Ports has %d entries for %d members", len(o.Ports), n)
+	}
 	rs := &ReplicaSet{tb: tb}
 	var addrs []string
 	for i := 0; i < n; i++ {
-		c := run(tb, o, "rs", func(p int) []string { return serverArgs(o, "mongod", p, "--replSet", "rs0") })
+		fixed := 0
+		if len(o.Ports) != 0 {
+			fixed = o.Ports[i]
+		}
+		c := run(tb, o, "rs", fixed, func(p int) []string { return serverArgs(o, "mongod", p, "--replSet", "rs0") })
 		rs.members = append(rs.members, c)
 		addrs = append(addrs, c.addr)
 	}
@@ -444,11 +478,11 @@ func StartShardedOneMongos(tb testing.TB, o Opts) *Sharded {
 	if o.Auth != nil {
 		tb.Fatal("mongofx: Auth is not supported for the sharded topology")
 	}
-	cfg := run(tb, o, "cfg", func(p int) []string { return serverArgs(o, "mongod", p, "--configsvr", "--replSet", "cfg") })
-	shard := run(tb, o, "shard", func(p int) []string { return serverArgs(o, "mongod", p, "--shardsvr", "--replSet", "shard0") })
+	cfg := run(tb, o, "cfg", 0, func(p int) []string { return serverArgs(o, "mongod", p, "--configsvr", "--replSet", "cfg") })
+	shard := run(tb, o, "shard", 0, func(p int) []string { return serverArgs(o, "mongod", p, "--shardsvr", "--replSet", "shard0") })
 	initReplSet(tb, o, "cfg", []string{cfg.addr})
 	initReplSet(tb, o, "shard0", []string{shard.addr})
-	mongos := run(tb, o, "mongos", func(p int) []string { return serverArgs(o, "mongos", p, "--configdb", "cfg/"+cfg.addr) })
+	mongos := run(tb, o, "mongos", 0, func(p int) []string { return serverArgs(o, "mongos", p, "--configdb", "cfg/"+cfg.addr) })
 	admin := connect(tb, o, "mongodb://"+mongos.addr+"/", nil)
 	waitFor(tb, "mongos", 90*time.Second, func() error { return pingErr(admin) })
 	waitFor(tb, "addShard", 120*time.Second, func() error {

@@ -21,6 +21,8 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
+	"net"
 	"os/exec"
 	"strings"
 	"testing"
@@ -253,5 +255,39 @@ func TestNoVolumesLeak(t *testing.T) {
 	if left := strings.Fields(dockerOut(t, "ps", "-aq", "--filter", "label=corralfx=1")); len(left) != 0 {
 		// Containers of other, parallel test processes are possible; none of ours may remain.
 		t.Logf("fixture containers still present (other processes?): %v", left)
+	}
+}
+
+// Opts.Ports lets a caller pick the members' host ports before the set starts.
+func TestPreselectedPorts(t *testing.T) {
+	ports := mongofx.ReservePorts(t, 3)
+	rs := mongofx.StartReplicaSet(t, mongofx.Opts{Version: "7.0", Members: 3, Ports: ports})
+	addrs := rs.Addrs()
+	if len(addrs) != 3 {
+		t.Fatalf("addrs = %v", addrs)
+	}
+	for i, p := range ports {
+		want := fmt.Sprintf("127.0.0.1:%d", p)
+		if addrs[i] != want {
+			t.Fatalf("member %d listens on %s, want the preselected %s", i, addrs[i], want)
+		}
+		c, err := net.DialTimeout("tcp", want, 3*time.Second)
+		if err != nil {
+			t.Fatalf("member %d does not accept connections on %s: %v", i, want, err)
+		}
+		c.Close()
+	}
+}
+
+// The data directories are tmpfs with room for index builds: a real mongod
+// refuses createIndexes when it sees less than about 500 MB free.
+func TestCreateIndexesHasRoom(t *testing.T) {
+	rs := mongofx.StartReplicaSet(t, mongofx.Opts{Version: "7.0", Members: 1})
+	coll := rs.Admin().Database("fxtest").Collection("idx")
+	if _, err := coll.InsertOne(ctx(t, 30*time.Second), bson.D{{Key: "a", Value: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coll.Indexes().CreateOne(ctx(t, 60*time.Second), mongo.IndexModel{Keys: bson.D{{Key: "a", Value: 1}}}); err != nil {
+		t.Fatalf("createIndexes: %v", err)
 	}
 }
