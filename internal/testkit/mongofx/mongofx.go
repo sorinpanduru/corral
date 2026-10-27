@@ -400,14 +400,22 @@ func (r *ReplicaSet) Logs(i int) string {
 	return out
 }
 
-// Stop stops member i.
+// Stop stops member i. The data directories are tmpfs mounts, so a stopped
+// member loses its data: see Start.
 func (r *ReplicaSet) Stop(i int) {
 	if out, err := docker("stop", "-t", "2", r.members[i].name); err != nil {
 		r.tb.Fatalf("mongofx: stop failed: %s", strings.TrimSpace(out))
 	}
 }
 
-// Start restarts member i.
+// Start restarts member i. Because /data/db and /data/configdb are tmpfs mounts
+// (so that nothing persists and no volume leaks), the restarted member comes
+// back with an EMPTY data directory: it is an unconfigured member that rejoins
+// the set and resyncs from the others, not a member that kept its data. A test
+// that needs a member to keep its data across a restart would need a
+// non-tmpfs variant of the fixture; none does today (the only user is the
+// fixture's own failover self-test, which asserts nothing about the restarted
+// member).
 func (r *ReplicaSet) Start(i int) {
 	if out, err := docker("start", r.members[i].name); err != nil {
 		r.tb.Fatalf("mongofx: start failed: %s", strings.TrimSpace(out))

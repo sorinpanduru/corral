@@ -35,6 +35,7 @@ func TestQueuedClientsCutAtDrainEndGetNoReply_FR47(t *testing.T) {
 		}
 		eventually(t, "every client queued", func() bool { return c.metric("corral_pool_waiters") >= clients })
 		proxyErrors := c.metric("corral_requests_total", "outcome", "proxy_error")
+		shutdownCloses := c.metric("corral_client_connections_closed_total", "reason", "shutdown")
 		c.p.Signal(syscall.SIGTERM)
 		// At the drain end the connections are closed (the hook holds before the
 		// pools close); no client may get any byte.
@@ -60,6 +61,10 @@ func TestQueuedClientsCutAtDrainEndGetNoReply_FR47(t *testing.T) {
 		// Each cut request is counted as a proxy error.
 		if got := c.metric("corral_requests_total", "outcome", "proxy_error") - proxyErrors; got < clients {
 			t.Errorf("run %d: %v proxy_error requests counted for %d cut clients", run, got, clients)
+		}
+		// The queued clients are closed with reason shutdown.
+		if got := c.metric("corral_client_connections_closed_total", "reason", "shutdown") - shutdownCloses; got < clients {
+			t.Errorf("run %d: %v connections closed with reason shutdown for %d cut clients", run, got, clients)
 		}
 		c.p.Release("shutdown_pool_close")
 		if code, err := c.p.Wait(30 * time.Second); err != nil || code != 0 {
