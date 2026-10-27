@@ -277,9 +277,12 @@ func (x *msg) forward() (proxy.CloseReason, bool) {
 			// The drain ended (FR-47 step 4) while the request waited: the
 			// connection is closed, with no synthesized error. Writing one
 			// would race with the close and sometimes reach the client.
-			co.End(err, nil)
-			ex.End(err, nil)
-			x.complete(proxy.OutcomeProxyError, err, false)
+			// Classified exactly like a request cut in flight by the same
+			// drain end (network / eof, see clientGone).
+			gerr := io.EOF
+			co.End(gerr, nil)
+			ex.End(gerr, nil)
+			x.complete(proxy.OutcomeProxyError, gerr, false)
 			return proxy.CloseShutdown, false
 		}
 		return x.checkoutFailed(co, ex, err)
