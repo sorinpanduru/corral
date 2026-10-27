@@ -88,6 +88,23 @@ unset behaviour is unchanged.
   and Blackhole skip the handshake. Legacy mode relies on Go's server honouring
   an explicit `MinVersion` below 1.2 (verified in the self-test).
 
+### Live TLS switching, handshake record, per-connection stall (proposed, needs Owner approval)
+
+- `SetTLS(mode)` changes the mode for connections accepted from then on;
+  existing connections are unaffected. Includes `TLSOff` (back to plaintext)
+  and plaintext to TLS. `TLSMode()` reads it. `Options.Authority` may be set
+  with TLS off so the CA exists before the first switch; otherwise `SetTLS`
+  creates one on first need (read it with `CAFile()` after).
+- `TLSHandshakes()` returns `[]TLSHandshake{ConnIndex, Remote, Start, End, OK,
+  Err, Version, Mode}` in completion order, failed attempts included (a
+  plaintext client against a TLS listener is a failed attempt). Plaintext
+  connections are not recorded. `WaitTLSHandshakes(timeout, pred)`,
+  `ResetTLSHandshakes()`. `Start` is when the server began the handshake.
+- `StallNextHello(connIndex, d)`: delays the reply to the next hello /
+  isMaster on that one open connection, once. Existing equivalent:
+  `FailChecksOn(appName, n, CheckDelay(d))`, which matches by appName, not by
+  connection.
+
 ## Known differences from a real mongod
 
 - Commands other than the ones above are echoed, never executed; there is no

@@ -119,6 +119,8 @@ type Server struct {
 	tlsCfg           *tls.Config
 	auth             *Authority
 	tlsFailures      int
+	tlsMode          TLSMode
+	hsLog            []TLSHandshake
 }
 
 // Start launches a server on 127.0.0.1:0 (or opts.Addr) and stops it through
@@ -136,11 +138,12 @@ func Start(tb testing.TB, opts Options) *Server {
 		authSticky: Succeed,
 		processID:  bson.ObjectID{0x6d, 0x6f, 0x6e, 0x67, 0x6f, 0x73, 0x69, 0x6d, 0, 0, 0, 1},
 	}
+	s.auth = opts.Authority
 	if opts.TLS != TLSOff {
-		s.auth = opts.Authority
 		if s.auth == nil {
 			s.auth = NewAuthority(tb)
 		}
+		s.tlsMode = opts.TLS
 		s.tlsCfg = s.auth.serverConfig(tb, opts.TLS)
 	}
 	addr := opts.Addr
@@ -242,17 +245,20 @@ func (s *Server) acceptLoop(ln net.Listener) {
 			return
 		}
 		s.attempts++
+		var cmode TLSMode
 		if s.tlsCfg != nil {
 			nc = tls.Server(nc, s.tlsCfg)
+			cmode = s.tlsMode
 		}
 		c := &conn{
-			s:      s,
-			idx:    len(s.conns),
-			nc:     nc,
-			in:     make(chan []byte, 256),
-			done:   make(chan struct{}),
-			opened: time.Now(),
-			open:   true,
+			tlsMode: cmode,
+			s:       s,
+			idx:     len(s.conns),
+			nc:      nc,
+			in:      make(chan []byte, 256),
+			done:    make(chan struct{}),
+			opened:  time.Now(),
+			open:    true,
 		}
 		s.conns = append(s.conns, c)
 		refuse, hole := s.refuse, s.blackhole
@@ -535,4 +541,19 @@ func (s *Server) connAt(i int) (*conn, error) {
 		return nil, fmt.Errorf("mongosim: connection %d is closed", i)
 	}
 	return c, nil
+}
+
+// StallNextHello delays the reply to the next hello / isMaster received on the
+// given open connection by d, once. It applies to that connection only (unlike
+// FailChecksOn(appName, n, CheckDelay(d)), which matches the next n hellos on
+// any connection with an appName). The stall blocks the connection, as on mongod.
+func (s *Server) StallNextHello(connIndex int, d time.Duration) error {
+	c, err := s.connAt(connIndex)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	c.stallNext = d
+	s.mu.Unlock()
+	return nil
 }

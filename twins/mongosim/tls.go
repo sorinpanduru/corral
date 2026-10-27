@@ -177,3 +177,65 @@ func (s *Server) TLSHandshakeFailures() int {
 	defer s.mu.Unlock()
 	return s.tlsFailures
 }
+
+// SetTLS switches the TLS mode for connections accepted from now on; existing
+// connections are unaffected. TLSOff goes back to plaintext, and a server that
+// started plaintext can move to any TLS mode (the Authority is created on first
+// need, or the one passed in Options.Authority is used). Certificates are
+// generated in memory when the mode is set.
+func (s *Server) SetTLS(mode TLSMode) {
+	s.tb.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if mode == TLSOff {
+		s.tlsCfg, s.tlsMode = nil, TLSOff
+		return
+	}
+	if s.auth == nil {
+		s.auth = NewAuthority(s.tb)
+	}
+	s.tlsCfg = s.auth.serverConfig(s.tb, mode)
+	s.tlsMode = mode
+}
+
+// TLSMode returns the mode applied to new connections.
+func (s *Server) TLSMode() TLSMode { s.mu.Lock(); defer s.mu.Unlock(); return s.tlsMode }
+
+// TLSHandshake is one server-side TLS handshake attempt. Plaintext
+// connections have no handshake and are not recorded.
+type TLSHandshake struct {
+	ConnIndex int
+	Remote    string    // client address (loopback, synthetic)
+	Start     time.Time // handshake began (first read on the connection)
+	End       time.Time // handshake finished or failed
+	OK        bool
+	Err       string // empty when OK; the server-side error text
+	Version   uint16 // negotiated tls.Version* when OK
+	Mode      TLSMode
+}
+
+// TLSHandshakes returns a copy of every handshake attempt so far, in the order
+// they finished, including failed ones.
+func (s *Server) TLSHandshakes() []TLSHandshake {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]TLSHandshake(nil), s.hsLog...)
+}
+
+// WaitTLSHandshakes polls until pred is true for the recorded handshakes or the
+// timeout passes.
+func (s *Server) WaitTLSHandshakes(timeout time.Duration, pred func([]TLSHandshake) bool) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if pred(s.TLSHandshakes()) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// ResetTLSHandshakes clears the handshake record (the failure counter stays).
+func (s *Server) ResetTLSHandshakes() { s.mu.Lock(); s.hsLog = nil; s.mu.Unlock() }
